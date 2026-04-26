@@ -66,6 +66,8 @@ export level_of, position_in_parent
 export rebuild_caches!, invalidate_caches!
 export refine_cells!, coarsen_cells!
 export cell_path, CellPath, find_at_path
+export RefinementEvent, ListenerHandle
+export register_refinement_listener!, unregister_refinement_listener!
 
 # SimplicialMesh
 export SimplicialMesh

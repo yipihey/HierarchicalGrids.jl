@@ -18,6 +18,10 @@ using HierarchicalGrids
         include("test_composite_and_refinement.jl")
     end
 
+    @testset "Layer 1: Refinement-event observer" begin
+        include("test_refinement_listener.jl")
+    end
+
     @testset "Layer 2: Geometry" begin
         include("test_geometry.jl")
     end
