@@ -596,9 +596,11 @@ function polynomial_remap_l_to_e!(target_coeffs::AbstractMatrix{T},
                                     overlap::GeometricOverlap{D, T},
                                     src_frames::Vector{<:CellReferenceFrame{D, T}},
                                     dst_frames::Vector{<:CellReferenceFrame{D, T}},
-                                    P_src::Integer, P_dst::Integer) where {D, T}
+                                    P_src::Integer, P_dst::Integer;
+                                    diagnostics::Union{Nothing, RemapDiagnostics{T}} = nothing) where {D, T}
     _polynomial_remap!(target_coeffs, source_coeffs, overlap,
-                        src_frames, dst_frames, P_src, P_dst; invert = false)
+                        src_frames, dst_frames, P_src, P_dst;
+                        invert = false, diagnostics = diagnostics)
 end
 
 """
@@ -615,9 +617,11 @@ function polynomial_remap_e_to_l!(target_coeffs::AbstractMatrix{T},
                                     overlap::GeometricOverlap{D, T},
                                     src_frames::Vector{<:CellReferenceFrame{D, T}},
                                     dst_frames::Vector{<:CellReferenceFrame{D, T}},
-                                    P_src::Integer, P_dst::Integer) where {D, T}
+                                    P_src::Integer, P_dst::Integer;
+                                    diagnostics::Union{Nothing, RemapDiagnostics{T}} = nothing) where {D, T}
     _polynomial_remap!(target_coeffs, source_coeffs, overlap,
-                        src_frames, dst_frames, P_src, P_dst; invert = true)
+                        src_frames, dst_frames, P_src, P_dst;
+                        invert = true, diagnostics = diagnostics)
 end
 
 function _polynomial_remap!(target_coeffs::AbstractMatrix{T},
@@ -626,7 +630,8 @@ function _polynomial_remap!(target_coeffs::AbstractMatrix{T},
                               src_frames::Vector{<:CellReferenceFrame{D, T}},
                               dst_frames::Vector{<:CellReferenceFrame{D, T}},
                               P_src::Integer, P_dst::Integer;
-                              invert::Bool) where {D, T}
+                              invert::Bool,
+                              diagnostics::Union{Nothing, RemapDiagnostics{T}} = nothing) where {D, T}
     P_src = Int(P_src); P_dst = Int(P_dst)
     n_dst = moments_length(D, P_dst)
 
@@ -645,6 +650,11 @@ function _polynomial_remap!(target_coeffs::AbstractMatrix{T},
         throw(DimensionMismatch("target_coeffs first dim $(size(target_coeffs, 1)) ≠ $n_dst"))
     size(source_coeffs, 1) == moments_length(D, P_src) ||
         throw(DimensionMismatch("source_coeffs first dim $(size(source_coeffs, 1)) ≠ $(moments_length(D, P_src))"))
+
+    # Optional per-overlap-entry diagnostics. Zero-overhead when nothing.
+    if diagnostics !== nothing
+        _accumulate_remap_diagnostics!(diagnostics, overlap, src_frames, invert)
+    end
 
     # Precompute pullback matrices per cell. These dominate setup cost but
     # are reused across every overlap entry that touches the cell.
@@ -705,4 +715,74 @@ end
         frame.edges[e][r]
     end, Val(D * D)))
     return abs(det(Amat))
+end
+
+# ============================================================================
+# Diagnostics helpers (used only when `diagnostics !== nothing`)
+# ============================================================================
+
+# Reference-cell volume for a given frame. Axis-aligned uses the unit cube
+# (volume 1); simplicial uses the unit simplex (volume 1/D!).
+@inline _frame_reference_volume(::AxisAlignedRef{D, T}) where {D, T} = one(T)
+@inline function _frame_reference_volume(::SimplicialRef{D, T}) where {D, T}
+    return one(T) / T(factorial(D))
+end
+
+# Signed Jacobian of the reference-to-physical affine map. For axis-aligned
+# the constructor enforces hi > lo so this is positive; for simplicial it
+# is `det A` and may be negative for inverted simplices (a shell crossing).
+@inline _frame_signed_jacobian(frame::AxisAlignedRef) = _frame_jacobian(frame)
+
+@inline function _frame_signed_jacobian(frame::SimplicialRef{D, T}) where {D, T}
+    Amat = SMatrix{D, D, T}(ntuple(i -> begin
+        e = ((i - 1) ÷ D) + 1
+        r = ((i - 1) % D) + 1
+        frame.edges[e][r]
+    end, Val(D * D)))
+    return det(Amat)
+end
+
+# Per-overlap-entry Liouville-Jacobian proxy. We define
+#
+#     stretch = entry.volume / source_physical_volume
+#             = entry.volume / (|det J_src| * V_ref(src))
+#
+# which is 1 for any source-cell-fully-inside-a-target-cell pair under an
+# identity remap and ≤ 1 for sub-cell overlaps. The sign is taken from
+# the signed source Jacobian so that an inverted source simplex flips the
+# proxy negative. The denominator is guarded against zero (degenerate
+# frames cannot produce overlap entries; if seen, treat as `Inf`/`-Inf`).
+@inline function _per_entry_jacobian(entry::OverlapEntry{D, T},
+                                       src_frame::CellReferenceFrame{D, T}) where {D, T}
+    j_signed = _frame_signed_jacobian(src_frame)
+    v_ref = _frame_reference_volume(src_frame)
+    denom = abs(j_signed) * v_ref
+    sign_factor = j_signed >= zero(T) ? one(T) : -one(T)
+    if denom <= zero(T)
+        # Degenerate source frame; surface as a clearly nonphysical value.
+        return sign_factor * T(Inf)
+    end
+    return sign_factor * (entry.volume / denom)
+end
+
+function _accumulate_remap_diagnostics!(d::RemapDiagnostics{T},
+                                          overlap::GeometricOverlap{D, T},
+                                          src_frames::Vector{<:CellReferenceFrame{D, T}},
+                                          invert::Bool) where {D, T}
+    @inbounds for entry in overlap.entries
+        i_src = invert ? Int(entry.eul_idx) : Int(entry.lag_idx)
+        jac = _per_entry_jacobian(entry, src_frames[i_src])
+        if jac < d.liouville_min
+            d.liouville_min = jac
+        end
+        if jac > d.liouville_max
+            d.liouville_max = jac
+        end
+        d.total_volume_in += entry.volume
+        d.total_volume_out += entry.volume
+        if jac <= zero(T)
+            d.n_negative_jacobian_cells += 1
+        end
+    end
+    return d
 end

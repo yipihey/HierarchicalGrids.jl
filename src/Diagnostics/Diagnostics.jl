@@ -41,6 +41,7 @@ export WelfordStats, push_value!, mean, variance, std_dev
 export skewness, kurtosis, excess_kurtosis, count_samples, merge_stats!
 export ExponentialMovingAverage, update!, value, reset!
 export PerCellStats
+export RemapDiagnostics
 
 # ============================================================================
 # WelfordStats — online mean, variance, skewness, kurtosis
@@ -342,6 +343,91 @@ function reset!(p::PerCellStats{T}) where T
         p.stats[i] = WelfordStats{T}()
     end
     return p
+end
+
+# ============================================================================
+# RemapDiagnostics — shell-crossing surveillance for polynomial remap kernels
+# ============================================================================
+
+"""
+    RemapDiagnostics{T<:AbstractFloat}()
+    RemapDiagnostics(::Type{T}) where T
+
+Mutable accumulator for per-cell-pair diagnostics tracked during a
+polynomial remap pass:
+
+- `liouville_min`, `liouville_max` — per-pair Jacobian (local stretch
+  factor) extrema. The proxy used is
+  `entry.volume / (source_reference_volume * |det J_src|)` =
+  `entry.volume / source_physical_volume`, which is 1 for any
+  source-cell pair fully contained in a single target cell under an
+  identity remap and < 1 for sub-cell overlaps. The minimum over all
+  pairs flags candidate shell-crossings; the maximum surfaces unusually
+  large stretch.
+- `total_volume_in`, `total_volume_out` — accumulated overlap volumes
+  on the source and target sides. Each overlap entry contributes
+  `entry.volume` to both (the overlap polytope is symmetric in source
+  and target), so the running totals are identical and their equality
+  provides a sanity check on the kernel.
+- `n_negative_jacobian_cells` — count of overlap entries for which
+  the per-pair Jacobian proxy is `≤ 0`. Strictly positive overlap
+  volumes are an invariant of `compute_overlap`, so a non-zero count
+  signals corruption (e.g. an inverted Lagrangian simplex propagated
+  past the builder's checks).
+
+The struct is designed to be allocated once and reused across many
+remap passes — call [`reset!`](@ref) between passes — or to be merged
+across thread-local copies via `Base.merge!`.
+"""
+mutable struct RemapDiagnostics{T<:AbstractFloat}
+    liouville_min::T
+    liouville_max::T
+    total_volume_in::T
+    total_volume_out::T
+    n_negative_jacobian_cells::Int
+end
+
+RemapDiagnostics{T}() where {T<:AbstractFloat} =
+    RemapDiagnostics{T}(typemax(T), typemin(T), zero(T), zero(T), 0)
+RemapDiagnostics(::Type{T}) where {T<:AbstractFloat} = RemapDiagnostics{T}()
+RemapDiagnostics() = RemapDiagnostics{Float64}()
+
+"""
+    reset!(d::RemapDiagnostics)
+
+Restore `d` to its freshly-constructed state. Returns `d`.
+"""
+function reset!(d::RemapDiagnostics{T}) where {T}
+    d.liouville_min = typemax(T)
+    d.liouville_max = typemin(T)
+    d.total_volume_in = zero(T)
+    d.total_volume_out = zero(T)
+    d.n_negative_jacobian_cells = 0
+    return d
+end
+
+"""
+    Base.merge!(a::RemapDiagnostics{T}, b::RemapDiagnostics{T}) -> a
+
+Merge `b` into `a` (parallel reduction). Takes elementwise
+`min`/`max`/sum as appropriate. Returns `a`.
+"""
+function Base.merge!(a::RemapDiagnostics{T}, b::RemapDiagnostics{T}) where {T}
+    a.liouville_min = min(a.liouville_min, b.liouville_min)
+    a.liouville_max = max(a.liouville_max, b.liouville_max)
+    a.total_volume_in += b.total_volume_in
+    a.total_volume_out += b.total_volume_out
+    a.n_negative_jacobian_cells += b.n_negative_jacobian_cells
+    return a
+end
+
+function Base.show(io::IO, d::RemapDiagnostics{T}) where {T}
+    print(io, "RemapDiagnostics{", T, "}(")
+    print(io, "liouville_min=", d.liouville_min,
+              ", liouville_max=", d.liouville_max,
+              ", total_volume_in=", d.total_volume_in,
+              ", total_volume_out=", d.total_volume_out,
+              ", n_negative_jacobian_cells=", d.n_negative_jacobian_cells, ")")
 end
 
 end # module Diagnostics

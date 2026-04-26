@@ -70,6 +70,7 @@ using ..Bases: AbstractBasis, MonomialBasis, n_coeffs
 using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView,
                   AbstractLayout, SoA, AoS, Blocked, basis_of, n_elements,
                   _layout_type_poly
+using ..Diagnostics: RemapDiagnostics
 
 # Types/functions
 export EulerianFrame, root_box, cell_unit_box, cell_physical_box, enumerate_leaves,
