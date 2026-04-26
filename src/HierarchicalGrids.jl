@@ -180,4 +180,9 @@ export polynomial_remap_field!
 export uniform_grid_dimensions
 export polynomial_remap_l_to_uniform_e!, polynomial_remap_uniform_e_to_l!
 
+# Layer 4 (initialization): L²-projection of analytical functions onto
+# PolynomialFieldSet. Depends on Bases, Quadrature, Storage, Mesh, and
+# the Overlap submodule (for EulerianFrame and cell_physical_box).
+include("Storage/Initialization.jl"); using .Initialization
+
 end # module HierarchicalGrids
