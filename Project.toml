@@ -1,0 +1,24 @@
+name = "HierarchicalGrids"
+uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+version = "0.1.0"
+authors = ["Tom Abel <tabel@stanford.edu>"]
+
+[deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
+R3D = "6888587b-6711-4ff3-8558-83329515e735"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+[compat]
+OhMyThreads = "0.8.5"
+R3D = "0.1.0"
+StaticArrays = "1"
+julia = "1.10"
+
+[extras]
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test", "Random"]

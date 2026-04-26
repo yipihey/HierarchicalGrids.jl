@@ -1,0 +1,72 @@
+using Test
+using HierarchicalGrids
+
+@testset "HierarchicalGrids.jl" begin
+    @testset "Layer 0: BitPrimitives" begin
+        include("test_bit_primitives.jl")
+    end
+
+    @testset "Layer 1: Mesh" begin
+        include("test_mesh.jl")
+    end
+
+    @testset "Layer 1: SimplicialMesh" begin
+        include("test_simplicial_mesh.jl")
+    end
+
+    @testset "Layer 1: CompositeMesh and refine_by_indicator!" begin
+        include("test_composite_and_refinement.jl")
+    end
+
+    @testset "Layer 2: Geometry" begin
+        include("test_geometry.jl")
+    end
+
+    @testset "Layer 2: Bases" begin
+        include("test_bases.jl")
+    end
+
+    @testset "Layer 2: Quadrature" begin
+        include("test_quadrature.jl")
+    end
+
+    @testset "Layer 2.5: Storage" begin
+        include("test_storage.jl")
+    end
+
+    @testset "Layer 2.5: PolynomialFieldSet" begin
+        include("test_polynomial_fieldset.jl")
+    end
+
+    @testset "Layer 3 (foundational): Threading" begin
+        include("test_threading.jl")
+    end
+
+    @testset "Layer 3 (foundational): Memory" begin
+        include("test_memory.jl")
+    end
+
+    @testset "Layer 3 (foundational): Diagnostics" begin
+        include("test_diagnostics.jl")
+    end
+
+    @testset "Layer 4: Overlap" begin
+        include("test_overlap.jl")
+    end
+
+    @testset "Layer 4: Polynomial remap" begin
+        include("test_polynomial_remap.jl")
+    end
+
+    @testset "Layer 4: Polynomial remap (FieldSet wrapper)" begin
+        include("test_polynomial_remap_fieldset.jl")
+    end
+
+    @testset "Layer 4: Polynomial remap (streaming)" begin
+        include("test_polynomial_remap_streaming.jl")
+    end
+
+    @testset "Integration tests" begin
+        include("test_integration.jl")
+    end
+end
