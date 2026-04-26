@@ -314,6 +314,51 @@ end
 # ============================================================================
 
 """
+    is_strictly_positive(field::PolynomialFieldView; atol = 0)
+        -> (positive::Bool, offending::Union{Nothing, Tuple{Int, NTuple{N, Int}}})
+
+Per-cell strict-positivity certificate for a polynomial field stored in
+Bernstein basis. Iterates cells in order; on the first failure returns
+`(false, (cell_index, offending_multi_index))`. Otherwise returns
+`(true, nothing)`.
+
+Throws `ArgumentError` if the underlying basis is not a `BernsteinBasis`
+(e.g. `MonomialBasis` does not have the convex-hull property, so the
+certificate would be unsound).
+
+Returning `false` does NOT imply non-positivity: the certificate is
+sufficient but not necessary (sharper under degree elevation).
+"""
+function is_strictly_positive(field::PolynomialFieldView{PFS, name};
+                              atol = nothing) where {PFS, name}
+    pfs = field.pfs
+    basis = pfs.basis
+    basis isa BernsteinBasis ||
+        throw(ArgumentError("is_strictly_positive requires a BernsteinBasis " *
+                             "(convex-hull property); got $(typeof(basis))"))
+    nc = n_coeffs(basis)
+    @inbounds for i in 1:pfs.n
+        # Materialize coefficients of cell i as an NTuple for the certificate.
+        coeffs = ntuple(k -> _get_poly_coeff(pfs, Val(name), i, k), nc)
+        a = atol === nothing ? zero(eltype(coeffs)) : atol
+        positive, offending = bernstein_positivity_certificate(coeffs, basis; atol=a)
+        if !positive
+            return (false, (i, offending))
+        end
+    end
+    return (true, nothing)
+end
+
+"""
+    is_strictly_positive(pfs::PolynomialFieldSet, name::Symbol; atol = 0)
+
+Convenience: forward to the field-view variant by extracting `pfs.<name>`.
+"""
+function is_strictly_positive(pfs::PolynomialFieldSet, name::Symbol; atol = nothing)
+    return is_strictly_positive(getproperty(pfs, name); atol=atol)
+end
+
+"""
     polynomial_action_error(poly_p, poly_pplus1, quad::QuadRule;
                               transform = identity, el_residual = 0)
 
