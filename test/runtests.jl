@@ -22,6 +22,10 @@ using HierarchicalGrids
         include("test_refinement_listener.jl")
     end
 
+    @testset "Layer 1: step_with_amr! driver" begin
+        include("test_step_with_amr.jl")
+    end
+
     @testset "Layer 2: Geometry" begin
         include("test_geometry.jl")
     end

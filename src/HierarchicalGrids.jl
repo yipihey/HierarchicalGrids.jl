@@ -191,4 +191,12 @@ export polynomial_remap_l_to_uniform_e!, polynomial_remap_uniform_e_to_l!
 include("Storage/Initialization.jl"); using .Initialization
 export init_field_from!
 
+# Layer 4 (AMR driver): topology-only `step_with_amr!` interleaver. Depends
+# on Mesh (for refine_by_indicator!) and Overlap (for EulerianFrame). Lives
+# under src/Mesh/ for organizational reasons but is a top-level submodule
+# so it can reach both layers.
+include("Mesh/AMR.jl")
+using .AMR
+export step_with_amr!
+
 end # module HierarchicalGrids
