@@ -64,6 +64,11 @@ export ROOT_PARENT  # sentinel value
 export RefinementEvent, ListenerHandle
 export register_refinement_listener!, unregister_refinement_listener!
 
+# Neighbor graph (PR-C)
+export NeighborGraph, face_neighbors, face_fine_neighbors
+export build_neighbor_graph, ensure_neighbor_graph!
+export cell_adjacency_sparsity
+
 # SimplicialMesh exports (added below)
 export SimplicialMesh
 export n_vertices, spatial_dimension
@@ -242,6 +247,16 @@ mutable struct HierarchicalMesh{D, M<:Unsigned}
     # forcing all callers to share a callable type.
     _listeners::Vector{Any}
     _next_listener_handle::UInt64
+
+    # When true, refine_cells! enforces 2:1 face-neighbor balance: any
+    # newly-created leaf may have face-neighbors at most one level coarser.
+    # Default false preserves existing behaviour.
+    balanced::Bool
+
+    # Lazily-built face-neighbor graph (PR-C). `Any` to avoid an upward
+    # dependency from Mesh on the NeighborGraph type. Reset to `nothing`
+    # by a refinement listener registered when the graph is first built.
+    _cached_neighbor_graph::Any
 end
 
 """
@@ -250,7 +265,7 @@ end
 Construct a single-cell mesh containing just the root cell. The root is a
 leaf with no siblings (split_mask = 0, sibling_index = 0).
 """
-function HierarchicalMesh{D}() where D
+function HierarchicalMesh{D}(; balanced::Bool=false) where D
     M = sibling_index_type(Val(D))
     cells = [CellMeta{D, M}(M(0), M(0), FLAG_LEAF)]
     return HierarchicalMesh{D, M}(
@@ -261,18 +276,20 @@ function HierarchicalMesh{D}() where D
         UInt32[],
         false,                       # caches invalid
         Any[],                       # no listeners yet
-        UInt64(1)                    # next handle starts at 1
+        UInt64(1),                   # next handle starts at 1
+        balanced,                    # enforce 2:1 balance on refine?
+        nothing,                     # no neighbor graph cached yet
     )
 end
 
 """
-    HierarchicalMesh{D}(initial_capacity::Integer) where D
+    HierarchicalMesh{D}(initial_capacity::Integer; balanced=false) where D
 
 Construct a single-cell mesh with reserved capacity for `initial_capacity`
 cells, useful for avoiding reallocation as the mesh grows during refinement.
 """
-function HierarchicalMesh{D}(initial_capacity::Integer) where D
-    mesh = HierarchicalMesh{D}()
+function HierarchicalMesh{D}(initial_capacity::Integer; balanced::Bool=false) where D
+    mesh = HierarchicalMesh{D}(; balanced=balanced)
     sizehint!(mesh.cells, initial_capacity)
     return mesh
 end
@@ -838,6 +855,49 @@ function refine_cells!(mesh::HierarchicalMesh{D, M}, cell_indices,
         _fire_refinement_event!(mesh, event)
     end
 
+    # 2:1 balance enforcement (PR-C). Done after the primary refinement so
+    # the listener-visible event corresponds to the user's request; balance
+    # refinements fire their own subsequent events.
+    if mesh.balanced
+        _enforce_balance!(mesh)
+    end
+
+    return mesh
+end
+
+# Walk all leaves; for each, ensure no face-neighbor is at a level more than
+# 1 coarser. Collect the offending coarser cells, refine them, repeat to
+# fixed point. Uses the public `face_neighbors` API (lazy-builds the
+# neighbor graph; the graph is invalidated when this function refines).
+function _enforce_balance!(mesh::HierarchicalMesh{D, M}) where {D, M}
+    F = 2 * D
+    while true
+        # Scan leaves with a fresh neighbor graph + level cache.
+        ensure_caches!(mesh)
+        levels = mesh._levels
+        graph = ensure_neighbor_graph!(mesh)
+
+        offenders = Set{UInt32}()
+        @inbounds for i in 1:n_cells(mesh)
+            is_leaf(mesh.cells[i]) || continue
+            li = levels[i]
+            face_tuple = graph.representatives[i]
+            for f in 1:F
+                rep = face_tuple[f]
+                rep == 0 && continue
+                # `rep` is a leaf; if its level is more than 1 coarser, its
+                # parent path needs another split. We refine the coarse
+                # neighbour itself (it is a leaf), which raises its level
+                # by one and recurs in the next pass.
+                if li - levels[rep] > 1
+                    push!(offenders, rep)
+                end
+            end
+        end
+        isempty(offenders) && break
+        # Refine offenders in sorted, unique order.
+        refine_cells!(mesh, sort!(collect(offenders)))
+    end
     return mesh
 end
 
@@ -958,6 +1018,11 @@ include("SimplicialMesh.jl")
 # Composite and paired meshes
 # ============================================================================
 include("CompositeMesh.jl")
+
+# ============================================================================
+# Face-neighbor graph + sparsity (PR-C)
+# ============================================================================
+include("Neighbors.jl")
 
 # ============================================================================
 # Generic indicator-driven refinement

@@ -7,6 +7,7 @@ authors = ["Tom Abel <tabel@stanford.edu>"]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 R3D = "6888587b-6711-4ff3-8558-83329515e735"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [compat]

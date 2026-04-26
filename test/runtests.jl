@@ -26,6 +26,18 @@ using HierarchicalGrids
         include("test_step_with_amr.jl")
     end
 
+    @testset "Layer 1: Face-neighbor graph" begin
+        include("test_neighbors.jl")
+    end
+
+    @testset "Layer 1: Cell-adjacency sparsity" begin
+        include("test_adjacency_sparsity.jl")
+    end
+
+    @testset "Layer 2.5: Halo view" begin
+        include("test_halo_view.jl")
+    end
+
     @testset "Layer 2: Geometry" begin
         include("test_geometry.jl")
     end
