@@ -50,7 +50,7 @@ end
 Key points:
 
 - Your `HydroState` *contains* the mesh, but doesn't *modify* it. Refinement decisions are typically made by the solver, but the actual `refine_cells!` call goes through the mesh's API.
-- When the mesh changes, your fields need to follow. The framework can give you mappings of old→new cell indices (this isn't fully built out yet; for now, fields are reset on refinement and you're expected to interpolate).
+- When the mesh changes, your fields need to follow. Register a refinement listener on the mesh and the framework will dispatch a `RefinementEvent` describing the batch (refined parents, new children, removed cells, and an `index_remap` array) — see [Refinement events](refinement_events.md).
 - Solver-specific state lives in your struct. Don't pollute the mesh with it.
 
 ## Adding a new layout
@@ -63,6 +63,40 @@ Covered in detail in `layouts.md`. The procedure:
 4. Implement `_resize_storage!(storage, ::Type{YourLayout}, new_n)`.
 
 Test by checking that the same kernel produces the same numerical results as SoA.
+
+## Positivity certificates for polynomial fields
+
+A common need for limiter detection in higher-order solvers is
+"is this polynomial coefficient column positive everywhere on its
+reference cell?" The Bernstein basis answers this cheaply via the
+convex-hull property: a sufficient condition is that every Bernstein
+coefficient is strictly positive.
+
+Two primitives implement this check:
+
+- `bernstein_positivity_certificate(coeffs, basis; atol = 0)` —
+  low-level certificate over a single coefficient vector. Returns
+  `(true, nothing)` on success, `(false, multi_index)` on the first
+  offending coefficient.
+- `is_strictly_positive(field::PolynomialFieldView; atol = 0)` (and
+  the `(pfs, name)` convenience overload) — sweeps every cell of a
+  Bernstein-basis `PolynomialFieldSet` and returns the first failure
+  as `(false, (cell_index, multi_index))`.
+
+```julia
+field = allocate_polynomial_fields(SoA(), BernsteinBasis{2, 1}(),
+                                    n_cells(mesh); rho = Float64)
+init_field_from!(field, frame, x -> 1.0 + 0.1 * x[1])
+
+ok, where = is_strictly_positive(field, :rho)
+ok || @warn "non-positive coefficient at cell $(where[1])"
+```
+
+A `false` result does NOT imply that the polynomial is actually
+non-positive: the Bernstein test is sufficient but not necessary, and
+gets sharper under degree elevation. `is_strictly_positive` raises
+`ArgumentError` if the field's basis is not a `BernsteinBasis` (the
+convex-hull property is what makes the check sound).
 
 ## Adding a new geometric operation
 
