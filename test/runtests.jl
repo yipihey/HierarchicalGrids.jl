@@ -34,6 +34,14 @@ using HierarchicalGrids
         include("test_adjacency_sparsity.jl")
     end
 
+    @testset "Layer 1: Boundary conditions (PR-D)" begin
+        include("test_boundary_conditions.jl")
+    end
+
+    @testset "Layer 1: Periodic SimplicialMesh (PR-D)" begin
+        include("test_periodic_simplicial.jl")
+    end
+
     @testset "Layer 2.5: Halo view" begin
         include("test_halo_view.jl")
     end

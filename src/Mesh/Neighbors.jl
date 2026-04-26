@@ -509,3 +509,142 @@ end
     end
     return
 end
+
+# ---------------------------------------------------------------------------
+# Periodic / boundary-condition aware neighbor wiring (PR-D)
+# ---------------------------------------------------------------------------
+
+"""
+    face_neighbors_with_bcs(mesh::HierarchicalMesh{D,M}, i::Integer,
+                             frame_bcs) -> NTuple{2D, UInt32}
+
+Boundary-condition-aware variant of [`face_neighbors`](@ref). Builds the
+underlying neighbor graph (lazily, like the plain `face_neighbors`) and
+post-processes the result for each periodic axis declared in
+`frame_bcs::FrameBoundaries{D}`:
+
+- Lo-side boundary entries on a periodic axis are replaced with the leaf
+  on the opposite (hi) side whose other-axes unit-cube extent overlaps
+  with `i`'s.
+- Hi-side boundary entries are replaced symmetrically.
+- Non-periodic-axis boundary entries are left as `0`.
+
+Non-periodic BC kinds (`INFLOW`, `OUTFLOW`, `REFLECTING`, `DIRICHLET`)
+are not consumed here — those are handled by PDE-level code that reads
+the `FrameBoundaries` directly.
+
+The `frame_bcs` argument is typed as `Any` to avoid an upward dependency
+from `Mesh` on the `Overlap` submodule where `FrameBoundaries` lives.
+The function looks for `is_periodic_axis(frame_bcs, axis)` via duck
+typing; either `BoundaryConditions.is_periodic_axis` (on a
+`BoundarySpec`) or a `FrameBoundaries` instance will work.
+"""
+function face_neighbors_with_bcs(mesh::HierarchicalMesh{D, M}, i::Integer,
+                                  frame_bcs) where {D, M}
+    g = ensure_neighbor_graph!(mesh)
+    base = g.representatives[Int(i)]
+
+    # Identify which axes are periodic. Use the public is_periodic_axis
+    # method that BoundaryConditions and FrameBoundaries both export.
+    any_periodic = false
+    @inbounds for d in 1:D
+        if _bc_is_periodic_axis(frame_bcs, d)
+            any_periodic = true
+            break
+        end
+    end
+    any_periodic || return base
+
+    # Get this leaf's unit-cube box. If it's not a leaf, we have nothing
+    # sensible to wire; return the (zero) entry.
+    is_leaf(mesh.cells[Int(i)]) || return base
+
+    (a_lo, a_hi) = _unit_box(mesh, Int(i))
+
+    # Collect leaves once; we need to scan opposite-wall leaves for matches.
+    # For typical mesh sizes the cost is O(N_leaves * D), in line with the
+    # rest of the neighbor-graph pipeline.
+    leaves = UInt32[]
+    leaf_lo = NTuple{D, Float64}[]
+    leaf_hi = NTuple{D, Float64}[]
+    @inbounds for k in 1:n_cells(mesh)
+        if is_leaf(mesh.cells[k])
+            (lo, hi) = _unit_box(mesh, k)
+            push!(leaves, UInt32(k))
+            push!(leaf_lo, lo)
+            push!(leaf_hi, hi)
+        end
+    end
+
+    # Output tuple as a mutable array; we'll re-tuple at the end.
+    out = collect(base)
+
+    @inbounds for d in 1:D
+        _bc_is_periodic_axis(frame_bcs, d) || continue
+        face_lo_idx = 2 * d - 1
+        face_hi_idx = 2 * d
+
+        on_lo_boundary = a_lo[d] <= _NEIGHBOR_EPS
+        on_hi_boundary = a_hi[d] >= 1.0 - _NEIGHBOR_EPS
+
+        if on_lo_boundary && out[face_lo_idx] == 0
+            # Find the leaf on the hi-wall that overlaps in the other axes.
+            best = UInt32(0)
+            for k in eachindex(leaves)
+                # Candidate must touch the hi wall on axis d.
+                leaf_hi[k][d] >= 1.0 - _NEIGHBOR_EPS || continue
+                ok = true
+                for d2 in 1:D
+                    d2 == d && continue
+                    if !_open_overlap(a_lo[d2], a_hi[d2],
+                                       leaf_lo[k][d2], leaf_hi[k][d2])
+                        ok = false
+                        break
+                    end
+                end
+                ok || continue
+                idx = leaves[k]
+                if best == 0 || idx < best
+                    best = idx
+                end
+            end
+            best != 0 && (out[face_lo_idx] = best)
+        end
+
+        if on_hi_boundary && out[face_hi_idx] == 0
+            best = UInt32(0)
+            for k in eachindex(leaves)
+                leaf_lo[k][d] <= _NEIGHBOR_EPS || continue
+                ok = true
+                for d2 in 1:D
+                    d2 == d && continue
+                    if !_open_overlap(a_lo[d2], a_hi[d2],
+                                       leaf_lo[k][d2], leaf_hi[k][d2])
+                        ok = false
+                        break
+                    end
+                end
+                ok || continue
+                idx = leaves[k]
+                if best == 0 || idx < best
+                    best = idx
+                end
+            end
+            best != 0 && (out[face_hi_idx] = best)
+        end
+    end
+
+    return ntuple(f -> out[f], Val(2*D))
+end
+
+# Duck-typed dispatcher: works for both BoundarySpec tuples (via the
+# BoundaryConditions function we imported as `_is_periodic_axis_spec`) and
+# `FrameBoundaries`-like objects exposing `is_periodic_axis(fb, axis)`.
+@inline _bc_is_periodic_axis(spec::NTuple{D, NTuple{2, BCKind}},
+                              axis::Integer) where {D} =
+    _is_periodic_axis_spec(spec, axis)
+
+# Generic fallback: any object with a `.spec` field that is a BoundarySpec.
+@inline _bc_is_periodic_axis(fb, axis::Integer) =
+    _is_periodic_axis_spec(fb.spec, axis)
+

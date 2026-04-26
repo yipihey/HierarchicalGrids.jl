@@ -52,6 +52,16 @@ export count_ones_native, leading_zeros_native, trailing_zeros_native,
        pdep, pext, bit_for_axis, sibling_index_type, volume_int_type,
        split_mask_type, vertex_int_type
 
+# Layer 1 (boundary-condition vocabulary, used by Mesh and Overlap below)
+include("Mesh/BoundaryConditions.jl")
+using .BoundaryConditions
+export BCKind, PERIODIC, INFLOW, OUTFLOW, REFLECTING, DIRICHLET
+export BoundarySpec, default_bc
+# `is_periodic_axis` and `validate` are deliberately not re-exported at the
+# top level: they live in BoundaryConditions and are also reachable via the
+# `FrameBoundaries` accessors. Top-level re-export would risk colliding with
+# downstream code; users that want them can `using .BoundaryConditions`.
+
 # Layer 1
 include("Mesh/Mesh.jl")
 using .Mesh
@@ -74,6 +84,9 @@ export NeighborGraph, face_neighbors, face_fine_neighbors
 export build_neighbor_graph, ensure_neighbor_graph!
 export cell_adjacency_sparsity
 
+# Boundary-aware neighbor wiring (PR-D)
+export face_neighbors_with_bcs
+
 # SimplicialMesh
 export SimplicialMesh
 export n_vertices, spatial_dimension, n_simplices
@@ -83,6 +96,9 @@ export simplex_neighbor, is_boundary_face
 export simplex_volume, simplex_reference_volume
 export deformation_gradient, volume_jacobian, distortion_metric
 export has_inverted_simplex, max_distortion, enumerate_edges
+
+# Periodic-wrap helper + Dirichlet pin (PR-D)
+export periodic!, pin_boundary_simplices!, is_pinned
 
 # Composite/Paired meshes
 export CompositeMesh, PairedMesh
@@ -159,6 +175,7 @@ include("Overlap/Overlap.jl")
 using .Overlap
 export EulerianFrame, root_box, cell_unit_box, cell_physical_box, enumerate_leaves,
        aabbs_overlap
+export FrameBoundaries, bc
 export OverlapEntry, GeometricOverlap, OverlapBuilder
 export n_entries, entries_for_lag, entries_for_eul, total_overlap_volume
 export push_overlap!, merge_builder!, finalize_overlap

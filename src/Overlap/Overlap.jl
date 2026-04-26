@@ -65,6 +65,8 @@ using ..Mesh: HierarchicalMesh, SimplicialMesh, CellMeta, PairedMesh,
               set_overlap_compute_function!,
               level_of, find_children, isotropic_mask
 using ..Mesh  # for ROOT_PARENT, ensure_caches!, _parents
+using ..BoundaryConditions: BCKind, BoundarySpec, default_bc, validate
+import ..BoundaryConditions: is_periodic_axis
 using ..Geometry: cell_extent
 using ..Bases: AbstractBasis, MonomialBasis, n_coeffs
 using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView,
@@ -75,6 +77,9 @@ using ..Diagnostics: RemapDiagnostics
 # Types/functions
 export EulerianFrame, root_box, cell_unit_box, cell_physical_box, enumerate_leaves,
        aabbs_overlap
+
+# Boundary-condition companion (PR-D)
+export FrameBoundaries, bc
 
 export OverlapEntry, GeometricOverlap, OverlapBuilder
 export n_entries, moment_order, entries_for_lag, entries_for_eul, total_overlap_volume
@@ -119,6 +124,7 @@ export uniform_grid_dimensions
 export polynomial_remap_l_to_uniform_e!, polynomial_remap_uniform_e_to_l!
 
 include("frame.jl")
+include("frame_boundaries.jl")
 include("moments.jl")
 include("data.jl")
 include("aabb.jl")

@@ -68,13 +68,29 @@ function compute_overlap(lag::SimplicialMesh{D, T},
                           edge_kind::Symbol = :linear,
                           leaf_size::Integer = 8,
                           parallel::Bool = false,
-                          scheduler::Symbol = :dynamic) where {D, T}
+                          scheduler::Symbol = :dynamic,
+                          frame_bcs::Union{Nothing, FrameBoundaries{D}} = nothing
+                          ) where {D, T}
     edge_kind === :linear ||
         throw(ArgumentError("edge_kind=$edge_kind not yet supported (:linear only). " *
                              "Cubic-edge dimension lifting volume-only path is unblocked, " *
                              "but full polynomial remap requires r3djl higher-order moments " *
                              "(P ≥ 1) at D ≥ 4 (still pending). " *
                              "See src/Overlap/lifting.jl for status."))
+
+    # PR-D: periodic ghost-overlap entries (Lagrangian simplices wrapped
+    # to the opposite side of a periodic axis) are deferred to a follow-up
+    # PR. Non-periodic BC kinds (INFLOW / OUTFLOW / REFLECTING / DIRICHLET)
+    # are advisory at this layer — they're consumed by PDE-level code
+    # (face fluxes, boundary integrals, Lagrangian motion clamping) rather
+    # than by the geometric overlap computation. When `frame_bcs` is
+    # `nothing` (the default), behavior is identical to pre-PR-D code.
+    # When non-`nothing`, this implementation accepts the argument for
+    # forward-compatibility but does not yet emit wrap-around ghost
+    # entries; callers that need periodic halos should consult
+    # `face_neighbors_with_bcs` for neighbor-graph wiring.
+    frame_bcs  # silence the unused-binding hint; the validation happened
+              # at FrameBoundaries construction time.
 
     # Build the BVH over Lagrangian simplices (sequential — small).
     tree = build_simplex_aabb_tree(lag; leaf_size = Int(leaf_size))
