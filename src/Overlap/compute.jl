@@ -78,26 +78,26 @@ function compute_overlap(lag::SimplicialMesh{D, T},
                              "(P ≥ 1) at D ≥ 4 (still pending). " *
                              "See src/Overlap/lifting.jl for status."))
 
-    # PR-D: periodic ghost-overlap entries (Lagrangian simplices wrapped
-    # to the opposite side of a periodic axis) are deferred to a follow-up
-    # PR. Non-periodic BC kinds (INFLOW / OUTFLOW / REFLECTING / DIRICHLET)
-    # are advisory at this layer — they're consumed by PDE-level code
-    # (face fluxes, boundary integrals, Lagrangian motion clamping) rather
-    # than by the geometric overlap computation. When `frame_bcs` is
-    # `nothing` (the default), behavior is identical to pre-PR-D code.
-    # When non-`nothing`, this implementation accepts the argument for
-    # forward-compatibility but does not yet emit wrap-around ghost
-    # entries; callers that need periodic halos should consult
-    # `face_neighbors_with_bcs` for neighbor-graph wiring.
-    frame_bcs  # silence the unused-binding hint; the validation happened
-              # at FrameBoundaries construction time.
+    # PR-D + follow-up: when `frame_bcs` is `nothing` (the default), the
+    # geometric path is identical to pre-PR-D code (single branch, zero
+    # overhead). When `frame_bcs` is supplied, periodic axes generate
+    # ghost-image overlap entries: a Lagrangian simplex partially or
+    # wholly outside the frame on a periodic axis is wrapped to overlap
+    # with the frame's interior via translation by ±(hi - lo). Multiple
+    # periodic axes produce corner ghosts via every combination of ±period
+    # shifts. Non-periodic BC kinds (INFLOW / OUTFLOW / REFLECTING /
+    # DIRICHLET) are advisory at this layer — they're consumed by PDE-
+    # level code (face fluxes, boundary integrals, Lagrangian motion
+    # clamping) rather than by the geometric overlap computation.
+    ghost_shifts = _ghost_shift_table(frame, frame_bcs)
 
     # Build the BVH over Lagrangian simplices (sequential — small).
     tree = build_simplex_aabb_tree(lag; leaf_size = Int(leaf_size))
     eul = frame.mesh
 
     if !parallel || Threads.nthreads() == 1
-        return _compute_overlap_sequential(lag, frame, tree, Int(moment_order))
+        return _compute_overlap_sequential(lag, frame, tree, Int(moment_order),
+                                             ghost_shifts)
     end
 
     # Heuristic threshold: for small problems, parallel overhead exceeds
@@ -109,10 +109,64 @@ function compute_overlap(lag::SimplicialMesh{D, T},
         is_leaf(frame.mesh.cells[ci]) && (n_eul_leaves += 1)
     end
     if n_simplices(lag) * n_eul_leaves < 10_000
-        return _compute_overlap_sequential(lag, frame, tree, Int(moment_order))
+        return _compute_overlap_sequential(lag, frame, tree, Int(moment_order),
+                                             ghost_shifts)
     end
 
-    return _compute_overlap_parallel(lag, frame, tree, Int(moment_order); scheduler)
+    return _compute_overlap_parallel(lag, frame, tree, Int(moment_order),
+                                       ghost_shifts; scheduler)
+end
+
+# Build the table of periodic ghost shifts. Returns `nothing` when no BCs
+# are attached (so the hot path can take a single, predictable branch on
+# `ghost_shifts === nothing`). Otherwise returns a Vector of NTuple{D, T}
+# shift vectors, EXCLUDING the zero shift (the zero-shift overlap is
+# computed by the regular per-leaf path). For k periodic axes the table
+# has 3^k - 1 entries, covering every combination of `{-period, 0,
+# +period}` along each periodic axis with at least one nonzero component.
+@inline function _ghost_shift_table(frame::EulerianFrame{D, T},
+                                     ::Nothing) where {D, T}
+    return nothing
+end
+
+function _ghost_shift_table(frame::EulerianFrame{D, T},
+                              fb::FrameBoundaries{D}) where {D, T}
+    # Determine periodic axes and their periods.
+    periodic_axes = Int[]
+    @inbounds for d in 1:D
+        if is_periodic_axis(fb, d)
+            push!(periodic_axes, d)
+        end
+    end
+    isempty(periodic_axes) && return nothing
+
+    periods = ntuple(d -> frame.hi[d] - frame.lo[d], Val(D))
+
+    # Enumerate all 3^k combinations of {-1, 0, +1} on the periodic axes,
+    # skipping the all-zero one. Non-periodic axes get a 0 shift.
+    k = length(periodic_axes)
+    n_combos = 3^k
+    shifts = Vector{NTuple{D, T}}()
+    sizehint!(shifts, n_combos - 1)
+    @inbounds for code in 0:(n_combos - 1)
+        # Decode `code` in base 3, mapping digit ∈ {0, 1, 2} → sign ∈ {0, +1, -1}.
+        # We store the sign per periodic axis, zero for non-periodic axes.
+        c = code
+        all_zero = true
+        signs = MVector{D, Int}(ntuple(_ -> 0, Val(D)))
+        for ax in periodic_axes
+            digit = c % 3
+            c = c ÷ 3
+            s = digit == 0 ? 0 : (digit == 1 ? 1 : -1)
+            signs[ax] = s
+            if s != 0
+                all_zero = false
+            end
+        end
+        all_zero && continue
+        push!(shifts, ntuple(d -> T(signs[d]) * periods[d], Val(D)))
+    end
+    return shifts
 end
 
 # Sequential implementation — used directly when parallel=false or
@@ -120,7 +174,10 @@ end
 function _compute_overlap_sequential(lag::SimplicialMesh{D, T},
                                        frame::EulerianFrame{D, T},
                                        tree::SimplicialAABBTree{D, T},
-                                       moment_order::Int) where {D, T}
+                                       moment_order::Int,
+                                       ghost_shifts::Union{Nothing,
+                                                           Vector{NTuple{D, T}}}
+                                       ) where {D, T}
     builder = OverlapBuilder{D, T}(moment_order)
     scratch = PairScratch(Val(D), T)
     moments_buf = Vector{T}(undef, moments_length(D, moment_order))
@@ -140,6 +197,36 @@ function _compute_overlap_sequential(lag::SimplicialMesh{D, T},
             vol > zero(T) || continue
             push_overlap!(builder, s, ci, vol, centroid, moments_buf)
         end
+
+        # Periodic ghost path: for each non-zero ghost shift, query the
+        # BVH against the leaf box translated by `-shift` (equivalent to
+        # finding simplices whose AABB, when shifted by `+shift`,
+        # intersects this leaf), then clip the shifted simplex against
+        # the leaf box. Ghost overlap entries are attributed to the
+        # original simplex index `s`, NOT a synthetic ghost index, so the
+        # downstream remap sees them as additional contributions to
+        # simplex s's mass balance.
+        if ghost_shifts !== nothing
+            for shift in ghost_shifts
+                q_lo = ntuple(d -> leaf_lo[d] - shift[d], Val(D))
+                q_hi = ntuple(d -> leaf_hi[d] - shift[d], Val(D))
+                empty!(candidates)
+                query_aabb!(candidates, tree, q_lo, q_hi)
+                for s in candidates
+                    verts = simplex_vertex_positions(lag, Int(s))
+                    shifted = ntuple(k -> ntuple(d -> verts[k][d] + shift[d],
+                                                    Val(D)),
+                                      Val(D + 1))
+                    vol, centroid, _ = overlap_simplex_box!(moments_buf,
+                                                              scratch,
+                                                              shifted,
+                                                              leaf_lo, leaf_hi,
+                                                              moment_order)
+                    vol > zero(T) || continue
+                    push_overlap!(builder, s, ci, vol, centroid, moments_buf)
+                end
+            end
+        end
     end
 
     return finalize_overlap(builder, n_simplices(lag), n_cells(eul))
@@ -151,7 +238,9 @@ end
 function _compute_overlap_parallel(lag::SimplicialMesh{D, T},
                                      frame::EulerianFrame{D, T},
                                      tree::SimplicialAABBTree{D, T},
-                                     moment_order::Int;
+                                     moment_order::Int,
+                                     ghost_shifts::Union{Nothing,
+                                                         Vector{NTuple{D, T}}};
                                      scheduler::Symbol = :dynamic) where {D, T}
     eul = frame.mesh
 
@@ -224,6 +313,29 @@ function _compute_overlap_parallel(lag::SimplicialMesh{D, T},
                                                           moment_order)
                 vol > zero(T) || continue
                 push_overlap!(builder, s, ci, vol, centroid, moments_buf)
+            end
+
+            # Periodic ghost path (mirror of the sequential implementation).
+            if ghost_shifts !== nothing
+                for shift in ghost_shifts
+                    q_lo = ntuple(d -> leaf_lo[d] - shift[d], Val(D))
+                    q_hi = ntuple(d -> leaf_hi[d] - shift[d], Val(D))
+                    empty!(candidates)
+                    query_aabb!(candidates, tree, q_lo, q_hi)
+                    for s in candidates
+                        verts = simplex_vertex_positions(lag, Int(s))
+                        shifted = ntuple(j -> ntuple(d -> verts[j][d] + shift[d],
+                                                        Val(D)),
+                                          Val(D + 1))
+                        vol, centroid, _ = overlap_simplex_box!(moments_buf,
+                                                                  scratch,
+                                                                  shifted,
+                                                                  leaf_lo, leaf_hi,
+                                                                  moment_order)
+                        vol > zero(T) || continue
+                        push_overlap!(builder, s, ci, vol, centroid, moments_buf)
+                    end
+                end
             end
         end
         builder
