@@ -48,6 +48,8 @@ boundary or finer refined region is non-disruptive.
 module Mesh
 
 using ..BitPrimitives
+using ..BoundaryConditions: BCKind, PERIODIC, REFLECTING, BoundarySpec,
+                             is_periodic_axis as _is_periodic_axis_spec
 
 export CellMeta, HierarchicalMesh
 export FLAG_LEAF, FLAG_BOUNDARY, FLAG_DIRTY
@@ -68,6 +70,12 @@ export register_refinement_listener!, unregister_refinement_listener!
 export NeighborGraph, face_neighbors, face_fine_neighbors
 export build_neighbor_graph, ensure_neighbor_graph!
 export cell_adjacency_sparsity
+
+# Boundary-aware neighbor wiring (PR-D)
+export face_neighbors_with_bcs
+
+# Periodic SimplicialMesh wiring + Dirichlet pin (PR-D)
+export periodic!, pin_boundary_simplices!, is_pinned
 
 # SimplicialMesh exports (added below)
 export SimplicialMesh

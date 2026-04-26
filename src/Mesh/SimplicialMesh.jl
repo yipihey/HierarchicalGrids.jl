@@ -51,6 +51,12 @@ mutable struct SimplicialMesh{D, T}
     positions::Vector{NTuple{D, T}}      # current positions
     reference_positions::Vector{NTuple{D, T}}  # positions at last regeneration
 
+    # Per-simplex Dirichlet pin flag (PR-D). Length == n_simplices. Default
+    # all-false. Advisory: downstream Lagrangian motion should clamp pinned
+    # simplices' vertex velocities. The remap and overlap layers do not
+    # consume this field.
+    pinned::BitVector
+
     function SimplicialMesh{D, T}(positions::Vector{NTuple{D, T}},
                                    simplex_vertices::Matrix{Int32},
                                    simplex_neighbors::Matrix{Int32};
@@ -82,7 +88,7 @@ mutable struct SimplicialMesh{D, T}
             throw(ArgumentError("reference_positions length must match positions length"))
 
         new{D, T}(nv, ns, copy(simplex_vertices), copy(simplex_neighbors),
-                  copy(positions), ref_pos)
+                  copy(positions), ref_pos, falses(ns))
     end
 end
 
@@ -475,3 +481,193 @@ function Base.show(io::IO, mesh::SimplicialMesh{D, T}) where {D, T}
     print(io, "SimplicialMesh{$D, $T}(",
               n_vertices(mesh), " vertices, ", n_simplices(mesh), " simplices)")
 end
+
+# ============================================================================
+# Periodic wrap-around (PR-D)
+# ============================================================================
+
+"""
+    periodic!(mesh::SimplicialMesh{D, T}, axes::NTuple{D, Bool},
+              bounds::NTuple{D, NTuple{2, T}}) -> mesh
+
+Rewire `simplex_neighbors` so that boundary faces on each periodic axis
+are identified with the matching face on the opposite side of the
+domain. `axes[d] == true` makes axis `d` periodic; `bounds[d] = (lo, hi)`
+gives the period for that axis.
+
+Two boundary faces match if their shared `(D-1)`-coordinates agree
+(within an absolute tolerance scaled to the box extent) after wrapping
+the periodic axis by its period. The wiring updates *both* affected
+entries in `simplex_neighbors`: face `k` of simplex `s` and the
+opposite-side face of the matched simplex `s'`.
+
+Faces on non-periodic-axis boundaries are left untouched (still 0).
+Faces that already had an interior neighbor are not modified — only
+boundary faces (entry == 0) are candidates for wrap-around wiring.
+
+Returns `mesh` (mutated in place).
+
+# Example
+
+```julia
+# 1D segment mesh on [0,1] with 4 segments
+mesh = SimplicialMesh{1, Float64}(...)
+periodic!(mesh, (true,), ((0.0, 1.0),))
+# Now segment 1's lo-side neighbor is segment N, etc.
+```
+"""
+function periodic!(mesh::SimplicialMesh{D, T},
+                   axes::NTuple{D, Bool},
+                   bounds::NTuple{D, NTuple{2, T}}) where {D, T}
+    # Bail out fast if no axes are periodic.
+    any(axes) || return mesh
+
+    ns = mesh.n_simplices
+
+    # Tolerance: scaled to the largest period. Coordinates are user-supplied
+    # floats; we accept a relative ε of ~1e-10 of the max extent.
+    max_extent = zero(T)
+    for d in 1:D
+        ext = bounds[d][2] - bounds[d][1]
+        ext > max_extent && (max_extent = ext)
+    end
+    tol = max(T(1e-10) * max_extent, T(0))
+
+    # For each periodic axis, find boundary faces lying on the lo-side wall
+    # and on the hi-side wall, then pair them by matching the OTHER axes'
+    # face centroid coordinates.
+    @inbounds for axis in 1:D
+        axes[axis] || continue
+        lo_wall = bounds[axis][1]
+        hi_wall = bounds[axis][2]
+
+        # A face on simplex s opposite vertex k consists of the D vertices
+        # other than vertex k. Pre-extract the boundary-face entries.
+        # `lo_faces[i] = (s, k, centroid_other_axes)` where centroid_other_axes
+        # is an NTuple{D, T} (the `axis` slot is set to 0 for matching).
+        lo_faces = Tuple{Int, Int, NTuple{D, T}}[]
+        hi_faces = Tuple{Int, Int, NTuple{D, T}}[]
+
+        for s in 1:ns, k in 1:(D + 1)
+            mesh.simplex_neighbors[k, s] == 0 || continue   # only boundary faces
+            face_pts = _face_vertex_positions(mesh, s, k)
+            # Face lies on the axis-wall iff all face vertices have the same
+            # axis-coordinate (== lo_wall or hi_wall, within tol).
+            on_lo = true
+            on_hi = true
+            for v in face_pts
+                if abs(v[axis] - lo_wall) > tol
+                    on_lo = false
+                end
+                if abs(v[axis] - hi_wall) > tol
+                    on_hi = false
+                end
+                (on_lo || on_hi) || break
+            end
+            (on_lo || on_hi) || continue
+
+            # Centroid in the OTHER axes (axis slot zeroed out).
+            cent = _face_centroid_other_axes(face_pts, axis, Val(D), T)
+            if on_lo
+                push!(lo_faces, (Int(s), Int(k), cent))
+            elseif on_hi
+                push!(hi_faces, (Int(s), Int(k), cent))
+            end
+        end
+
+        # Pair lo-face <-> hi-face by closest centroid match. We use a
+        # simple nested loop: D-1 dimensional matching, ns is small in
+        # typical use; the algorithm is O(L^2) where L is the per-wall face
+        # count. If this becomes hot, replace with a quantized hash bucket.
+        used_hi = falses(length(hi_faces))
+        for (s_lo, k_lo, cent_lo) in lo_faces
+            best_j = 0
+            best_d2 = T(Inf)
+            for j in eachindex(hi_faces)
+                used_hi[j] && continue
+                cent_hi = hi_faces[j][3]
+                d2 = zero(T)
+                for d in 1:D
+                    d == axis && continue
+                    Δ = cent_lo[d] - cent_hi[d]
+                    d2 += Δ * Δ
+                end
+                if d2 < best_d2
+                    best_d2 = d2
+                    best_j = j
+                end
+            end
+            best_j == 0 && continue
+            # Require a match within tol^2 (squared distance).
+            best_d2 <= tol * tol + eps(T) || continue
+            s_hi, k_hi, _ = hi_faces[best_j]
+            mesh.simplex_neighbors[k_lo, s_lo] = Int32(s_hi)
+            mesh.simplex_neighbors[k_hi, s_hi] = Int32(s_lo)
+            used_hi[best_j] = true
+        end
+    end
+
+    return mesh
+end
+
+# Vertex positions of the face of simplex `s` opposite vertex `k`.
+# Returns an NTuple of length D (D vertices form a (D-1)-face).
+@inline function _face_vertex_positions(mesh::SimplicialMesh{D, T},
+                                         s::Integer, k::Integer) where {D, T}
+    # Build a tuple of length D, skipping the k-th vertex.
+    return ntuple(Val(D)) do i
+        idx = i < k ? i : i + 1
+        mesh.positions[mesh.simplex_vertices[idx, s]]
+    end
+end
+
+# Centroid of the D face-vertices, with the periodic axis slot zeroed
+# (so it doesn't contribute to matching).
+@inline function _face_centroid_other_axes(face_pts, axis::Integer,
+                                            ::Val{D}, ::Type{T}) where {D, T}
+    return ntuple(Val(D)) do d
+        if d == axis
+            zero(T)
+        else
+            s = zero(T)
+            for v in face_pts
+                s += v[d]
+            end
+            s / T(length(face_pts))
+        end
+    end
+end
+
+# ============================================================================
+# Dirichlet pinned simplices (PR-D)
+# ============================================================================
+
+"""
+    pin_boundary_simplices!(mesh::SimplicialMesh, simplex_indices) -> mesh
+
+Mark each simplex listed in `simplex_indices` as Dirichlet-pinned. Pinned
+simplices are advisory: downstream Lagrangian motion code reads
+`is_pinned` and clamps the vertex velocities of pinned simplices to zero
+(or to a prescribed Dirichlet value). The geometric overlap and remap
+operators do not consume this flag.
+
+Indices outside `1:n_simplices(mesh)` raise `BoundsError`.
+"""
+function pin_boundary_simplices!(mesh::SimplicialMesh, simplex_indices)
+    ns = mesh.n_simplices
+    for i in simplex_indices
+        (1 <= i <= ns) || throw(BoundsError(mesh, i))
+        mesh.pinned[i] = true
+    end
+    return mesh
+end
+
+"""
+    is_pinned(mesh::SimplicialMesh, i::Integer) -> Bool
+
+Whether simplex `i` has been Dirichlet-pinned via
+[`pin_boundary_simplices!`](@ref). Default is `false` for newly-constructed
+meshes.
+"""
+@inline is_pinned(mesh::SimplicialMesh, i::Integer) = mesh.pinned[i]
+
