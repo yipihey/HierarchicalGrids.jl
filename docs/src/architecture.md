@@ -151,6 +151,30 @@ In HierarchicalGrids, adding a new physics module means adding a new struct that
 
 The cost is some indirection: instead of `grid->density[i]`, you write `fields.density[i]`. The benefit is decades of clean evolution.
 
+## Cross-cutting topics
+
+A few features cut across several layers and are documented in their
+own files:
+
+- [Refinement events](refinement_events.md) — `RefinementEvent` and
+  the `register_refinement_listener!` / `unregister_refinement_listener!`
+  observer pattern that keeps external state (fields, particle bins,
+  derived caches) consistent across batched mesh changes.
+- [Neighbors and halos](neighbors_and_halos.md) — the lazily-built
+  face-neighbor graph (`face_neighbors`, `face_fine_neighbors`,
+  `cell_adjacency_sparsity`) and the `HaloView` stencil-indexing
+  wrapper. A balanced `HierarchicalMesh` (`balanced::Bool` constructor
+  flag) limits the level gap on any face to 1.
+- [Boundary conditions](boundary_conditions.md) — the `BCKind` enum,
+  `BoundarySpec`, `FrameBoundaries{D}`, the periodic Lagrangian wrap
+  (`periodic!`), and the Dirichlet pin (`pin_boundary_simplices!`,
+  `is_pinned`).
+- [Topology-only AMR driver](amr_driver.md) — `step_with_amr!` is a
+  small interleaver that calls a user `step!` callback and periodically
+  invokes `refine_by_indicator!` on a hysteresis schedule. Kept
+  intentionally minimal; per-cell state stays consistent via the
+  refinement-listener mechanism.
+
 ## What we expect to add
 
 - **Patch-based AMR (Berger-Oliger).** Some physics works better with patches than cell-trees. The geometry and mesh layers are sufficient to support patches as a parallel mesh type; we'll add this when we have a use case.

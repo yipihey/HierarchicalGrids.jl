@@ -87,6 +87,12 @@ ov = compute_overlap(lag, frame; moment_order=1, leaf_size=8)
 @assert total_overlap_volume(ov) ≈ 1.0   # exact mass conservation
 ```
 
+The same call works for `D = 1` (intervals against a 1D
+hierarchical mesh) and `D = 3` (tetrahedra against an octree). For
+1D, the underlying clip is `Geometry.interval_intersection`; the rest
+of the API — moments, polynomial remap, the streaming variants —
+follows the higher-D code path unchanged.
+
 That's it for the geometry. From here, polynomial remap is a few lines:
 
 ```julia
@@ -217,6 +223,40 @@ region. In two-stream regions of cosmological flows, this gives the
 correct multi-stream density; for general flows where inversion is an
 artifact, you probably want to detect inversion separately and decide
 how to handle it.
+
+## Diagnostics
+
+`RemapDiagnostics{T}` is a mutable accumulator passed through to the
+polynomial remap routines for shell-crossing surveillance and kernel
+sanity checks:
+
+- `liouville_min`, `liouville_max` — extrema of the per-pair Jacobian
+  proxy `entry.volume / source_physical_volume`. Values close to zero
+  flag candidate shell-crossings; values far from one flag unusual
+  stretch.
+- `total_volume_in`, `total_volume_out` — accumulated overlap volumes
+  on the source and target sides. Each entry contributes `entry.volume`
+  to both, so the running totals must agree.
+- `n_negative_jacobian_cells` — count of entries with non-positive
+  Jacobian proxy. `compute_overlap` guarantees positive volumes, so a
+  non-zero count signals upstream corruption (e.g. a Lagrangian simplex
+  that inverted past the builder's checks).
+
+```julia
+diag = RemapDiagnostics(Float64)
+polynomial_remap_l_to_e!(eul_field, lag_field, ov; diagnostics = diag)
+@show diag
+@assert diag.total_volume_in ≈ diag.total_volume_out
+@assert diag.n_negative_jacobian_cells == 0
+
+# Reuse across passes:
+reset!(diag)
+# Or reduce thread-local copies via Base.merge!(d_acc, d_thread).
+```
+
+`total_overlap_volume(ov)` and `n_entries(ov)` cover the lighter
+geometry-only summary; `RemapDiagnostics` is the heavier per-remap
+sanity check.
 
 ## Performance notes
 

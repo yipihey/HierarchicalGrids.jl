@@ -26,7 +26,7 @@ n_cells(mesh)            # → 1
 is_leaf(mesh.cells[1])   # → true
 ```
 
-The `{3}` parameter is the dimension. The framework supports arbitrary dimension; you can equally write `HierarchicalMesh{2}()` or `HierarchicalMesh{4}()`.
+The `{3}` parameter is the dimension. The framework supports arbitrary dimension; you can equally write `HierarchicalMesh{1}()`, `HierarchicalMesh{2}()`, or `HierarchicalMesh{4}()`. The 1D case is fully supported end-to-end: `compute_overlap`, polynomial remap, neighbor graph, halos, and AMR all work for `D = 1`.
 
 ## Refinement
 
@@ -150,7 +150,37 @@ for i in (old_n + 1):new_n
 end
 ```
 
-(In a real solver you'd plug in a refinement-aware initialization that interpolates from parent values; the framework gives you the indices, you supply the policy.)
+(In a real solver you'd plug in a refinement-aware initialization that interpolates from parent values; the framework gives you the indices, you supply the policy. For batched updates, register a listener once and the framework will dispatch a `RefinementEvent` after every refine/coarsen — see [Refinement events](refinement_events.md).)
+
+## Initializing a polynomial field from a function
+
+For polynomial-coefficient field storage, `init_field_from!` runs a
+per-cell L² projection of an analytical function onto the field's
+basis. Two methods cover both Eulerian and Lagrangian setups:
+
+```julia
+using HierarchicalGrids
+
+# Eulerian: project onto every cell of an EulerianFrame
+mesh  = HierarchicalMesh{2}()
+refine_cells!(mesh, [1])
+frame = EulerianFrame(mesh, (0.0, 0.0), (1.0, 1.0))
+
+field = allocate_polynomial_fields(SoA(), BernsteinBasis{2, 2}(),
+                                    n_cells(mesh); rho = Float64)
+init_field_from!(field, frame, x -> 1.0 + 0.5 * sinpi(2 * x[1]))
+
+# Lagrangian: project onto every simplex of a SimplicialMesh
+lag = SimplicialMesh{2, Float64}(...)
+lag_field = allocate_polynomial_fields(SoA(), BernsteinBasis{2, 1}(),
+                                        n_simplices(lag); rho = Float64)
+init_field_from!(lag_field, lag, x -> 1.0 + 0.1 * x[2])
+```
+
+The default quadrature order (`2P + 1`, exact for two degree-`P` basis
+functions) is sufficient for polynomial inputs; pass a larger
+`quadrature_order` keyword for trigonometric or otherwise nonsmooth
+functions.
 
 ## Volumes and conservation
 
@@ -245,4 +275,7 @@ end
 
 - Read `architecture.md` for the why behind these design choices.
 - Read `layouts.md` for a deeper look at the Storage layer and how to add new layouts.
+- Read `neighbors_and_halos.md` for face adjacency, sparsity patterns, and the `HaloView` stencil wrapper.
+- Read `boundary_conditions.md` for `BCKind`, `FrameBoundaries`, and the periodic Lagrangian wrap helper.
+- Read `refinement_events.md` and `amr_driver.md` for keeping state in sync across AMR cycles, and for the topology-only driver `step_with_amr!`.
 - Look at `examples/dsmc/` for a real mini-application that uses everything described above.
