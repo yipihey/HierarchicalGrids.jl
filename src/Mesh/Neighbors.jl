@@ -3,23 +3,28 @@
 
 Face-neighbor adjacency for `HierarchicalMesh`.
 
-# Algorithm
+# Algorithm: path-walking face-neighbor finder
 
-Each leaf cell `i` lives in a unit reference box `[0,1]^D` whose AABB is
-recovered by walking the parent chain of `i` from the root and applying the
-sibling/split-mask coordinates of every step. Two leaves are face-neighbors
-along axis `d`, side `s ∈ {lo, hi}`, iff their unit-cube AABBs share a
-`(D-1)`-face: they agree on axes other than `d` (with positive overlap), and
-they touch on axis `d` (one cell's hi face equals the other cell's lo face,
-within a tolerance scaled to the deepest split level).
+For each leaf cell `i` and each face `(axis d, side s ∈ {lo, hi})`:
 
-For the first cut (PR-C, correctness-first), the implementation computes
-unit-cube AABBs once per leaf in `O(N * depth_avg)` and then performs
-`O(2D * N_leaves)` face lookups against an axis-bucketed leaf list. This is
-quadratic in the worst case but well below the cost of a full polytope
-clip; the data structure is a pure `Vector{NTuple{2D, UInt32}}` for
-representative neighbors plus a `Dict` of fine-neighbor lists for
-hanging-node faces (only populated when the mesh is unbalanced).
+1. Walk up the parent chain from `i`. At each step, examine the cell's own
+   `position_in_parent` on axis `d`. The first ancestor `e*` whose split
+   mask includes axis `d` AND whose own `pos_d == 1 - s` marks the level
+   at which the path crosses axis `d` on side `s`.
+2. The mirror sibling `M` of `e*` (same parent, axis-`d` position flipped
+   to `s`) is the root of the subtree containing the face-neighbor.
+3. Descend `M`, mirroring the upward path's axis-`d` positions but
+   flipping side `s ↔ 1 - s` at every step where axis `d` is split. At
+   each step, if the current node is a leaf, that's the (potentially
+   coarse) face-neighbor. If we exhaust the path while still at a non-leaf
+   interior node, enumerate ALL descendant leaves on the matching face —
+   those are the fine neighbors (multi-many on unbalanced meshes).
+4. If the upward walk reaches the root without finding such an ancestor,
+   the face is on the domain boundary (returns 0).
+
+This runs in `O(N · D · depth_max)` worst case, asymptotically replacing
+the previous axis-bucket strategy that was `O(N²)` worst-case (when many
+leaves quantized to the same bucket key on degenerate axis-aligned cuts).
 
 # Coarse-fine face contract
 
@@ -158,14 +163,214 @@ const _NEIGHBOR_EPS = 1e-12
     return (a_hi > b_lo + _NEIGHBOR_EPS) && (b_hi > a_lo + _NEIGHBOR_EPS)
 end
 
+# ---------------------------------------------------------------------------
+# Path-walking helpers
+# ---------------------------------------------------------------------------
+
+# Position-in-parent on axis d for a cell with given (sibling_index, mask).
+# Returns 0 (lo half) or 1 (hi half). If axis d is NOT in the mask, returns
+# 0 — but in that case axis d is "passed through" (the cell occupies its
+# parent's full axis-d extent), so the caller must check `_axis_in_mask`.
+@inline function _pos_on_axis(sib::Unsigned, mask::Unsigned, d::Integer)
+    expanded = pdep(UInt32(sib), UInt32(mask))
+    return Int((expanded >> (d - 1)) & UInt32(1))
+end
+
+@inline function _axis_in_mask(mask::Unsigned, d::Integer)
+    return (UInt32(mask) >> (d - 1)) & UInt32(1) != 0
+end
+
+# Flip the axis-d bit of a sibling index, given the cell's mask. Used to
+# produce the "mirror" sibling that is the same as `sib` on every other
+# split axis but on the opposite half of axis d.
+@inline function _flip_axis(sib::Unsigned, mask::Unsigned, d::Integer)
+    M_ = typeof(sib)
+    # The PEXT/PDEP roundtrip would re-pack bits; cheaper to xor the
+    # appropriate bit position directly.
+    # The bit position of axis d within `sib` is the popcount of mask bits
+    # below d.
+    bit_pos = count_ones(UInt32(mask) & ((UInt32(1) << (d - 1)) - UInt32(1)))
+    return sib ⊻ (M_(1) << bit_pos)
+end
+
+# Find the child of `parent_idx` (a non-leaf cell) whose sibling_index
+# matches `target_sib`. Returns 0 if no such child (e.g., split mask
+# disagreement).
+function _find_child_with_sib(mesh::HierarchicalMesh{D, M},
+                              parent_idx::UInt32, target_sib::M) where {D, M}
+    children = find_children(mesh, parent_idx)
+    for ci in children
+        if mesh.cells[ci].sibling_index == target_sib
+            return ci
+        end
+    end
+    return UInt32(0)
+end
+
+# Enumerate all leaves of `subtree_root`'s subtree that touch axis-d on the
+# `target_side` (0 = lo, 1 = hi) face of `subtree_root`. At each non-leaf
+# encountered, descend only into children whose pos on axis d is the
+# target side (when axis d is split there) or all children (when axis d
+# is unsplit at that level — the children pass through axis d).
+#
+# `out` accumulates the leaf cell indices.
+function _collect_face_leaves!(out::Vector{UInt32},
+                                mesh::HierarchicalMesh{D, M},
+                                subtree_root::UInt32,
+                                d::Integer, target_side::Int) where {D, M}
+    cell = mesh.cells[subtree_root]
+    if is_leaf(cell)
+        push!(out, subtree_root)
+        return out
+    end
+    children = find_children(mesh, subtree_root)
+    mask = mesh.cells[children[1]].split_mask
+    if _axis_in_mask(mask, d)
+        # Only follow children with pos_d == target_side
+        for ci in children
+            child_cell = mesh.cells[ci]
+            if _pos_on_axis(child_cell.sibling_index, mask, d) == target_side
+                _collect_face_leaves!(out, mesh, ci, d, target_side)
+            end
+        end
+    else
+        # Axis d not split here; recurse into all children.
+        for ci in children
+            _collect_face_leaves!(out, mesh, ci, d, target_side)
+        end
+    end
+    return out
+end
+
+# Locate the face-neighbor (or neighbors) of leaf `i` on face (axis d,
+# side s). Returns a tuple (representative, fine_list_or_nothing) where
+# `representative` is 0 if the face is on the domain boundary, otherwise
+# the lowest-indexed neighbor leaf. `fine_list_or_nothing` is `nothing`
+# unless there are >1 fine neighbors, in which case it is a sorted
+# Vector{UInt32}.
+function _path_face_neighbor(mesh::HierarchicalMesh{D, M},
+                              i::UInt32, d::Integer, s::Int) where {D, M}
+    parents = mesh._parents
+
+    # ---- Phase 1: walk up to find e*. We collect the path from leaf
+    # toward root, recording (sib, mask) at each step. The walk stops when
+    # we encounter an ancestor whose own pos on axis d is `1 - s`. That
+    # ancestor exists iff at some point our path crossed axis d on side s.
+    chain_sibs  = M[]      # sibling_indices encountered, leaf-first
+    chain_masks = M[]      # split_masks encountered, leaf-first
+
+    current = i
+    e_star::UInt32 = UInt32(0)        # the ancestor cell (cell id)
+    parent_of_e_star::UInt32 = UInt32(0)
+    other_side = 1 - s
+    while current != ROOT_PARENT && parents[current] != ROOT_PARENT
+        cell = mesh.cells[current]
+        sib  = cell.sibling_index
+        mask = cell.split_mask
+        if _axis_in_mask(mask, d) && _pos_on_axis(sib, mask, d) == other_side
+            e_star = current
+            parent_of_e_star = parents[current]
+            break
+        end
+        push!(chain_sibs, sib)
+        push!(chain_masks, mask)
+        current = parents[current]
+    end
+
+    if e_star == 0
+        # Walked to root without crossing — domain boundary.
+        return (UInt32(0), nothing)
+    end
+
+    # ---- Phase 2: navigate to the mirror sibling M of e*.
+    e_cell = mesh.cells[e_star]
+    e_mask = e_cell.split_mask
+    e_sib  = e_cell.sibling_index
+    mirror_sib = _flip_axis(e_sib, e_mask, d)
+    M_idx = _find_child_with_sib(mesh, parent_of_e_star, mirror_sib)
+    if M_idx == 0
+        # Should not happen: siblings are always present when the parent
+        # was refined. Defensive bail-out.
+        return (UInt32(0), nothing)
+    end
+
+    # ---- Phase 3: descend M, consuming chain entries from the END
+    # (closest to e*) down toward i (closest to leaf). At each entry we
+    # flip axis d.
+    cur = M_idx
+    # The chain is leaf-first; we want to consume from the entry just
+    # below e*, which is at the END of the chain (the last pushed entry
+    # was the cell directly below e*; the first pushed was i itself).
+    # Wait: chain_sibs[1] = i's own sib/mask, chain_sibs[end] = the cell
+    # directly below e* (i.e., e*'s child on the i-path). To descend from
+    # M, we want to start with the entry that is e*'s child on i's path,
+    # then go deeper. So iterate end -> 1.
+    k = length(chain_sibs)
+    while k >= 1
+        cur_cell = mesh.cells[cur]
+        if is_leaf(cur_cell)
+            # Coarse neighbor; we found a leaf before exhausting the path.
+            return (cur, nothing)
+        end
+        # Compute the target sibling for the descent step.
+        path_sib  = chain_sibs[k]
+        path_mask = chain_masks[k]
+        cur_mask  = cur_cell.split_mask
+        if cur_mask == path_mask && _axis_in_mask(cur_mask, d)
+            # Same split pattern: just flip axis d in the path's sibling.
+            target_sib = _flip_axis(path_sib, cur_mask, d)
+            child_idx = _find_child_with_sib(mesh, cur, target_sib)
+            if child_idx == 0
+                # Mismatch (shouldn't normally happen with same mask, but
+                # fall back to face enumeration).
+                break
+            end
+            cur = child_idx
+            k -= 1
+        else
+            # Split-mask divergence between path and current subtree
+            # (anisotropic refinement variation). Fall back to face
+            # enumeration of the matching face from `cur`.
+            break
+        end
+    end
+
+    # ---- Phase 4: at `cur`, collect all leaf descendants on the matching
+    # face. The matching face on `cur` is the (1 - s)-side of axis d (the
+    # face that touches our cell's side-s face).
+    cur_cell = mesh.cells[cur]
+    if is_leaf(cur_cell)
+        return (cur, nothing)
+    end
+    matching_side = 1 - s
+    collected = UInt32[]
+    _collect_face_leaves!(collected, mesh, cur, d, matching_side)
+    if isempty(collected)
+        return (UInt32(0), nothing)
+    elseif length(collected) == 1
+        return (collected[1], nothing)
+    else
+        sort!(collected)
+        rep = collected[1]
+        return (rep, collected)
+    end
+end
+
 """
     build_neighbor_graph(mesh::HierarchicalMesh{D, M}) -> NeighborGraph{D, M}
 
-Build the face-neighbor adjacency from scratch by computing unit-cube AABBs
-for every leaf and matching faces. O(N_leaves^2) in the worst case but with
-small constants and early termination on axis disagreement.
+Build the face-neighbor adjacency by walking the parent chain of each leaf.
+For each leaf and each face `(axis d, side s)`, locate the lowest ancestor
+whose path crosses axis `d` on side `s`, navigate to its mirror sibling,
+and descend the mirror subtree to find the face-neighbor (or enumerate
+multiple fine neighbors at hanging-node faces).
+
+Worst-case cost: `O(N · D · depth_max)` for the per-leaf path walks plus
+`O(adjacency)` for fine-leaf enumeration. The previous bucket-based
+implementation was `O(N²)` worst-case.
 """
 function build_neighbor_graph(mesh::HierarchicalMesh{D, M}) where {D, M}
+    ensure_caches!(mesh)
     n = n_cells(mesh)
     F = 2 * D
     representatives = fill(ntuple(_ -> UInt32(0), Val(2*D)), n)
@@ -175,142 +380,29 @@ function build_neighbor_graph(mesh::HierarchicalMesh{D, M}) where {D, M}
         return NeighborGraph{D, M}(representatives, fine)
     end
 
-    # Collect leaves and their unit-cube boxes.
-    leaf_indices = UInt32[]
-    leaf_lo  = NTuple{D, Float64}[]
-    leaf_hi  = NTuple{D, Float64}[]
-    sizehint!(leaf_indices, n)
-    sizehint!(leaf_lo, n)
-    sizehint!(leaf_hi, n)
+    face_buf = Vector{UInt32}(undef, F)
+
     @inbounds for i in 1:n
-        if is_leaf(mesh.cells[i])
-            (lo, hi) = _unit_box(mesh, i)
-            push!(leaf_indices, UInt32(i))
-            push!(leaf_lo, lo)
-            push!(leaf_hi, hi)
-        end
-    end
-    L = length(leaf_indices)
-
-    # Bucket leaves by axis-d coordinate of their lo / hi face. We use a
-    # dictionary keyed by a discretization of the coordinate, so that
-    # candidate faces share an O(1) lookup. The granularity is the smallest
-    # representable splitting at depth 32 — well below practical depths.
-    quantize(x) = round(Int64, x / _NEIGHBOR_EPS)
-
-    # For each axis d, two dicts: cells whose `lo`-face is at coordinate q,
-    # cells whose `hi`-face is at coordinate q.
-    lo_buckets = ntuple(_ -> Dict{Int64, Vector{Int}}(), Val(D))
-    hi_buckets = ntuple(_ -> Dict{Int64, Vector{Int}}(), Val(D))
-    @inbounds for li in 1:L
-        for d in 1:D
-            push!(get!(lo_buckets[d], quantize(leaf_lo[li][d]), Int[]), li)
-            push!(get!(hi_buckets[d], quantize(leaf_hi[li][d]), Int[]), li)
-        end
-    end
-
-    # For each leaf i, for each face (axis d, side s), collect candidate
-    # neighbors from the opposite-bucket at the matching coordinate, then
-    # filter by overlap on the OTHER axes.
-    @inbounds for li in 1:L
-        i_idx = leaf_indices[li]
-        a_lo = leaf_lo[li]
-        a_hi = leaf_hi[li]
-
-        face_arr = Vector{UInt32}(undef, F)
+        is_leaf(mesh.cells[i]) || continue
+        i32 = UInt32(i)
         for f in 1:F
-            face_arr[f] = UInt32(0)
+            face_buf[f] = UInt32(0)
         end
-
         for d in 1:D
-            # face f = 2d-1 (lo side). Our lo[d] face touches neighbors
-            # whose hi[d] equals our lo[d].
-            face_lo_idx = 2*d - 1
-            face_hi_idx = 2*d
-            qlo = quantize(a_lo[d])
-            qhi = quantize(a_hi[d])
-
-            # Skip immediately if our face is at the domain boundary
-            # (lo[d] == 0 or hi[d] == 1). Boundary check is cheap and
-            # avoids walking the whole bucket of all cells on the boundary.
-            on_lo_boundary = a_lo[d] <= _NEIGHBOR_EPS
-            on_hi_boundary = a_hi[d] >= 1.0 - _NEIGHBOR_EPS
-
-            # --- LO side ---
-            if !on_lo_boundary
-                cands = get(hi_buckets[d], qlo, nothing)
-                if cands !== nothing
-                    fine_list = UInt32[]
-                    rep::UInt32 = UInt32(0)
-                    for cj in cands
-                        cj == li && continue
-                        b_lo = leaf_lo[cj]
-                        b_hi = leaf_hi[cj]
-                        # axis-d hi of cj must touch our lo
-                        # (already guaranteed by bucket)
-                        # All OTHER axes must overlap with positive measure
-                        ok = true
-                        for d2 in 1:D
-                            d2 == d && continue
-                            if !_open_overlap(a_lo[d2], a_hi[d2], b_lo[d2], b_hi[d2])
-                                ok = false
-                                break
-                            end
-                        end
-                        ok || continue
-                        j_idx = leaf_indices[cj]
-                        push!(fine_list, j_idx)
-                        if rep == 0 || j_idx < rep
-                            rep = j_idx
-                        end
-                    end
-                    if rep != 0
-                        face_arr[face_lo_idx] = rep
-                        if length(fine_list) > 1
-                            sort!(fine_list)
-                            fine[(i_idx, UInt8(face_lo_idx))] = fine_list
-                        end
-                    end
-                end
+            # lo side (s = 0), face index 2d - 1
+            (rep_lo, fl_lo) = _path_face_neighbor(mesh, i32, d, 0)
+            face_buf[2*d - 1] = rep_lo
+            if fl_lo !== nothing
+                fine[(i32, UInt8(2*d - 1))] = fl_lo
             end
-
-            # --- HI side ---
-            if !on_hi_boundary
-                cands = get(lo_buckets[d], qhi, nothing)
-                if cands !== nothing
-                    fine_list = UInt32[]
-                    rep = UInt32(0)
-                    for cj in cands
-                        cj == li && continue
-                        b_lo = leaf_lo[cj]
-                        b_hi = leaf_hi[cj]
-                        ok = true
-                        for d2 in 1:D
-                            d2 == d && continue
-                            if !_open_overlap(a_lo[d2], a_hi[d2], b_lo[d2], b_hi[d2])
-                                ok = false
-                                break
-                            end
-                        end
-                        ok || continue
-                        j_idx = leaf_indices[cj]
-                        push!(fine_list, j_idx)
-                        if rep == 0 || j_idx < rep
-                            rep = j_idx
-                        end
-                    end
-                    if rep != 0
-                        face_arr[face_hi_idx] = rep
-                        if length(fine_list) > 1
-                            sort!(fine_list)
-                            fine[(i_idx, UInt8(face_hi_idx))] = fine_list
-                        end
-                    end
-                end
+            # hi side (s = 1), face index 2d
+            (rep_hi, fl_hi) = _path_face_neighbor(mesh, i32, d, 1)
+            face_buf[2*d] = rep_hi
+            if fl_hi !== nothing
+                fine[(i32, UInt8(2*d))] = fl_hi
             end
         end
-
-        representatives[i_idx] = ntuple(f -> face_arr[f], Val(2*D))
+        representatives[i] = ntuple(f -> face_buf[f], Val(2*D))
     end
 
     return NeighborGraph{D, M}(representatives, fine)
