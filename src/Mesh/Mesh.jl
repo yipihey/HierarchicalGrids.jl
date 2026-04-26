@@ -61,6 +61,8 @@ export rebuild_caches!, invalidate_caches!, caches_valid
 export refine_cells!, coarsen_cells!
 export cell_path, CellPath, find_at_path
 export ROOT_PARENT  # sentinel value
+export RefinementEvent, ListenerHandle
+export register_refinement_listener!, unregister_refinement_listener!
 
 # SimplicialMesh exports (added below)
 export SimplicialMesh
@@ -234,6 +236,12 @@ mutable struct HierarchicalMesh{D, M<:Unsigned}
     _parents::Vector{UInt32}
     _subtree_sizes::Vector{UInt32}
     _cache_valid::Bool
+
+    # Refinement-event observers. Each entry is a (handle, callback) tuple.
+    # `Any` is used so that closures (do…end blocks) can be stored without
+    # forcing all callers to share a callable type.
+    _listeners::Vector{Any}
+    _next_listener_handle::UInt64
 end
 
 """
@@ -251,7 +259,9 @@ function HierarchicalMesh{D}() where D
         Int16[],                     # empty caches
         UInt32[],
         UInt32[],
-        false                        # caches invalid
+        false,                       # caches invalid
+        Any[],                       # no listeners yet
+        UInt64(1)                    # next handle starts at 1
     )
 end
 
@@ -586,6 +596,110 @@ function find_at_path(mesh::HierarchicalMesh{D, M}, path::CellPath{D, M}) where 
 end
 
 # ============================================================================
+# Refinement events and listener API
+# ============================================================================
+
+"""
+    RefinementEvent
+
+Describes a single batched mesh modification, carrying enough information for
+downstream per-cell storage to resize and permute its arrays so cell indices
+stay aligned with the mesh after the event.
+
+# Fields
+- `refined_parents::Vector{UInt32}` — OLD indices of cells that became non-leaf
+  parents in this batch. Empty for a pure-coarsen event.
+- `new_children::Vector{UnitRange{UInt32}}` — parallel to `refined_parents`;
+  `new_children[k]` is the NEW-index range of children produced by refining
+  `refined_parents[k]`.
+- `coarsened_parents::Vector{UInt32}` — NEW indices of cells that became leaf
+  again in this batch. Empty for a pure-refine event.
+- `removed_old_indices::Vector{UInt32}` — OLD indices of cells that were
+  removed by coarsening (children of `coarsened_parents`).
+- `index_remap::Vector{UInt32}` — length = old `n_cells`. `index_remap[old_i]
+  == 0` means the old cell was removed; otherwise it is the new index.
+"""
+struct RefinementEvent
+    refined_parents::Vector{UInt32}
+    new_children::Vector{UnitRange{UInt32}}
+    coarsened_parents::Vector{UInt32}
+    removed_old_indices::Vector{UInt32}
+    index_remap::Vector{UInt32}
+end
+
+"""
+    ListenerHandle
+
+Opaque handle returned by [`register_refinement_listener!`](@ref) and accepted
+by [`unregister_refinement_listener!`](@ref).
+"""
+const ListenerHandle = UInt64
+
+"""
+    register_refinement_listener!(mesh::HierarchicalMesh, callback) -> ListenerHandle
+
+Register `callback(event::RefinementEvent)` to be invoked after every
+`refine_cells!`/`coarsen_cells!` call on `mesh`. Returns an opaque handle
+usable with [`unregister_refinement_listener!`](@ref).
+
+Listener exceptions are caught and rethrown AFTER cache invalidation so the
+mesh is left in a consistent state. Order of invocation matches registration
+order. Listeners registered during a callback are not fired for the current
+event (the listener list is snapshotted before iteration).
+"""
+function register_refinement_listener!(mesh::HierarchicalMesh, callback)::ListenerHandle
+    handle = mesh._next_listener_handle
+    mesh._next_listener_handle = handle + UInt64(1)
+    push!(mesh._listeners, (handle, callback))
+    return handle
+end
+
+"""
+    unregister_refinement_listener!(mesh::HierarchicalMesh, handle::ListenerHandle) -> Bool
+
+Remove the listener identified by `handle`. Returns `true` if found and
+removed, `false` otherwise.
+"""
+function unregister_refinement_listener!(mesh::HierarchicalMesh, handle::ListenerHandle)::Bool
+    listeners = mesh._listeners
+    for k in eachindex(listeners)
+        h, _ = listeners[k]::Tuple{UInt64, Any}
+        if h == handle
+            deleteat!(listeners, k)
+            return true
+        end
+    end
+    return false
+end
+
+# Internal: dispatch an event to all currently-registered listeners.
+# Snapshots the listener list so registrations made by callbacks do not see
+# the in-flight event. Catches exceptions, allowing every listener to run,
+# and rethrows the first exception only after all listeners have been called.
+function _fire_refinement_event!(mesh::HierarchicalMesh, event::RefinementEvent)
+    # Snapshot so listeners that re-register / unregister don't disturb iteration.
+    snapshot = copy(mesh._listeners)
+    first_err = nothing
+    first_bt = nothing
+    for entry in snapshot
+        _, cb = entry::Tuple{UInt64, Any}
+        try
+            cb(event)
+        catch err
+            if first_err === nothing
+                first_err = err
+                first_bt = catch_backtrace()
+            end
+        end
+    end
+    if first_err !== nothing
+        # Rethrow with the original backtrace so the caller sees the original site.
+        Base.rethrow(first_err)
+    end
+    return mesh
+end
+
+# ============================================================================
 # Refinement and coarsening
 # ============================================================================
 
@@ -648,6 +762,23 @@ function refine_cells!(mesh::HierarchicalMesh{D, M}, cell_indices,
     refine_set = Set(sorted_indices)
     refine_mask_dict = Dict(sorted_indices[i] => sorted_masks[i] for i in eachindex(sorted_indices))
 
+    # Track event data only if there are listeners (event construction
+    # allocates; the no-listener fast path keeps refine_cells! at its
+    # original allocation cost).
+    fire_event = !isempty(mesh._listeners)
+    index_remap = fire_event ? Vector{UInt32}(undef, n_old) : UInt32[]
+    new_children_ranges = fire_event ?
+        Vector{UnitRange{UInt32}}(undef, length(sorted_indices)) :
+        UnitRange{UInt32}[]
+    # Map old refined-cell index -> position in sorted_indices, so we know
+    # which slot of `new_children_ranges` to fill. Built only when needed.
+    refined_pos = if fire_event
+        Dict{UInt32, Int}(UInt32(sorted_indices[i]) => i
+                          for i in eachindex(sorted_indices))
+    else
+        Dict{UInt32, Int}()
+    end
+
     write_idx = 1
     for read_idx in 1:n_old
         old_cell = mesh.cells[read_idx]
@@ -655,15 +786,20 @@ function refine_cells!(mesh::HierarchicalMesh{D, M}, cell_indices,
         if read_idx in refine_set
             # Mark this cell as non-leaf, with the chosen split_mask
             mask = refine_mask_dict[read_idx]
+            parent_new_idx = UInt32(write_idx)
             new_cells[write_idx] = CellMeta{D, M}(
                 old_cell.sibling_index,
                 mask,                       # update split_mask to indicate refinement pattern
                 old_cell.flags & ~FLAG_LEAF  # clear leaf flag
             )
+            if fire_event
+                @inbounds index_remap[read_idx] = parent_new_idx
+            end
             write_idx += 1
 
             # Add children
             n_children = children_count(mask)
+            child_start = UInt32(write_idx)
             for child_sib in 0:(n_children - 1)
                 new_cells[write_idx] = CellMeta{D, M}(
                     M(child_sib),
@@ -672,9 +808,16 @@ function refine_cells!(mesh::HierarchicalMesh{D, M}, cell_indices,
                 )
                 write_idx += 1
             end
+            if fire_event
+                child_end = UInt32(write_idx - 1)
+                @inbounds new_children_ranges[refined_pos[UInt32(read_idx)]] = child_start:child_end
+            end
         else
             # Copy unchanged
             new_cells[write_idx] = old_cell
+            if fire_event
+                @inbounds index_remap[read_idx] = UInt32(write_idx)
+            end
             write_idx += 1
         end
     end
@@ -683,6 +826,18 @@ function refine_cells!(mesh::HierarchicalMesh{D, M}, cell_indices,
 
     mesh.cells = new_cells
     invalidate_caches!(mesh)
+
+    if fire_event
+        event = RefinementEvent(
+            UInt32.(sorted_indices),
+            new_children_ranges,
+            UInt32[],
+            UInt32[],
+            index_remap,
+        )
+        _fire_refinement_event!(mesh, event)
+    end
+
     return mesh
 end
 
@@ -728,6 +883,21 @@ function coarsen_cells!(mesh::HierarchicalMesh{D, M}, parent_indices) where {D, 
     new_cells = Vector{CellMeta{D, M}}(undef, new_n)
 
     coarsen_set = Set(sorted)
+
+    # Event bookkeeping only when there's a listener.
+    fire_event = !isempty(mesh._listeners)
+    index_remap = fire_event ? Vector{UInt32}(undef, n_old) : UInt32[]
+    coarsened_new = fire_event ? Vector{UInt32}(undef, length(sorted)) : UInt32[]
+    # Build coarsened_new in the order of `sorted`. We fill via a dict for
+    # deterministic order matching the sorted parent indices.
+    coarsened_pos = if fire_event
+        Dict{UInt32, Int}(UInt32(sorted[i]) => i for i in eachindex(sorted))
+    else
+        Dict{UInt32, Int}()
+    end
+    removed_old = fire_event ? Vector{UInt32}(undef, length(to_remove)) : UInt32[]
+    removed_count = 0
+
     write_idx = 1
     for read_idx in 1:n_old
         if read_idx in coarsen_set
@@ -738,12 +908,24 @@ function coarsen_cells!(mesh::HierarchicalMesh{D, M}, parent_indices) where {D, 
                 old_cell.split_mask,
                 old_cell.flags | FLAG_LEAF
             )
+            if fire_event
+                @inbounds index_remap[read_idx] = UInt32(write_idx)
+                @inbounds coarsened_new[coarsened_pos[UInt32(read_idx)]] = UInt32(write_idx)
+            end
             write_idx += 1
         elseif read_idx in to_remove
             # Skip
+            if fire_event
+                @inbounds index_remap[read_idx] = UInt32(0)
+                removed_count += 1
+                @inbounds removed_old[removed_count] = UInt32(read_idx)
+            end
             continue
         else
             new_cells[write_idx] = mesh.cells[read_idx]
+            if fire_event
+                @inbounds index_remap[read_idx] = UInt32(write_idx)
+            end
             write_idx += 1
         end
     end
@@ -752,6 +934,18 @@ function coarsen_cells!(mesh::HierarchicalMesh{D, M}, parent_indices) where {D, 
 
     mesh.cells = new_cells
     invalidate_caches!(mesh)
+
+    if fire_event
+        event = RefinementEvent(
+            UInt32[],
+            UnitRange{UInt32}[],
+            coarsened_new,
+            removed_old,
+            index_remap,
+        )
+        _fire_refinement_event!(mesh, event)
+    end
+
     return mesh
 end
 
