@@ -69,6 +69,11 @@ export cell_path, CellPath, find_at_path
 export RefinementEvent, ListenerHandle
 export register_refinement_listener!, unregister_refinement_listener!
 
+# Neighbor graph (PR-C)
+export NeighborGraph, face_neighbors, face_fine_neighbors
+export build_neighbor_graph, ensure_neighbor_graph!
+export cell_adjacency_sparsity
+
 # SimplicialMesh
 export SimplicialMesh
 export n_vertices, spatial_dimension, n_simplices
@@ -126,6 +131,7 @@ export PolynomialFieldView, PolynomialView
 export gradient_at, n_coeffs_per_element, basis_of
 export polynomial_action_error, polynomial_action_error_per_element
 export is_strictly_positive
+export HaloView, halo_view
 
 # Layer 3 (foundational pieces, full implementation later)
 include("Threading/Threading.jl")

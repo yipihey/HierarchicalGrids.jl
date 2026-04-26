@@ -47,6 +47,8 @@ using ..Bases: AbstractBasis, BernsteinBasis, n_coeffs, evaluate, gradient,
 # Quadrature is included before Storage at the top level; we use it for the
 # polynomial-aware action-error indicator.
 using ..Quadrature: QuadRule, action_error_l2
+# Mesh is included before Storage at the top level; HaloView uses it.
+using ..Mesh: HierarchicalMesh, face_neighbors
 
 export AbstractLayout, SoA, AoS, Blocked
 export FieldSet, n_elements, field_names, has_field
@@ -56,6 +58,7 @@ export PolynomialFieldView, PolynomialView
 export gradient_at, n_coeffs_per_element, basis_of
 export polynomial_action_error, polynomial_action_error_per_element
 export is_strictly_positive
+export HaloView, halo_view
 
 # ============================================================================
 # Layout types
@@ -417,5 +420,10 @@ end
 # Polynomial field storage (depends on Bases for n_coeffs/evaluate/gradient)
 # ============================================================================
 include("PolynomialFieldSet.jl")
+
+# ============================================================================
+# Halo view over a PolynomialFieldView (depends on Mesh's NeighborGraph; PR-C)
+# ============================================================================
+include("HaloView.jl")
 
 end # module Storage
