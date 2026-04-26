@@ -26,6 +26,10 @@ using HierarchicalGrids
         include("test_bases.jl")
     end
 
+    @testset "Layer 2: Bernstein positivity certificate" begin
+        include("test_positivity_certificate.jl")
+    end
+
     @testset "Layer 2: Quadrature" begin
         include("test_quadrature.jl")
     end
@@ -36,6 +40,10 @@ using HierarchicalGrids
 
     @testset "Layer 2.5: PolynomialFieldSet" begin
         include("test_polynomial_fieldset.jl")
+    end
+
+    @testset "Layer 2.5: init_field_from!" begin
+        include("test_init_field_from.jl")
     end
 
     @testset "Layer 3 (foundational): Threading" begin
@@ -54,8 +62,16 @@ using HierarchicalGrids
         include("test_overlap.jl")
     end
 
+    @testset "Layer 4: Overlap (1D)" begin
+        include("test_overlap_1d.jl")
+    end
+
     @testset "Layer 4: Polynomial remap" begin
         include("test_polynomial_remap.jl")
+    end
+
+    @testset "Layer 4: Polynomial remap diagnostics" begin
+        include("test_remap_diagnostics.jl")
     end
 
     @testset "Layer 4: Polynomial remap (FieldSet wrapper)" begin

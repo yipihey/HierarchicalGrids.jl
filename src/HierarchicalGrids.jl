@@ -103,6 +103,7 @@ using .Bases
 export AbstractBasis, MonomialBasis, BernsteinBasis, LagrangeBasis
 export n_coeffs, evaluate, gradient
 export all_bernstein_coeffs_positive, is_positive_certificate, change_basis
+export bernstein_positivity_certificate
 
 # Layer 2 (numerical-analysis primitives): Gauss quadrature
 include("Quadrature/Quadrature.jl")
@@ -122,6 +123,7 @@ export PolynomialFieldSet, allocate_polynomial_fields
 export PolynomialFieldView, PolynomialView
 export gradient_at, n_coeffs_per_element, basis_of
 export polynomial_action_error, polynomial_action_error_per_element
+export is_strictly_positive
 
 # Layer 3 (foundational pieces, full implementation later)
 include("Threading/Threading.jl")
@@ -142,6 +144,7 @@ export WelfordStats, push_value!, count_samples, merge_stats!
 export mean, variance, std_dev, skewness, kurtosis, excess_kurtosis
 export ExponentialMovingAverage, update!, value, reset!
 export PerCellStats
+export RemapDiagnostics
 
 # Layer 4: geometric-overlap and remap operators
 include("Overlap/Overlap.jl")
@@ -184,5 +187,6 @@ export polynomial_remap_l_to_uniform_e!, polynomial_remap_uniform_e_to_l!
 # PolynomialFieldSet. Depends on Bases, Quadrature, Storage, Mesh, and
 # the Overlap submodule (for EulerianFrame and cell_physical_box).
 include("Storage/Initialization.jl"); using .Initialization
+export init_field_from!
 
 end # module HierarchicalGrids
