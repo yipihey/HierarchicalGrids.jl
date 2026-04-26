@@ -65,23 +65,17 @@ end
 # ---------------------------------------------------------------------------
 @testset "no refinement when indicator is zero" begin
     frame = make_1d_frame()
-    # Pre-refine root once so coarsen logic has real parents to consider
-    # (sidesteps a corner case in `_find_coarsen_candidates` when only the
-    # root is present).
-    refine_cells!(frame.mesh, [1])
     n0 = n_cells(frame.mesh)
     state = StepState()
 
     physics!(s::StepState, _frame) = (s.n_step_calls += 1; s)
-    # All-zero indicator: no leaves above refine_threshold. (The zeros are
-    # also below coarsen_threshold, but coarsening of the root's children
-    # would just bring us back to the single-cell root — i.e. there is
-    # 1 round of coarsening, then steady state.)
+    # All-zero indicator: no leaves above refine_threshold and nothing to
+    # coarsen on a single-root mesh.
     indicator(mesh) = fill(0.0, n_cells(mesh))
 
     step_with_amr!(state, frame, physics!, indicator, 12;
                    refine_threshold = 0.5,
-                   coarsen_threshold = -1.0,    # disable coarsening
+                   coarsen_threshold = 0.1,
                    hysteresis_steps = 3)
 
     @test state.n_step_calls == 12

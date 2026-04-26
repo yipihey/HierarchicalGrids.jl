@@ -108,8 +108,11 @@ function _find_coarsen_candidates(mesh::HierarchicalMesh{D, M}, ind_fn,
             continue
         end
         parent = find_parent(mesh, ci)
-        # Skip root and already-processed parents
-        (parent <= 0 || parent in seen_parents) && continue
+        # Skip the root cell (find_parent returns ROOT_PARENT == typemax(UInt32)
+        # for the root) and already-processed parents. Note that `parent` is a
+        # UInt32, so a `parent <= 0` guard never fires and would let
+        # find_children index out of bounds on a single-root mesh.
+        (parent == ROOT_PARENT || parent in seen_parents) && continue
         push!(seen_parents, parent)
 
         # Get all children of this parent

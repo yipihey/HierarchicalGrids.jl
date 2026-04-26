@@ -190,4 +190,18 @@ end
             [1.0, 2.0, 3.0]; refine_threshold=0.5)  # wrong length
     end
 
+    @testset "single-root mesh with positive coarsen threshold (regression)" begin
+        # Regression for a latent BoundsError in _find_coarsen_candidates:
+        # find_parent on the root returns ROOT_PARENT == typemax(UInt32),
+        # which the old `parent <= 0` UInt32 guard couldn't catch. With a
+        # 1-cell mesh and a positive coarsen_threshold this used to throw.
+        mesh = HierarchicalMesh{2}()
+        @test n_cells(mesh) == 1
+        result = refine_by_indicator!(mesh, fill(0.0, n_cells(mesh));
+                                      refine_threshold=1.0,
+                                      coarsen_threshold=0.1)
+        @test result == (refined=0, coarsened=0)
+        @test n_cells(mesh) == 1
+    end
+
 end
