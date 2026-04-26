@@ -42,7 +42,8 @@ property dispatch.
 module Storage
 
 # Bases is included before Storage at the top level; access via parent module.
-using ..Bases: AbstractBasis, n_coeffs, evaluate, gradient
+using ..Bases: AbstractBasis, BernsteinBasis, n_coeffs, evaluate, gradient,
+               bernstein_positivity_certificate
 # Quadrature is included before Storage at the top level; we use it for the
 # polynomial-aware action-error indicator.
 using ..Quadrature: QuadRule, action_error_l2
@@ -54,6 +55,7 @@ export PolynomialFieldSet, allocate_polynomial_fields
 export PolynomialFieldView, PolynomialView
 export gradient_at, n_coeffs_per_element, basis_of
 export polynomial_action_error, polynomial_action_error_per_element
+export is_strictly_positive
 
 # ============================================================================
 # Layout types

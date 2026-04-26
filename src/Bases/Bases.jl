@@ -38,6 +38,7 @@ export AbstractBasis
 export MonomialBasis, BernsteinBasis, LagrangeBasis
 export n_coeffs, evaluate, gradient
 export all_bernstein_coeffs_positive, is_positive_certificate
+export bernstein_positivity_certificate
 export change_basis
 
 # ============================================================================
@@ -393,6 +394,40 @@ reconstructed in Bernstein form.
         c > zero(c) || return false
     end
     return true
+end
+
+"""
+    bernstein_positivity_certificate(coeffs, basis::BernsteinBasis{D,P}; atol = 0)
+        -> (positive::Bool, offending::Union{Nothing, NTuple{D+1, Int}})
+
+Strict-positivity certificate. Returns `(true, nothing)` if every coefficient
+satisfies `c > -atol` (i.e. is positive up to tolerance `atol`); otherwise
+`(false, α)` where `α` is the multi-index of the first offending coefficient in
+the basis's standard ordering.
+
+`atol >= 0` is a tolerance for treating tiny negative values as zero. With the
+default `atol = 0`, the test is strict positivity (`c > 0`).
+
+By the convex-hull property (see `BernsteinBasis`), `true` is sufficient for
+strict positivity on the entire reference simplex (in the limit `atol → 0`);
+`false` does NOT imply non-positivity (the test gets sharper under degree
+elevation).
+
+The multi-index `α = (α_0, α_1, ..., α_D)` has length `D+1` (barycentric) and
+satisfies `sum(α) == P`.
+"""
+function bernstein_positivity_certificate(coeffs, basis::BernsteinBasis{D, P};
+                                          atol = zero(eltype(coeffs))) where {D, P}
+    length(coeffs) == binomial(D + P, P) ||
+        throw(DimensionMismatch("coeffs length doesn't match basis"))
+    inds = _cached_bernstein_multiindices(D, P)
+    threshold = -atol
+    @inbounds for k in eachindex(inds)
+        if !(coeffs[k] > threshold)
+            return (false, inds[k])
+        end
+    end
+    return (true, nothing)
 end
 
 # ============================================================================
