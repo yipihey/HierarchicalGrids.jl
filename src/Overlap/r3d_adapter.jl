@@ -14,7 +14,9 @@ Returns `(0, (0, ...))` if the overlap is empty.
 
 Real R3D backend via the r3djl package. Supports D=2 and D=3 directly
 through `R3D.Flat.init_simplex!` → `R3D.Flat.box_planes!` →
-`R3D.Flat.clip!` → `R3D.Flat.moments!`. D ≥ 4 throws a clean error:
+`R3D.Flat.clip!` → `R3D.Flat.moments!`. D=1 uses a closed-form interval
+intersection (no r3djl call) — intervals are trivial polytopes and the
+moments are elementary integrals. D ≥ 4 throws a clean error:
 r3djl now provides correct `clip!` (single + sequential, simplex bug
 fixed in r3djl f704cff) and `moments!` order = 0 at D ≥ 4, but
 `compute_overlap` consumes higher-order moments (centroid +
@@ -72,6 +74,18 @@ function PairScratch(::Val{D}, ::Type{T}; capacity::Int = 64) where {D, T}
     placeholder_n = R3D.Vec{D, T}(ntuple(d -> d == 1 ? one(T) : zero(T), Val(D))...)
     placeholder = R3D.Plane{D, T}(placeholder_n, zero(T))
     return PairScratch{D, T}(poly, fill(placeholder, 2 * D))
+end
+
+# D=1 specialization: the closed-form interval path doesn't use the
+# polytope or plane buffers. We still allocate a minimal FlatPolytope
+# (size 1, zero capacity is fine since we never touch it) so the type
+# signature `PairScratch{1, T}` is satisfied; this keeps the type stable
+# across D without burdening the 1D path with a real polytope buffer.
+function PairScratch(::Val{1}, ::Type{T}; capacity::Int = 64) where {T}
+    poly = R3D.Flat.FlatPolytope{1, T}(1)
+    placeholder_n = R3D.Vec{1, T}(one(T))
+    placeholder = R3D.Plane{1, T}(placeholder_n, zero(T))
+    return PairScratch{1, T}(poly, R3D.Plane{1, T}[placeholder, placeholder])
 end
 
 # ============================================================================
@@ -132,6 +146,11 @@ function _overlap_dispatch(out_moments::AbstractVector{T},
         "See src/Overlap/lifting.jl for status."))
 end
 
+_overlap_dispatch(out::AbstractVector{T}, scratch::PairScratch{1, T},
+                   verts, lo::NTuple{1, T}, hi::NTuple{1, T},
+                   order::Int, ::Val{1}) where {T} =
+    _overlap_1d!(out, verts, lo, hi, order)
+
 _overlap_dispatch(out::AbstractVector{T}, scratch::PairScratch{2, T},
                    verts, lo::NTuple{2, T}, hi::NTuple{2, T},
                    order::Int, ::Val{2}) where {T} =
@@ -141,6 +160,58 @@ _overlap_dispatch(out::AbstractVector{T}, scratch::PairScratch{3, T},
                    verts, lo::NTuple{3, T}, hi::NTuple{3, T},
                    order::Int, ::Val{3}) where {T} =
     _overlap_via_r3d!(out, scratch, verts, lo, hi, order)
+
+# ============================================================================
+# Closed-form 1D implementation
+# ============================================================================
+
+# In 1D, a "simplex" is a segment with two vertices (a, b), and the
+# Eulerian "box" is the interval [box_lo[1], box_hi[1]]. The overlap is
+# an interval [lo, hi] computed by interval intersection. The k-th moment
+# integrated about the origin (matching the D=2/3 r3djl convention — see
+# `_verify_moment_ordering` and `moments.jl`) is
+#
+#     M_k = ∫_lo^hi x^k dx = (hi^{k+1} - lo^{k+1}) / (k + 1)
+#
+# Graded-lex ordering for D=1 collapses to ascending degree:
+#     out_moments[k+1] = M_k   for k = 0, ..., moment_order
+#
+# The 0th moment is the length (volume); the 1st divided by length is
+# the centroid x-coordinate. Returns `(0, (0,))` for empty overlaps.
+@inline function _overlap_1d!(out_moments::AbstractVector{T},
+                                simplex_vertices,
+                                box_lo::NTuple{1, T},
+                                box_hi::NTuple{1, T},
+                                moment_order::Int) where {T}
+    # Simplex vertices is a 2-element collection of NTuple{1, T}.
+    a = simplex_vertices[1][1]
+    b = simplex_vertices[2][1]
+    seg_lo = a < b ? a : b
+    seg_hi = a < b ? b : a
+
+    lo = max(seg_lo, box_lo[1])
+    hi = min(seg_hi, box_hi[1])
+
+    if hi <= lo
+        # Empty / degenerate overlap.
+        return (zero(T), (zero(T),), out_moments)
+    end
+
+    vol = hi - lo
+    out_moments[1] = vol
+    # Higher-order moments in graded-lex (== ascending degree in 1D).
+    @inbounds for k in 1:moment_order
+        out_moments[k + 1] = (hi^(k + 1) - lo^(k + 1)) / T(k + 1)
+    end
+
+    # Centroid requires order >= 1; otherwise sentinel zero.
+    centroid = if moment_order >= 1
+        (out_moments[2] / vol,)
+    else
+        (zero(T),)
+    end
+    return (vol, centroid, out_moments)
+end
 
 # ============================================================================
 # R3D-backed implementation (D=2, D=3)
