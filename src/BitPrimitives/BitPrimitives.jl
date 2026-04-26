@@ -37,20 +37,15 @@ export nth_set_bit_position, positions_of_set_bits
 Whether the host CPU supports BMI2 instructions (PDEP, PEXT). Set at
 module load time. On non-x86 hardware, always false; software fallback is used.
 """
-const HAS_BMI2 = let
-    if Sys.ARCH == :x86_64 || Sys.ARCH == :i686
-        # Try to detect BMI2; conservative default is false
-        try
-            # PDEP is BMI2; if it exists as an LLVM intrinsic and we can call it
-            test_result = ccall("llvm.x86.bmi.pdep.32", llvmcall, UInt32,
-                                (UInt32, UInt32), UInt32(1), UInt32(1))
-            test_result == UInt32(1)
-        catch
-            false
-        end
-    else
+const HAS_BMI2 = @static if Sys.ARCH === :x86_64 || Sys.ARCH === :i686
+    try
+        ccall("llvm.x86.bmi.pdep.32", llvmcall, UInt32,
+              (UInt32, UInt32), UInt32(1), UInt32(1)) == UInt32(1)
+    catch
         false
     end
+else
+    false
 end
 
 # ============================================================================
@@ -102,19 +97,21 @@ julia> pdep(UInt32(0b11), UInt32(0b101))
 ```
 """
 @inline function pdep(src::UInt32, mask::UInt32)
-    if HAS_BMI2
-        return ccall("llvm.x86.bmi.pdep.32", llvmcall, UInt32, (UInt32, UInt32), src, mask)
-    else
-        return pdep_fallback(src, mask)
+    @static if Sys.ARCH === :x86_64 || Sys.ARCH === :i686
+        if HAS_BMI2
+            return ccall("llvm.x86.bmi.pdep.32", llvmcall, UInt32, (UInt32, UInt32), src, mask)
+        end
     end
+    return pdep_fallback(src, mask)
 end
 
 @inline function pdep(src::UInt64, mask::UInt64)
-    if HAS_BMI2
-        return ccall("llvm.x86.bmi.pdep.64", llvmcall, UInt64, (UInt64, UInt64), src, mask)
-    else
-        return pdep_fallback(src, mask)
+    @static if Sys.ARCH === :x86_64 || Sys.ARCH === :i686
+        if HAS_BMI2
+            return ccall("llvm.x86.bmi.pdep.64", llvmcall, UInt64, (UInt64, UInt64), src, mask)
+        end
     end
+    return pdep_fallback(src, mask)
 end
 
 # Smaller types promote to UInt32
@@ -139,19 +136,21 @@ julia> pext(UInt32(0b101), UInt32(0b101))
 ```
 """
 @inline function pext(src::UInt32, mask::UInt32)
-    if HAS_BMI2
-        return ccall("llvm.x86.bmi.pext.32", llvmcall, UInt32, (UInt32, UInt32), src, mask)
-    else
-        return pext_fallback(src, mask)
+    @static if Sys.ARCH === :x86_64 || Sys.ARCH === :i686
+        if HAS_BMI2
+            return ccall("llvm.x86.bmi.pext.32", llvmcall, UInt32, (UInt32, UInt32), src, mask)
+        end
     end
+    return pext_fallback(src, mask)
 end
 
 @inline function pext(src::UInt64, mask::UInt64)
-    if HAS_BMI2
-        return ccall("llvm.x86.bmi.pext.64", llvmcall, UInt64, (UInt64, UInt64), src, mask)
-    else
-        return pext_fallback(src, mask)
+    @static if Sys.ARCH === :x86_64 || Sys.ARCH === :i686
+        if HAS_BMI2
+            return ccall("llvm.x86.bmi.pext.64", llvmcall, UInt64, (UInt64, UInt64), src, mask)
+        end
     end
+    return pext_fallback(src, mask)
 end
 
 @inline pext(src::UInt8, mask::UInt8) = UInt8(pext(UInt32(src), UInt32(mask)))
