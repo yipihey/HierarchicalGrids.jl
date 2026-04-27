@@ -154,6 +154,10 @@ using HierarchicalGrids
         include("test_overlap_describe.jl")
     end
 
+    @testset "Layer 4: Overlap (EulerianFrame × EulerianFrame, PR-12)" begin
+        include("test_inter_frame_overlap.jl")
+    end
+
     @testset "Layer 4: Polynomial remap" begin
         include("test_polynomial_remap.jl")
     end
