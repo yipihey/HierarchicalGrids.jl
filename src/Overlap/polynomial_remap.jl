@@ -456,6 +456,15 @@ end
 # RHS assembly for L² projection
 # ============================================================================
 
+# Threshold (in number of overlap entries) below which `accumulate_polynomial_rhs!`
+# falls through to the sequential kernel even when a non-`Sequential` backend is
+# requested. The two-phase pattern allocates one `n_dst × n_dst_cells` partial
+# RHS per task plus a final reduction pass; for small entry counts the task
+# spawn + allocation overhead dominates the scatter cost. 2048 is empirically
+# above the per-task break-even on a 4-thread M-series host for typical
+# (P_src, P_dst, D) ∈ {1, 2}².
+const _POLYNOMIAL_RHS_PARALLEL_THRESHOLD = 2048
+
 """
     accumulate_polynomial_rhs!(rhs::AbstractMatrix{T},
                                  src_coeffs::AbstractMatrix{T},
@@ -463,7 +472,8 @@ end
                                  dst_pullbacks::Vector{<:AbstractMatrix{T}},
                                  overlap::GeometricOverlap{D, T},
                                  P_src::Integer, P_dst::Integer;
-                                 invert::Bool = false) where {D, T}
+                                 invert::Bool = false,
+                                 backend::AbstractParallelBackend = default_backend()) where {D, T}
 
 Accumulate the right-hand side of the destination L² projection system
 into `rhs[α, j] += Σ_i Σ_γ Σ_δ U_j[α, γ] · P_i[δ] · M_{γ+δ}` for every
@@ -479,6 +489,25 @@ overlap entry, where:
 Each overlap entry must have `moments` up to order `P_src + P_dst` —
 otherwise the upper-degree terms can't be computed and the routine
 throws.
+
+# Parallelism
+
+The scatter is keyed by destination cell — multiple overlap entries can
+hit the same `rhs[:, j]` column, so naive per-entry parallelization
+races on the write. This routine instead uses the two-phase pattern:
+
+1. Partition `overlap.entries` into per-task contiguous chunks; each
+   task accumulates into a private `partial::Matrix{T}` of shape
+   `(n_dst, n_dst_cells)` (zero-aliasing, no synchronization).
+2. Sequentially reduce `rhs .+= partial` in fixed chunk-index order.
+
+Step 2 is deterministic (the partials are summed in the same order on
+every call), so the result is byte-equal across `Sequential`,
+`OhMyThreadsBackend(:dynamic|:static|:greedy|:serial)`. Per-task partial
+allocation cost (`n_chunks` matrices of size `n_dst × n_dst_cells`) is
+amortized when this routine is called repeatedly with the same shapes —
+it is **not** cached between calls, so a one-shot RHS assembly pays it
+once.
 """
 function accumulate_polynomial_rhs!(rhs::AbstractMatrix{T},
                                       src_coeffs::AbstractMatrix{T},
@@ -486,11 +515,11 @@ function accumulate_polynomial_rhs!(rhs::AbstractMatrix{T},
                                       dst_pullbacks::Vector{<:AbstractMatrix{T}},
                                       overlap::GeometricOverlap{D, T},
                                       P_src::Integer, P_dst::Integer;
-                                      invert::Bool = false) where {D, T}
+                                      invert::Bool = false,
+                                      backend::AbstractParallelBackend = default_backend()) where {D, T}
     P_src = Int(P_src); P_dst = Int(P_dst)
     n_src = moments_length(D, P_src)
     n_dst = moments_length(D, P_dst)
-    n_phys = moments_length(D, P_src + P_dst)
     moment_order(overlap) >= P_src + P_dst ||
         throw(ArgumentError("overlap was built with moment_order=$(moment_order(overlap)); needs ≥ $(P_src + P_dst) for P_src=$P_src, P_dst=$P_dst"))
     size(rhs, 1) == n_dst ||
@@ -512,10 +541,85 @@ function accumulate_polynomial_rhs!(rhs::AbstractMatrix{T},
     end
 
     fill!(rhs, zero(T))
-    # Per-entry buffer: physical-coordinate coefficients of the source polynomial
-    Pi_buf = Vector{T}(undef, n_src)
 
-    @inbounds for entry in overlap.entries
+    n_entries = length(overlap.entries)
+
+    # Sequential fast-path: byte-identical to the legacy loop. Entered when
+    # the caller asked for `Sequential`, when there are too few entries to
+    # offset the chunking + partial-allocation overhead, or when only a
+    # single OS thread is available.
+    if backend isa Sequential ||
+       n_entries < _POLYNOMIAL_RHS_PARALLEL_THRESHOLD ||
+       Threads.nthreads() == 1
+        _accumulate_polynomial_rhs_kernel!(rhs, src_coeffs, src_pullbacks,
+                                           dst_pullbacks, overlap, lookup,
+                                           1:n_entries, n_src, n_dst, invert)
+        return rhs
+    end
+
+    # Parallel path: per-task partial RHS buffers + sequential reduction.
+    n_chunks = min(n_entries, max(2, Threads.nthreads()))
+    chunk_ranges = OhMyThreads.index_chunks(1:n_entries; n = n_chunks)
+    n_chunks = length(chunk_ranges)
+    partials = Vector{Matrix{T}}(undef, n_chunks)
+
+    # `ChunkSplitters.IndexChunks` is iterable + `length`-able but not an
+    # `AbstractArray`, so we drive the parallel/serial walks via `1:n_chunks`
+    # and explicit indexing into `chunk_ranges`.
+    if backend isa OhMyThreadsBackend
+        # `chunking = false`: we did our own chunking; one task per chunk.
+        OhMyThreads.tforeach(1:n_chunks;
+                             scheduler = backend.scheduler,
+                             chunking = false) do k
+            partial = zeros(T, n_dst, size(rhs, 2))
+            _accumulate_polynomial_rhs_kernel!(partial, src_coeffs, src_pullbacks,
+                                               dst_pullbacks, overlap, lookup,
+                                               chunk_ranges[k], n_src, n_dst, invert)
+            partials[k] = partial
+        end
+    else
+        # Future-proofing for additional backend types: fall back to a serial
+        # walk over chunks. This still exercises the partial-buffer code path
+        # (deterministic merge order), so the result is byte-equal to the
+        # `Sequential` kernel.
+        @inbounds for k in 1:n_chunks
+            partial = zeros(T, n_dst, size(rhs, 2))
+            _accumulate_polynomial_rhs_kernel!(partial, src_coeffs, src_pullbacks,
+                                               dst_pullbacks, overlap, lookup,
+                                               chunk_ranges[k], n_src, n_dst, invert)
+            partials[k] = partial
+        end
+    end
+
+    # Sequential reduction: fixed chunk-index order ⇒ deterministic across
+    # schedulers (`:dynamic`/`:static`/`:greedy` only differ in *task*
+    # ordering, not in the merge order, since we index `partials[k]`).
+    @inbounds for k in 1:n_chunks
+        rhs .+= partials[k]
+    end
+    return rhs
+end
+
+# Inner kernel: scatter-accumulate `overlap.entries[entry_range]` into `rhs`
+# (which may be the final destination or a per-task partial). Hoisting this
+# out of the public function lets both the sequential fast-path and the
+# parallel partial-buffer path share the exact same code.
+@inline function _accumulate_polynomial_rhs_kernel!(rhs::AbstractMatrix{T},
+                                                     src_coeffs::AbstractMatrix{T},
+                                                     src_pullbacks::Vector{<:AbstractMatrix{T}},
+                                                     dst_pullbacks::Vector{<:AbstractMatrix{T}},
+                                                     overlap::GeometricOverlap{D, T},
+                                                     lookup::Matrix{Int},
+                                                     entry_range,
+                                                     n_src::Int, n_dst::Int,
+                                                     invert::Bool) where {D, T}
+    # Per-call buffer: physical-coordinate coefficients of the source polynomial.
+    # In the parallel path each task gets its own kernel invocation, so this
+    # is per-task by construction (no aliasing).
+    Pi_buf = Vector{T}(undef, n_src)
+    entries = overlap.entries
+    @inbounds for k in entry_range
+        entry = entries[k]
         i = invert ? Int(entry.eul_idx) : Int(entry.lag_idx)
         j = invert ? Int(entry.lag_idx) : Int(entry.eul_idx)
 
@@ -664,17 +768,14 @@ function _polynomial_remap!(target_coeffs::AbstractMatrix{T},
     src_pullbacks = [reference_to_physical_pullback(f, P_src) for f in src_frames]
     dst_pullbacks = [reference_to_physical_pullback(f, P_dst) for f in dst_frames]
 
-    # Assemble RHS for every destination cell.
-    #
-    # NOTE (deferred): `accumulate_polynomial_rhs!` is held sequential in PR-1.
-    # Its inner loop scatters into `rhs[:, j_dst]` keyed by overlap entries,
-    # which is not a per-destination-cell partition; parallelizing it requires
-    # either entry-bucketing by destination (extra pass) or per-task RHS
-    # buffers + a final reduction. That refactor is its own design pass and
-    # belongs to a follow-up PR.
+    # Assemble RHS for every destination cell. The two-phase parallel
+    # pattern (per-task partial RHS buffers + sequential reduction) is
+    # routed through the same `backend` kwarg as the destination-cell
+    # solve below; see `accumulate_polynomial_rhs!`.
     rhs = zeros(T, n_dst, n_dst_cells)
     accumulate_polynomial_rhs!(rhs, source_coeffs, src_pullbacks, dst_pullbacks,
-                                 overlap, P_src, P_dst; invert = invert)
+                                 overlap, P_src, P_dst;
+                                 invert = invert, backend = backend)
 
     # Solve M_j d_j = b_j for every destination cell with nonzero rhs.
     # The destination mass matrix lives in the destination's *reference frame*
