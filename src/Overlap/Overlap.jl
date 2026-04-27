@@ -93,6 +93,7 @@ export SimplicialAABBTree, simplex_aabb, build_simplex_aabb_tree,
        query_aabb!, query_aabb, n_nodes
 
 export PairScratch, overlap_simplex_box!
+export IntPairScratch, overlap_simplex_box_exact!
 
 export compute_overlap, install_r3d_overlap!
 
@@ -129,6 +130,7 @@ include("moments.jl")
 include("data.jl")
 include("aabb.jl")
 include("r3d_adapter.jl")
+include("r3d_int_adapter.jl")
 include("compute.jl")
 include("remap.jl")
 include("polynomial_remap.jl")
