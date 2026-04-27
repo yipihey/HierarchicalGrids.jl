@@ -46,7 +46,7 @@ end
                              dt = 0.02,
                              n_steps = 8,
                              amr_every = 0)
-    _, info = run!(config)
+    _, info = _CFDCellAdvectionSmoke.CFDCellAdvection.run!(config)
     @test info.mass_drift < 1e-12
 end
 
@@ -57,7 +57,7 @@ end
                              dt = 0.05,
                              n_steps = 40,
                              amr_every = 0)
-    _, info = run!(config)
+    _, info = _CFDCellAdvectionSmoke.CFDCellAdvection.run!(config)
     @test info.mass_drift < 1e-10
     @test info.l1_error < 0.15
 end
@@ -71,7 +71,7 @@ end
                              refine_threshold = 0.05,
                              coarsen_threshold = 0.005,
                              max_level = 4)
-    _, info = run!(config)
+    _, info = _CFDCellAdvectionSmoke.CFDCellAdvection.run!(config)
     @test info.mass_drift < 1e-10
     @test info.n_leaves_final >= 4 * 4
 end
