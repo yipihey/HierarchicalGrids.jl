@@ -6,6 +6,13 @@ simplicial meshes and Eulerian hierarchical meshes, and for using those
 intersections to do conservative polynomial-field remap in either
 direction.
 
+The per-pair clip ships in two interchangeable backends — `Float64`
+(the default, covered here) and an integer-exact `Rational` path
+(`overlap_simplex_box_exact!` plus the `IntegerLattice` quantization
+helpers, covered in [Exact-rational overlap backend](exact_backend.md)).
+The exact backend additionally unlocks `D = 4` (volume only); the float
+path errors at `D ≥ 4`.
+
 ## What problem this solves
 
 You have a Lagrangian description of some quantity — a deformed
