@@ -7,8 +7,8 @@ that powers `compute_overlap`:
   The default; fast, well-tested, supports `D = 1, 2, 3`.
 - **Exact** — `overlap_simplex_box_exact!` over integer-coordinate
   vertices and `Rational{R}` accumulators. Bit-exact, deterministic,
-  unlocks `D = 4` (volume only), available via the `IntegerLattice`
-  quantization helpers in this document.
+  unlocks `D = 4` with full polynomial moments, available via the
+  `IntegerLattice` quantization helpers in this document.
 
 This page covers the exact path: the lattice abstraction, the
 quantization round-trip, the direct adapter, the D=4 capability, the
@@ -31,11 +31,13 @@ audit harness, and what to expect performance-wise.
   integer comparisons rather than by float predicates. Inputs that the
   float path would handle with sliver-rejection heuristics terminate
   cleanly.
-- **D=4 capability (volume only).** The exact path's pentachoron-vs-box
-  clip and `R3D.IntExact.volume_exact` give 4-volumes today. The float
-  path still errors at `D ≥ 4` (its `r3djl` polynomial-moment
-  recursion is not yet 4D-ready). Higher-degree moments at D=4 wait on
-  upstream work — see the D=4 section.
+- **D=4 capability with full moments.** The exact path's
+  pentachoron-vs-box clip and `R3D.IntExact.moments_exact!` give
+  4-volumes and full polynomial moments today (unlocked by upstream
+  r3djl commit `943135f1`, polynomial moments at D ∈ {4, 5, 6} via
+  simplex decomposition). The float path still errors at `D ≥ 4` (its
+  `r3djl` polynomial-moment recursion is not yet 4D-ready), so the
+  exact backend remains the only D=4-capable path through HG.
 
 ## The lattice abstraction
 
@@ -237,11 +239,11 @@ e.g.) — the default is conservative.
 
 ## D = 4
 
-The exact backend supports `D = 4` for volume only:
+The exact backend supports `D = 4` with full polynomial moments:
 
 ```julia
-P       = 0
-nmom    = 1                     # moments_length(4, 0) == 1
+P       = 1
+nmom    = moments_length(4, P)  # 5 at P=1
 scratch = IntPairScratch(Val(4), Int32; capacity = 64)
 out     = Vector{Rational{BigInt}}(undef, nmom)
 
@@ -254,35 +256,29 @@ simplex = ((Int32(0),    Int32(0),    Int32(0),    Int32(0)),
 box_lo  = (Int32(0),    Int32(0),    Int32(0),    Int32(0))
 box_hi  = (Int32(1024), Int32(1024), Int32(1024), Int32(1024))
 
-vol, _, _ = overlap_simplex_box_exact!(out, scratch,
-                                        simplex, box_lo, box_hi, P;
-                                        accumulator = BigInt)
+vol, centroid, _ = overlap_simplex_box_exact!(out, scratch,
+                                                simplex, box_lo, box_hi, P;
+                                                accumulator = BigInt)
 @assert vol == big(1024)^4 // 24
+@assert centroid == ntuple(_ -> big(1024) // 5, 4)
 ```
 
 What works at D=4:
 
 - `IntPairScratch{4, T}` allocation.
-- `overlap_simplex_box_exact!(...; accumulator = BigInt)` with
-  `moment_order == 0`.
-- Integer-exact 4-volume via `R3D.IntExact.volume_exact`.
+- `overlap_simplex_box_exact!(...; accumulator = BigInt)` with any
+  `moment_order` ≥ 0. Polynomial moments are routed upstream through
+  `R3D.IntExact.moments_exact!`'s `_moments_exact_dgeneric_4plus!`
+  (landed in r3djl commit `943135f1`).
+- Integer-exact 4-volume, centroid, and full second-and-higher moments
+  in graded-lex order.
 
-What does NOT work at D=4 yet:
+What does NOT work at D=4:
 
-- `moment_order ≥ 1`. The adapter throws an informative error pointing
-  at the upstream limitation: `R3D.IntExact.moments_exact!` errors at
-  `D ≥ 4` because the sqrt-free fan-triangulation moments at D=4 have
-  not yet shipped in `r3djl` (only `volume_exact(D=4)` is available).
-- Centroids. The returned centroid tuple is the zero placeholder
-  `(0//1, 0//1, 0//1, 0//1)`; first-order moments would require the
-  moment recursion that is not implemented at D=4.
 - The float path. `compute_overlap` and `overlap_simplex_box!` still
   error at `D ≥ 4`. D=4 is reachable today only through the exact
-  adapter.
-
-When upstream `r3djl` ships D=4 polynomial moments, the adapter will
-remove the `moment_order == 0` guard and the centroid will populate
-naturally; no API change is planned at this layer.
+  adapter (the float r3djl path does not yet ship a D ≥ 4 moment
+  recursion).
 
 ## Audit harness
 
@@ -399,8 +395,8 @@ a drop-in for downstream consumers.
   `SimplicialMesh` and the `EulerianFrame`.
 - `D = 1` is rejected; the float path's closed-form interval
   intersection is already exact, so use `backend = :float`.
-- `D = 4` is volume-only — pass `moment_order = 0`. Higher moments
-  await upstream `R3D.IntExact.moments_exact!` support at `D ≥ 4`.
+- `D ∈ {2, 3, 4}` are supported with full polynomial moments. `D = 4`
+  is reachable only through `:exact` (the float path errors at D ≥ 4).
 - Periodic-ghost overlap (`frame_bcs` with periodic axes) is not yet
   supported under `backend = :exact`. Use `:float`, which handles
   periodic ghosts correctly — backend agreement stays at the

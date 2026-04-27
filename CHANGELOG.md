@@ -63,9 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`R3D.IntExact` adapter for exact-rational overlap**: new file
   `src/Overlap/r3d_int_adapter.jl` with `IntPairScratch{D, T}` and
   `overlap_simplex_box_exact!` returning `Rational{R}` volume,
-  centroid, and full polynomial moments at D=2,3 (volume-only at D=4
-  pending upstream `moments_exact!` support). `_default_accumulator`
-  follows IntExact's documented type-promotion guidance.
+  centroid, and full polynomial moments at D ∈ {2, 3, 4}.
+  `_default_accumulator` follows IntExact's documented type-promotion
+  guidance.
 - **`IntegerLattice{D, T}` quantization helpers**: equal-scale lattice
   built from an `EulerianFrame`. `quantize`, `quantize_strict`,
   `dequantize`, `lat_resolution`, `unscale_volume`, `unscale_moment`
@@ -81,17 +81,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drop-in `GeometricOverlap{D, Float64}`. Default `:float` backend is
   byte-identical to today. Performance: ~4.6× slowdown vs `:float` at
   D=2 with `moment_order=1` and the BigInt-promoted default
-  accumulator. `D=4` is volume-only; `D=1` is rejected (use `:float`,
-  already exact); periodic ghosts under `:exact` are deferred.
-- **D=4 dispatch under the `:exact` backend** (volume-only): integer
-  pentachoron and tesseract-tile-decomposition tests pass with exact
-  rational volumes. Float `compute_overlap` continues to error at
-  D≥4 by design.
+  accumulator. `D ∈ {2, 3, 4}` supported with full polynomial moments;
+  `D=1` is rejected (use `:float`, already exact); periodic ghosts
+  under `:exact` are deferred.
+- **D=4 dispatch under the `:exact` backend** with full polynomial
+  moments: integer pentachoron, Kuhn 24-pentachoron tile
+  decomposition, P=1 centroid, and P=2 second-moment tests all pass
+  bit-exactly via `R3D.IntExact.moments_exact!`. Float
+  `compute_overlap` continues to error at D≥4 by design.
 - **Comprehensive D=3 test coverage** for `compute_overlap` and
   `polynomial_remap`: identity, refined-Eulerian, translated,
   empty/partial-overlap, P=0 and P=1 round-trip, RemapDiagnostics
   variants. Surfaces and documents the positive-orientation
   requirement for tetrahedral simplices.
+
+### Changed
+
+- **r3djl pin bumped** from `b08c363` to `ff23853f` (as of 2026-04-27).
+  Unlocks `R3D.IntExact.moments_exact!` at D ∈ {4, 5, 6} via the new
+  `_moments_exact_dgeneric_4plus!` simplex-decomposition path (landed
+  upstream in commit `943135f1`). HG surfaces this for `D = 4` only
+  (D=5/6 remain research-grade upstream). The D=4 adapter dispatch
+  in `src/Overlap/r3d_int_adapter.jl` now mirrors D=2/D=3 exactly:
+  clip + `moments_exact!`, full polynomial-moment output, centroid
+  populated from first-order moments. The `compute_overlap(..., backend
+  = :exact)` `D = 4 ⇒ moment_order = 0` guard is removed; any
+  `moment_order ≥ 0` is now accepted at D = 4. No public-API breakage:
+  signatures (`init_simplex!`, `clip!`, `moments_exact!`,
+  `volume_exact`, `overlap_simplex_box_exact!`, `compute_overlap`)
+  are unchanged.
 
 ### Fixed
 

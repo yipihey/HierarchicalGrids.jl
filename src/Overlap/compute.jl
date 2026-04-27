@@ -48,10 +48,8 @@ physical coordinates).
   `R3D.IntExact` via the `IntegerLattice` quantization helpers, returning
   a `GeometricOverlap{D, Float64}` whose volumes/moments are dequantized
   from exact-rational arithmetic. The `:exact` path requires
-  `T == Float64`. At `D = 4` the exact backend supports `moment_order = 0`
-  only (upstream `R3D.IntExact.moments_exact!` is not yet implemented at
-  D ≥ 4); the centroid stored in each `OverlapEntry` is a zero placeholder
-  in that case. At `D = 1` the `:float` path is already exact (closed-form
+  `T == Float64`. `D ∈ {2, 3, 4}` are supported with full polynomial
+  moments. At `D = 1` the `:float` path is already exact (closed-form
   interval intersection), so `:exact` is rejected with a recommendation
   to use `:float`.
 - `lattice` — optional `IntegerLattice{D}` controlling the quantization
@@ -134,15 +132,7 @@ function compute_overlap(lag::SimplicialMesh{D, T},
         D <= 4 ||
             throw(ArgumentError(
                 "compute_overlap: backend = :exact is not supported at D = $D. " *
-                "Currently supported: D = 2, 3 (full moments), D = 4 " *
-                "(volume only, moment_order = 0)."))
-        if D == 4 && moment_order != 0
-            throw(ArgumentError(
-                "compute_overlap: backend = :exact at D = 4 requires " *
-                "moment_order = 0 (got $(moment_order)). Upstream " *
-                "R3D.IntExact.moments_exact! is not yet implemented at D ≥ 4; " *
-                "only `volume_exact(D = 4)` ships."))
-        end
+                "Currently supported: D ∈ {2, 3, 4} with full polynomial moments."))
         # Periodic-ghost interaction: defer for now. Quantizing a vertex
         # that has been ghost-shifted by ±period can land outside the
         # default lattice's representable range (the lattice is derived
@@ -391,8 +381,7 @@ end
 # The centroid is recomputed from the shifted physical-frame moments
 # (entries 2..D+1 of the moment vector divided by the volume) when
 # `moment_order >= 1`; otherwise the centroid is a zero placeholder
-# (consistent with the float adapter's convention at order 0 and with
-# the D=4 P=0 limitation).
+# (consistent with the float adapter's convention at order 0).
 # ----------------------------------------------------------------------------
 function _compute_overlap_sequential_exact(
         lag::SimplicialMesh{D, Float64},
@@ -443,7 +432,7 @@ function _compute_overlap_sequential_exact(
                 vol_phys = unscale_volume(vol_rat, lat)
                 vol_phys > 0.0 || continue
 
-                if D == 4 || moment_order == 0
+                if moment_order == 0
                     # Volume-only path: no shift needed; centroid is a
                     # zero placeholder (consistent with the int adapter
                     # and float-order-0 convention).

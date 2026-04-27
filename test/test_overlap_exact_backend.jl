@@ -256,10 +256,10 @@ end
 end
 
 # ============================================================================
-# 6. D = 4 — volume-only :exact, moment_order >= 1 errors, :float still errors
+# 6. D = 4 — full polynomial moments via :exact backend; :float still errors.
 # ============================================================================
 
-@testset "exact backend D=4: volume-only success and moment_order error" begin
+@testset "exact backend D=4: volume + polynomial moments succeed" begin
     # Build a single pentachoron mesh and a single-cell D=4 frame.
     positions = [
         (0.0, 0.0, 0.0, 0.0),
@@ -275,18 +275,31 @@ end
     frame = EulerianFrame(eul, (0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0))
 
     # Volume-only :exact succeeds and gives the analytic 1/24.
-    o_e = compute_overlap(lag, frame; moment_order = 0, backend = :exact)
-    @test n_entries(o_e) == 1
-    @test total_overlap_volume(o_e) ≈ 1.0 / 24.0 atol = 1e-12
-    # Centroid is a zero placeholder at D = 4 / P = 0.
-    @test all(o_e.entries[1].centroid .== 0.0)
+    o0 = compute_overlap(lag, frame; moment_order = 0, backend = :exact)
+    @test n_entries(o0) == 1
+    @test total_overlap_volume(o0) ≈ 1.0 / 24.0 atol = 1e-12
+    # Centroid is a zero placeholder at moment_order = 0 (consistent with
+    # the float-order-0 convention).
+    @test all(o0.entries[1].centroid .== 0.0)
 
-    # moment_order >= 1 with :exact at D=4 → ArgumentError.
-    @test_throws ArgumentError compute_overlap(lag, frame;
-                                                  moment_order = 1,
-                                                  backend = :exact)
+    # moment_order = 1 with :exact at D=4 ⇒ full polynomial moments via
+    # `R3D.IntExact.moments_exact!` (unlocked by r3djl 943135f1). The
+    # corner pentachoron's centroid is (1/5, 1/5, 1/5, 1/5) on [0,1]^4.
+    o1 = compute_overlap(lag, frame; moment_order = 1, backend = :exact)
+    @test n_entries(o1) == 1
+    @test total_overlap_volume(o1) ≈ 1.0 / 24.0 atol = 1e-12
+    cen1 = o1.entries[1].centroid
+    for d in 1:4
+        @test cen1[d] ≈ 0.2 atol = 1e-6
+    end
 
-    # :float at D = 4 still errors (existing limitation).
+    # moment_order = 2 also succeeds; volume still consistent.
+    o2 = compute_overlap(lag, frame; moment_order = 2, backend = :exact)
+    @test n_entries(o2) == 1
+    @test total_overlap_volume(o2) ≈ 1.0 / 24.0 atol = 1e-12
+
+    # :float at D = 4 still errors (the float r3djl path doesn't implement
+    # D >= 4 polynomial-moment integration; only the IntExact path does).
     @test_throws ErrorException compute_overlap(lag, frame;
                                                    moment_order = 0,
                                                    backend = :float)
