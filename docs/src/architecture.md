@@ -178,6 +178,12 @@ own files:
   quantization, `overlap_simplex_box_exact!`, and the `audit_overlap`
   harness. Bit-exact, deterministic, robust on degenerate orientations,
   and the only path that reaches `D = 4` (volume only) today.
+- [Parallelism](parallelism.md) and [Benchmarking](benchmarking.md) —
+  the `AbstractParallelBackend` trait (`Sequential`, `OhMyThreadsBackend`),
+  the `parallel_foreach` / `parallel_mapreduce` / `parallel_chunked` verbs
+  used internally, hardware-specific recipes (Apple Silicon, AMD NUMA),
+  and the standalone benchmark harness under `benchmarks/`. Calibrated
+  baselines live in `benchmarks/PERF.md`.
 
 ## What we expect to add
 
