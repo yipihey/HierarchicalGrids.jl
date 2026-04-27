@@ -1,0 +1,16 @@
+name = "CFDPatchAMR"
+uuid = "c4d5e6f7-a8b9-0123-cdef-456789abcdef"
+authors = ["Tom Abel <tabel@stanford.edu>"]
+version = "0.1.0"
+
+[deps]
+HierarchicalGrids = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+[compat]
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
