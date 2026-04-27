@@ -95,8 +95,8 @@ export ensure_overlap!, invalidate_overlap!, overlap_cache
 export set_overlap_compute_function!
 export update_lagrangian_positions!
 
-# Generic refinement
-export refine_by_indicator!
+# Generic refinement is provided by the top-level `RefineByIndicator`
+# submodule (loaded after `Threading`); see `src/Mesh/RefineByIndicator.jl`.
 
 # ============================================================================
 # Flag constants
@@ -1032,9 +1032,8 @@ include("CompositeMesh.jl")
 # ============================================================================
 include("Neighbors.jl")
 
-# ============================================================================
-# Generic indicator-driven refinement
-# ============================================================================
-include("RefineByIndicator.jl")
+# Generic indicator-driven refinement now lives in its own top-level
+# `RefineByIndicator` submodule, loaded after `Threading`. See
+# `src/HierarchicalGrids.jl` for the include order.
 
 end # module Mesh

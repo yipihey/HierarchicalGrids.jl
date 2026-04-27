@@ -49,7 +49,7 @@ const BACKEND_SPECS = [
 ]
 
 const SWEEP = (
-    workloads     = [:compute_overlap],
+    workloads     = [:compute_overlap, :refine_by_indicator],
     sizes         = [:small, :medium, :large],
     thread_counts = unique([1, 2, 4, 8, max(8, Threads.nthreads())]),
 )

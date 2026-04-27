@@ -13,7 +13,8 @@ mechanism: callers register listeners on the mesh that observe each
 """
 module AMR
 
-using ..Mesh: HierarchicalMesh, refine_by_indicator!
+using ..Mesh: HierarchicalMesh
+using ..RefineByIndicator: refine_by_indicator!
 using ..Overlap: EulerianFrame
 
 export step_with_amr!
