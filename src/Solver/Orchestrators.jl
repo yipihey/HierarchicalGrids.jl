@@ -259,3 +259,60 @@ function for_each_face!(flux_kernel, fluxes_out, fields_in,
     fluxes_out === fluxes_out  # no-op; keep the binding live
     return nothing
 end
+
+# ----------------------------------------------------------------------------
+# for_each_block!  (PR-10, Path A — polynomial blocks)
+# ----------------------------------------------------------------------------
+
+"""
+    for_each_block!(kernel, fields_out, fields_in, frame::EulerianFrame{D, Float64};
+                    ghost_depth::Int = 0,
+                    bcs::Union{Nothing, FrameBoundaries{D}} = nothing,
+                    ctx = nothing,
+                    backend::AbstractParallelBackend = default_backend())
+
+Apply `kernel(bv::BlockView, bhv::BlockHaloView, ctx)` to every leaf
+block of `frame.mesh` in parallel. Path A: each leaf cell carries a
+degree-`P` polynomial, and the kernel sees per-block point-evaluation
+through `bv(Val(:rho), ξ)` and `bhv(Val(:rho), off, ξ)` in addition to
+the usual coefficient read/write API.
+
+Same orchestration discipline as `for_each_cell!`: caches and the
+neighbor graph are pre-built before fan-out so kernels never trigger the
+non-thread-safe lazy initializers.
+
+The `for_each_block!` kernel API is identical for Path B (PR-11 —
+`PointSampleFieldSet`); the dispatch point is the `block_view` /
+`block_halo_view` constructors, which key off the field type. Adding
+`PointSampleFieldSet` support is therefore a pure additive change.
+"""
+function for_each_block!(kernel, fields_out, fields_in,
+                            frame::EulerianFrame{D, Float64};
+                            ghost_depth::Int = 0,
+                            bcs::Union{Nothing, FrameBoundaries{D}} = nothing,
+                            ctx = nothing,
+                            backend::AbstractParallelBackend = default_backend()
+                            ) where {D}
+    ghost_depth >= 0 ||
+        throw(ArgumentError("for_each_block!: ghost_depth must be ≥ 0, got $ghost_depth"))
+
+    mesh = frame.mesh
+
+    # Pre-warm caches (PR-1 lesson) before going parallel.
+    Mesh.ensure_caches!(mesh)
+    ensure_neighbor_graph!(mesh)
+
+    leaves = enumerate_leaves(mesh)
+    halo_depth = max(1, ghost_depth)
+
+    parallel_foreach(backend,
+                     i -> begin
+                         bv  = block_view(fields_in, fields_out, frame, Int(i))
+                         bhv = block_halo_view(fields_in, mesh, Int(i),
+                                                halo_depth; bcs = bcs)
+                         kernel(bv, bhv, ctx)
+                         return nothing
+                     end,
+                     leaves)
+    return nothing
+end

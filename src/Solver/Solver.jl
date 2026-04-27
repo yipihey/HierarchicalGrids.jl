@@ -34,6 +34,7 @@ using ..Mesh: face_neighbors, face_fine_neighbors, face_neighbors_with_bcs,
 using ..BoundaryConditions: BCKind, BoundarySpec, is_periodic_axis,
                             PERIODIC, INFLOW, OUTFLOW, REFLECTING, DIRICHLET
 using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView
+using ..Bases: AbstractBasis, MonomialBasis, BernsteinBasis, n_coeffs, evaluate
 using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_box,
                   enumerate_leaves
 using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
@@ -44,14 +45,15 @@ using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
 # ----------------------------------------------------------------------------
 
 include("Views.jl")
+include("BlockView.jl")
 include("Orchestrators.jl")
 
 # ----------------------------------------------------------------------------
 # Exports
 # ----------------------------------------------------------------------------
 
-export CellView, HaloView
-export ghost_depth, cell_view, halo_view_multi
-export for_each_cell!, for_each_face!
+export CellView, HaloView, BlockView, BlockHaloView
+export ghost_depth, cell_view, halo_view_multi, block_view, block_halo_view
+export for_each_cell!, for_each_face!, for_each_block!
 
 end # module Solver

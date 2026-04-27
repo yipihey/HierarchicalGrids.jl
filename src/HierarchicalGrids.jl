@@ -260,9 +260,11 @@ export step_with_amr!
 # `using .Solver: HaloView` in user code).
 include("Solver/Solver.jl")
 using .Solver: CellView, ghost_depth, cell_view, halo_view_multi,
-                for_each_cell!, for_each_face!
-export CellView
-export ghost_depth, cell_view, halo_view_multi
-export for_each_cell!, for_each_face!
+                for_each_cell!, for_each_face!,
+                BlockView, BlockHaloView, block_view, block_halo_view,
+                for_each_block!
+export CellView, BlockView, BlockHaloView
+export ghost_depth, cell_view, halo_view_multi, block_view, block_halo_view
+export for_each_cell!, for_each_face!, for_each_block!
 
 end # module HierarchicalGrids

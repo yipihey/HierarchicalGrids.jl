@@ -186,6 +186,14 @@ using HierarchicalGrids
         include("test_orchestrators_threading.jl")
     end
 
+    @testset "Phase 2 (Solver): BlockView (PR-10)" begin
+        include("test_block_view.jl")
+    end
+
+    @testset "Phase 2 (Solver): for_each_block! (PR-10)" begin
+        include("test_for_each_block.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end
