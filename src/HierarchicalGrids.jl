@@ -263,11 +263,23 @@ using .Solver: CellView, ghost_depth, cell_view, halo_view_multi,
                 for_each_cell!, for_each_face!, KernelContext,
                 BlockView, BlockHaloView, block_view, block_halo_view,
                 for_each_block!,
-                AdaptiveField, dispose!
+                AdaptiveField, dispose!,
+                PatchHierarchy, PatchBoundaryBC, PatchView, PatchHaloView,
+                add_patches!, for_each_patch!,
+                restrict_to_parents!, prolong_from_parents!
 export CellView, BlockView, BlockHaloView
 export ghost_depth, cell_view, halo_view_multi, block_view, block_halo_view
 export for_each_cell!, for_each_face!, for_each_block!
 export KernelContext
 export AdaptiveField, dispose!
+# PR-13: PatchHierarchy + for_each_patch! orchestrator. The patch-hierarchy
+# accessors `n_levels`, `n_patches`, `patches_at`, and `validate` are
+# deliberately NOT re-exported at the top level — they live in `Solver`
+# alongside `PatchHierarchy` and are available via `Solver.<name>` or
+# `using .Solver: <name>`. Top-level re-export risks colliding with
+# user-defined `validate` / `n_levels`.
+export PatchHierarchy, PatchBoundaryBC, PatchView, PatchHaloView
+export add_patches!, for_each_patch!
+export restrict_to_parents!, prolong_from_parents!
 
 end # module HierarchicalGrids

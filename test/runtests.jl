@@ -206,6 +206,10 @@ using HierarchicalGrids
         include("test_adaptive_field.jl")
     end
 
+    @testset "Phase 2 (Solver): PatchHierarchy (PR-13)" begin
+        include("test_patch_hierarchy.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end
