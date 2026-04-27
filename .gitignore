@@ -44,6 +44,10 @@ lcov.info
 # Logs
 *.log
 
-# Benchmark results (calibrated baselines land in PR-5).
+# Benchmark results: ignored by default; committed baselines are
+# allow-listed by hostname pattern so users' ad-hoc local runs don't
+# get accidentally committed.
 benchmarks/results/*.json
+!benchmarks/results/apple-silicon-*.json
+!benchmarks/results/amd-*.json
 benchmarks/Manifest.toml
