@@ -154,6 +154,10 @@ include("Threading/Threading.jl")
 using .Threading
 export ThreadChunk, partition_for_threads
 export parallel_for_cells, parallel_reduce_cells, parallel_for_chunks
+# Backend trait + verbs (PR-0).
+export AbstractParallelBackend, Sequential, OhMyThreadsBackend
+export default_backend, set_default_backend!
+export parallel_foreach, parallel_mapreduce, parallel_chunked
 
 include("Memory/Memory.jl")
 using .Memory
