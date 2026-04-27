@@ -193,6 +193,22 @@ end
     return out
 end
 
+@inline function _fill_box_planes_int!(out::AbstractVector{R3D.Plane{4, T}},
+                                        lo::NTuple{4, T},
+                                        hi::NTuple{4, T}) where {T<:Signed}
+    @inbounds begin
+        out[1] = R3D.Plane{4, T}(R3D.Vec{4, T}(T( 1), T(0), T(0), T(0)), -lo[1])
+        out[2] = R3D.Plane{4, T}(R3D.Vec{4, T}(T(-1), T(0), T(0), T(0)),  hi[1])
+        out[3] = R3D.Plane{4, T}(R3D.Vec{4, T}(T(0),  T( 1), T(0), T(0)), -lo[2])
+        out[4] = R3D.Plane{4, T}(R3D.Vec{4, T}(T(0),  T(-1), T(0), T(0)),  hi[2])
+        out[5] = R3D.Plane{4, T}(R3D.Vec{4, T}(T(0),  T(0),  T( 1), T(0)), -lo[3])
+        out[6] = R3D.Plane{4, T}(R3D.Vec{4, T}(T(0),  T(0),  T(-1), T(0)),  hi[3])
+        out[7] = R3D.Plane{4, T}(R3D.Vec{4, T}(T(0),  T(0),  T(0),  T( 1)), -lo[4])
+        out[8] = R3D.Plane{4, T}(R3D.Vec{4, T}(T(0),  T(0),  T(0),  T(-1)),  hi[4])
+    end
+    return out
+end
+
 # ============================================================================
 # Public adapter entry point
 # ============================================================================
@@ -235,7 +251,14 @@ out_moments)` when the simplex is outside the box, fully clipped
 away, or numerically degenerate (signed area / volume ≤ 0 — same
 convention as the float path's `vol > 0` guard).
 
-D = 2 and D = 3 only at this PR; D = 4 will be added in PR-5.
+D = 2, D = 3, and D = 4 are supported. D = 4 supports `moment_order = 0`
+only (volume): upstream `R3D.IntExact.moments_exact!` errors at D ≥ 4
+because polynomial moments at D = 4 are still research-grade in r3djl
+(sqrt-free fan-triangulation moments at D = 4 require a separate
+implementation that is not yet shipped). The D = 4 dispatch here calls
+`R3D.IntExact.volume_exact` for `moment_order == 0` and throws an
+informative error for `moment_order >= 1` so callers see the upstream
+limitation at the adapter boundary, not somewhere deeper.
 
 # Centroid convention
 
@@ -272,9 +295,8 @@ end
 # Per-D dispatch
 # ============================================================================
 
-# Generic catch-all: D ≥ 4 not yet supported in this PR. PR-5 will add
-# the D = 4 dispatch through `R3D.IntExact.init_simplex!(D=4)` +
-# `volume_exact(D=4)` + (research-grade) higher-order moments.
+# Generic catch-all: D ≥ 5 still not supported. PR-5 unlocks D=4 (volume
+# only). Higher-D dispatch waits on upstream `R3D.IntExact` D ≥ 5 support.
 function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
                                   scratch::IntPairScratch{D, T},
                                   simplex_vertices,
@@ -283,9 +305,10 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
                                   moment_order::Int,
                                   ::Val{D}) where {D, T<:Signed, R<:Signed}
     throw(ErrorException(
-        "overlap_simplex_box_exact! at D=$D not supported in this PR. " *
-        "PR-1 ships D=2 and D=3 only; PR-5 unlocks D=4. " *
-        "See src/Overlap/r3d_int_adapter.jl for the dispatch table."))
+        "overlap_simplex_box_exact! at D=$D not supported. " *
+        "Currently supported: D=2 (full moments), D=3 (full moments), " *
+        "D=4 (volume only, P=0). Higher D awaits upstream R3D.IntExact " *
+        "support. See src/Overlap/r3d_int_adapter.jl for the dispatch table."))
 end
 
 # ----------------------------------------------------------------------------
@@ -433,6 +456,125 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
     else
         (zero(Rational{R}), zero(Rational{R}), zero(Rational{R}))
     end
+    return (vol, centroid, out_moments)
+end
+
+# ----------------------------------------------------------------------------
+# D = 4
+#
+# Upstream `R3D.IntExact.moments_exact!` errors at D ≥ 4 (polynomial
+# moments at D = 4 are research-grade in r3djl: the sqrt-free fan
+# triangulation only ships `volume_exact(D=4)` today). The D = 4
+# dispatch therefore supports ONLY `moment_order == 0`: it initializes
+# the pentachoron, clips against the 8 axis-aligned box planes, and
+# reads the 4-volume via `R3D.IntExact.volume_exact`. The volume lands
+# in `out_moments[1]` to match the graded-lex layout of `moments_exact!`
+# at D = 2, 3.
+#
+# A `moment_order >= 1` request throws a scoped error pointing at the
+# upstream limitation. PR-3 will surface this at the `compute_overlap`
+# layer for the `:exact` backend (D=4 means `P=0` only until r3djl
+# ships D=4 polynomial moments).
+#
+# Vertex orientation (positive 4-volume): the 5! / 2 = 60 even
+# permutations on 5 vertices give a positive `det(V)`, the 60 odd ones
+# negative. We compute the signed 4-volume (det of the 4x4 matrix of
+# `vk - v1`, k = 2..5) and swap two trailing vertices to flip parity if
+# negative — same convention as the D = 2, 3 paths.
+# ----------------------------------------------------------------------------
+
+# Signed 24·volume of the integer pentachoron (v1, v2, v3, v4, v5) via the
+# 4×4 determinant of (vk - v1) columns. Returned as `R` to keep the
+# accumulator clean; for `T = Int16` and modest coords the intermediate
+# expansion fits in `Int128` after a few clips, but we promote to `R`
+# (the moment-buffer accumulator) to match the D = 4 default `BigInt`.
+@inline function _signed_24vol_d4(::Type{R}, v1, v2, v3, v4, v5) where {R<:Signed}
+    a1 = R(v2[1] - v1[1]); a2 = R(v2[2] - v1[2]); a3 = R(v2[3] - v1[3]); a4 = R(v2[4] - v1[4])
+    b1 = R(v3[1] - v1[1]); b2 = R(v3[2] - v1[2]); b3 = R(v3[3] - v1[3]); b4 = R(v3[4] - v1[4])
+    c1 = R(v4[1] - v1[1]); c2 = R(v4[2] - v1[2]); c3 = R(v4[3] - v1[3]); c4 = R(v4[4] - v1[4])
+    d1 = R(v5[1] - v1[1]); d2 = R(v5[2] - v1[2]); d3 = R(v5[3] - v1[3]); d4 = R(v5[4] - v1[4])
+    # 4×4 determinant by cofactor expansion along the first row.
+    # M_ij = 3×3 minor with row 1 and column j removed.
+    m11 = b2*(c3*d4 - c4*d3) - b3*(c2*d4 - c4*d2) + b4*(c2*d3 - c3*d2)
+    m12 = b1*(c3*d4 - c4*d3) - b3*(c1*d4 - c4*d1) + b4*(c1*d3 - c3*d1)
+    m13 = b1*(c2*d4 - c4*d2) - b2*(c1*d4 - c4*d1) + b4*(c1*d2 - c2*d1)
+    m14 = b1*(c2*d3 - c3*d2) - b2*(c1*d3 - c3*d1) + b3*(c1*d2 - c2*d1)
+    return a1*m11 - a2*m12 + a3*m13 - a4*m14
+end
+
+function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
+                                  scratch::IntPairScratch{4, T},
+                                  simplex_vertices,
+                                  box_lo::NTuple{4, T},
+                                  box_hi::NTuple{4, T},
+                                  moment_order::Int,
+                                  ::Val{4}) where {T<:Signed, R<:Signed}
+    moment_order == 0 || throw(ErrorException(
+        "overlap_simplex_box_exact! at D=4 supports moment_order = 0 only. " *
+        "Got moment_order = $moment_order. Upstream R3D.IntExact.moments_exact! " *
+        "errors at D = 4 because polynomial moments at D ≥ 4 are not yet " *
+        "implemented in r3djl (only `volume_exact(D=4)` ships). " *
+        "PR-3's compute_overlap :exact backend will surface this at the " *
+        "user-facing layer."))
+
+    if box_lo[1] >= box_hi[1] || box_lo[2] >= box_hi[2] ||
+       box_lo[3] >= box_hi[3] || box_lo[4] >= box_hi[4]
+        return _empty_result(out_moments, Val(4), R)
+    end
+
+    poly = scratch.poly
+    planes = scratch.plane_buf
+
+    v1 = simplex_vertices[1]
+    v2 = simplex_vertices[2]
+    v3 = simplex_vertices[3]
+    v4 = simplex_vertices[4]
+    v5 = simplex_vertices[5]
+    sv = _signed_24vol_d4(R, v1, v2, v3, v4, v5)
+    if sv < zero(R)
+        v4, v5 = v5, v4
+    elseif sv == zero(R)
+        # Degenerate pentachoron (coplanar in 4D) — measure zero.
+        return _empty_result(out_moments, Val(4), R)
+    end
+
+    # `init_simplex!` D=4 takes a length-5 indexable collection of
+    # length-D indexable vertex positions. A 5-tuple of `SVector{4, T}`
+    # is the zero-allocation form (stack-allocated, supports indexing).
+    vv1 = SVector{4, T}(v1[1], v1[2], v1[3], v1[4])
+    vv2 = SVector{4, T}(v2[1], v2[2], v2[3], v2[4])
+    vv3 = SVector{4, T}(v3[1], v3[2], v3[3], v3[4])
+    vv4 = SVector{4, T}(v4[1], v4[2], v4[3], v4[4])
+    vv5 = SVector{4, T}(v5[1], v5[2], v5[3], v5[4])
+    R3D.IntExact.init_simplex!(poly, (vv1, vv2, vv3, vv4, vv5))
+
+    _fill_box_planes_int!(planes, box_lo, box_hi)
+
+    ok = R3D.IntExact.clip!(poly, planes)
+    if !ok
+        throw(OverflowError(
+            "R3D.IntExact.clip! reported capacity overflow during 4D " *
+            "pentachoron-box clipping (scratch.poly.capacity = $(poly.capacity)). " *
+            "Allocate IntPairScratch with a larger capacity if this is " *
+            "expected geometry."))
+    end
+    if poly.nverts == 0
+        return _empty_result(out_moments, Val(4), R)
+    end
+
+    # Volume only — moments_exact!(D=4) is unimplemented upstream.
+    vol = R3D.IntExact.volume_exact(poly, R)
+    if vol <= zero(Rational{R})
+        fill!(out_moments, zero(Rational{R}))
+        return _empty_result(out_moments, Val(4), R)
+    end
+
+    @inbounds out_moments[1] = vol
+    # Centroid is not derivable from P=0 moments alone: it would require
+    # the 5 first-order moments which `moments_exact!` cannot produce at
+    # D = 4. Return a zero placeholder and document the convention.
+    centroid = (zero(Rational{R}), zero(Rational{R}),
+                zero(Rational{R}), zero(Rational{R}))
     return (vol, centroid, out_moments)
 end
 
