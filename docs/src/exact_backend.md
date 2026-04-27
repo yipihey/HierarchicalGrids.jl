@@ -404,25 +404,27 @@ a drop-in for downstream consumers.
 
 ## Known limitations of the upstream IntExact path
 
-`R3D.IntExact` is a young, undocumented submodule of r3djl that ships
-no upstream tests; HG is its first consumer. Two concrete issues
-have been observed:
+The `D = 2` path in `R3D.IntExact` had two upstream bugs that HG
+encountered as the first consumer; both are substantially fixed
+upstream as of r3djl commit `154b346` (2026-04-27):
 
-1. **Degenerate-collinear clip outputs at `D = 2`**:
-   `R3D.IntExact._moments_exact_d2!` can produce `0//0` on shared-edge
-   tile decompositions where two triangles meet exactly along an
-   edge. Avoid such tilings by perturbing the shared edge by one
-   lattice step, or stick to the `:float` backend.
+1. **`R3D.IntExact._moments_exact_d2!` `0//0` throw on degenerate
+   clips** — fully fixed upstream. The function no longer constructs
+   invalid rationals on shared-edge tile decompositions.
 
-2. **`D = 2` accuracy on arbitrary triangle / refined-Eulerian
-   configurations at `bits = 16`**: systematic ~10–30% volume errors
-   have been observed on certain combinations of Lagrangian triangle
-   orientation and Eulerian leaf placement, even though the audit
-   harness's canonical battery passes at machine precision. The
-   adapter's error envelope is well-characterized only for
-   single-simplex inside an unrefined Eulerian box; complex
-   compositions should be cross-checked against the float backend
-   via `audit_overlap` before relying on the result.
+2. **`D = 2` `clip!` returning negative-volume polytopes on
+   refined-Eulerian configurations** — substantially fixed upstream.
+   On the canonical "two-triangle tile / 1-refined Eulerian" geometry
+   that exposed the bug most aggressively, the data-loss drop count
+   went from 7 (out of 6 entries) to 2. The residual cases are
+   diagonal-corner pairs where the Lagrangian triangle's hypotenuse
+   exactly meets an Eulerian quadrant boundary — zero-area boundary
+   intersections that the float path silently treats as empty but
+   the integer path produces with flipped orientation. HG's adapter
+   guards `vol ≤ 0` and drops those entries; the `audit_drops` kwarg
+   on `compute_overlap` surfaces them when needed. Mass loss on this
+   geometry is now negligible; cross-validate via `audit_overlap` on
+   any unfamiliar geometry before relying on the result.
 
 3. **`D = 2` storage overflow at high bit counts**: at lattice
    scales corresponding to `bits ≥ 24`, the polygon clip's
@@ -433,13 +435,11 @@ have been observed:
    geometry.
 
 The audit harness (`audit_overlap`) and the load-time
-`_verify_intexact_consistency` check pass on a curated battery of
-canonical polytopes, so HG ships the exact backend as opt-in with
-these caveats. For applications that need bit-exact reproducibility
-on the supported envelope (single-simplex / single-tet at
-`bits = 16`), the exact backend is reliable; for general
-multi-simplex / refined-Eulerian production use, the float backend
-remains the recommendation pending upstream IntExact maturation.
+`_verify_intexact_consistency` check pass on the canonical polytope
+battery. For applications using the exact backend on multi-simplex /
+refined-Eulerian geometry, `audit_overlap(lag, frame; per_pair=true)`
+or `compute_overlap(...; audit_drops=true)` give per-pair visibility
+into any residual disagreements with the float backend.
 
 ## See also
 
