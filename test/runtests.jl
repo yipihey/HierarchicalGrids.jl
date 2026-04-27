@@ -102,6 +102,10 @@ using HierarchicalGrids
         include("test_overlap_int_adapter.jl")
     end
 
+    @testset "Layer 4: IntegerLattice quantization helpers" begin
+        include("test_quantize.jl")
+    end
+
     @testset "Layer 4: Polynomial remap" begin
         include("test_polynomial_remap.jl")
     end
