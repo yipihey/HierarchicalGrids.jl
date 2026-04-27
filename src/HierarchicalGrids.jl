@@ -259,8 +259,10 @@ export step_with_amr!
 # multi-field halo via `HierarchicalGrids.Solver.HaloView` (or
 # `using .Solver: HaloView` in user code).
 include("Solver/Solver.jl")
-using .Solver: CellView, ghost_depth, cell_view, halo_view_multi
+using .Solver: CellView, ghost_depth, cell_view, halo_view_multi,
+                for_each_cell!, for_each_face!
 export CellView
 export ghost_depth, cell_view, halo_view_multi
+export for_each_cell!, for_each_face!
 
 end # module HierarchicalGrids

@@ -27,19 +27,24 @@ module Solver
 # Imports
 # ----------------------------------------------------------------------------
 
+using ..Mesh
 using ..Mesh: HierarchicalMesh, n_cells, is_leaf, level_of
 using ..Mesh: face_neighbors, face_fine_neighbors, face_neighbors_with_bcs,
               ensure_neighbor_graph!
 using ..BoundaryConditions: BCKind, BoundarySpec, is_periodic_axis,
                             PERIODIC, INFLOW, OUTFLOW, REFLECTING, DIRICHLET
 using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView
-using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_box
+using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_box,
+                  enumerate_leaves
+using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
+                    default_backend, parallel_foreach
 
 # ----------------------------------------------------------------------------
 # Includes
 # ----------------------------------------------------------------------------
 
 include("Views.jl")
+include("Orchestrators.jl")
 
 # ----------------------------------------------------------------------------
 # Exports
@@ -47,5 +52,6 @@ include("Views.jl")
 
 export CellView, HaloView
 export ghost_depth, cell_view, halo_view_multi
+export for_each_cell!, for_each_face!
 
 end # module Solver

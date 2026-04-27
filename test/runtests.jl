@@ -178,6 +178,14 @@ using HierarchicalGrids
         include("test_views.jl")
     end
 
+    @testset "Phase 2 (Solver): Orchestrators (PR-7)" begin
+        include("test_orchestrators.jl")
+    end
+
+    @testset "Phase 2 (Solver): Orchestrators threading determinism (PR-7)" begin
+        include("test_orchestrators_threading.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end
