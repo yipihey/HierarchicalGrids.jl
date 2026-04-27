@@ -60,6 +60,7 @@ module Overlap
 using StaticArrays
 using LinearAlgebra: det
 import OhMyThreads
+using OhMyThreads.TaskLocalValues: TaskLocalValue
 using ..Mesh: HierarchicalMesh, SimplicialMesh, CellMeta, PairedMesh,
               n_cells, n_simplices, is_leaf, simplex_vertex_positions,
               set_overlap_compute_function!,
@@ -72,6 +73,8 @@ using ..Bases: AbstractBasis, MonomialBasis, n_coeffs
 using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView,
                   AbstractLayout, SoA, AoS, Blocked, basis_of, n_elements,
                   _layout_type_poly
+using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
+                   default_backend, parallel_foreach
 using ..Diagnostics: RemapDiagnostics
 
 # Types/functions

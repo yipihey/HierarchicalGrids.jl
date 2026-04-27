@@ -597,10 +597,11 @@ function polynomial_remap_l_to_e!(target_coeffs::AbstractMatrix{T},
                                     src_frames::Vector{<:CellReferenceFrame{D, T}},
                                     dst_frames::Vector{<:CellReferenceFrame{D, T}},
                                     P_src::Integer, P_dst::Integer;
-                                    diagnostics::Union{Nothing, RemapDiagnostics{T}} = nothing) where {D, T}
+                                    diagnostics::Union{Nothing, RemapDiagnostics{T}} = nothing,
+                                    backend::AbstractParallelBackend = default_backend()) where {D, T}
     _polynomial_remap!(target_coeffs, source_coeffs, overlap,
                         src_frames, dst_frames, P_src, P_dst;
-                        invert = false, diagnostics = diagnostics)
+                        invert = false, diagnostics = diagnostics, backend = backend)
 end
 
 """
@@ -618,10 +619,11 @@ function polynomial_remap_e_to_l!(target_coeffs::AbstractMatrix{T},
                                     src_frames::Vector{<:CellReferenceFrame{D, T}},
                                     dst_frames::Vector{<:CellReferenceFrame{D, T}},
                                     P_src::Integer, P_dst::Integer;
-                                    diagnostics::Union{Nothing, RemapDiagnostics{T}} = nothing) where {D, T}
+                                    diagnostics::Union{Nothing, RemapDiagnostics{T}} = nothing,
+                                    backend::AbstractParallelBackend = default_backend()) where {D, T}
     _polynomial_remap!(target_coeffs, source_coeffs, overlap,
                         src_frames, dst_frames, P_src, P_dst;
-                        invert = true, diagnostics = diagnostics)
+                        invert = true, diagnostics = diagnostics, backend = backend)
 end
 
 function _polynomial_remap!(target_coeffs::AbstractMatrix{T},
@@ -631,7 +633,8 @@ function _polynomial_remap!(target_coeffs::AbstractMatrix{T},
                               dst_frames::Vector{<:CellReferenceFrame{D, T}},
                               P_src::Integer, P_dst::Integer;
                               invert::Bool,
-                              diagnostics::Union{Nothing, RemapDiagnostics{T}} = nothing) where {D, T}
+                              diagnostics::Union{Nothing, RemapDiagnostics{T}} = nothing,
+                              backend::AbstractParallelBackend = default_backend()) where {D, T}
     P_src = Int(P_src); P_dst = Int(P_dst)
     n_dst = moments_length(D, P_dst)
 
@@ -661,7 +664,14 @@ function _polynomial_remap!(target_coeffs::AbstractMatrix{T},
     src_pullbacks = [reference_to_physical_pullback(f, P_src) for f in src_frames]
     dst_pullbacks = [reference_to_physical_pullback(f, P_dst) for f in dst_frames]
 
-    # Assemble RHS for every destination cell
+    # Assemble RHS for every destination cell.
+    #
+    # NOTE (deferred): `accumulate_polynomial_rhs!` is held sequential in PR-1.
+    # Its inner loop scatters into `rhs[:, j_dst]` keyed by overlap entries,
+    # which is not a per-destination-cell partition; parallelizing it requires
+    # either entry-bucketing by destination (extra pass) or per-task RHS
+    # buffers + a final reduction. That refactor is its own design pass and
+    # belongs to a follow-up PR.
     rhs = zeros(T, n_dst, n_dst_cells)
     accumulate_polynomial_rhs!(rhs, source_coeffs, src_pullbacks, dst_pullbacks,
                                  overlap, P_src, P_dst; invert = invert)
@@ -677,18 +687,40 @@ function _polynomial_remap!(target_coeffs::AbstractMatrix{T},
     # so the volume factors cancel cleanly when we solve M_j d_j = b_j.
     #
     # ⇒ Use M_j = |det J_dst| · M_ref and use b_j as accumulated.
+    #
+    # The j-loop is embarrassingly parallel: each task reads its own
+    # `rhs[:, j]` column + `dst_frames[j]` and writes its own
+    # `target_coeffs[:, j]` column — no cross-cell dependencies. Per-task
+    # working buffers are scoped via `TaskLocalValue` so each task pays
+    # the allocation cost once on first touch, not once per cell.
     fill!(target_coeffs, zero(T))
-    for j in 1:n_dst_cells
-        if any(rhs[α, j] != zero(T) for α in 1:n_dst)
-            M_ref = reference_mass_matrix(dst_frames[j], P_dst)
-            jac = _frame_jacobian(dst_frames[j])
-            M_j = jac .* M_ref
-            d = M_j \ view(rhs, :, j)
-            for α in 1:n_dst
-                target_coeffs[α, j] = d[α]
+    Mwork_tls = TaskLocalValue{Matrix{T}}(() -> Matrix{T}(undef, n_dst, n_dst))
+    bwork_tls = TaskLocalValue{Vector{T}}(() -> Vector{T}(undef, n_dst))
+    parallel_foreach(backend, function (j)
+        nonzero = false
+        @inbounds for α in 1:n_dst
+            if rhs[α, j] != zero(T)
+                nonzero = true
+                break
             end
         end
-    end
+        nonzero || return
+        M_ref = reference_mass_matrix(dst_frames[j], P_dst)
+        jac = _frame_jacobian(dst_frames[j])
+        M_j = Mwork_tls[]
+        b_j = bwork_tls[]
+        @inbounds for β in 1:n_dst, α in 1:n_dst
+            M_j[α, β] = jac * M_ref[α, β]
+        end
+        @inbounds for α in 1:n_dst
+            b_j[α] = rhs[α, j]
+        end
+        d = M_j \ b_j
+        @inbounds for α in 1:n_dst
+            target_coeffs[α, j] = d[α]
+        end
+        return
+    end, 1:n_dst_cells)
     return target_coeffs
 end
 

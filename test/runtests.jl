@@ -74,6 +74,10 @@ using HierarchicalGrids
         include("test_init_field_from.jl")
     end
 
+    @testset "Layer 2.5: init_field_from! (backend determinism)" begin
+        include("test_init_field_from_threading.jl")
+    end
+
     @testset "Layer 3 (foundational): Threading" begin
         include("test_threading.jl")
     end
@@ -144,6 +148,10 @@ using HierarchicalGrids
 
     @testset "Layer 4: Polynomial remap" begin
         include("test_polynomial_remap.jl")
+    end
+
+    @testset "Layer 4: Polynomial remap (backend determinism)" begin
+        include("test_polynomial_remap_threading.jl")
     end
 
     @testset "Layer 4: Polynomial remap diagnostics" begin

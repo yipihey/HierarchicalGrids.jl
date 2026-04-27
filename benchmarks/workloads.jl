@@ -193,6 +193,141 @@ function run_refine_by_indicator(state, backend::AbstractParallelBackend)
 end
 
 # ----------------------------------------------------------------------------
+# Workload :polynomial_remap_l_to_e
+# ----------------------------------------------------------------------------
+
+"""
+    build_polynomial_remap_l_to_e(size) -> NamedTuple
+
+Construct a Lagrangian × Eulerian fixture plus the precomputed overlap and
+source-coefficient matrix needed by `polynomial_remap_l_to_e!`. The returned
+state is reusable across backends — only the destination matrix is overwritten
+per call.
+
+  :small  → ~16 simplices,  ~16 leaves
+  :medium → ~256 simplices, ~256 leaves
+  :large  → ~1024 simplices, ~1024 leaves
+"""
+function build_polynomial_remap_l_to_e(size::Symbol)
+    base = build_compute_overlap(size)
+    lag = base.lag
+    frame = base.frame
+    P = 2
+    overlap = compute_overlap(lag, frame; moment_order = 2 * P)
+    src_frames = CellReferenceFrame{2, Float64}[lagrangian_frame(lag, i)
+                                                 for i in 1:n_simplices(lag)]
+    dst_frames = CellReferenceFrame{2, Float64}[eulerian_frame(frame, j)
+                                                 for j in 1:n_cells(frame.mesh)]
+    n_phys = HierarchicalGrids.moments_length(2, P)
+    # Build a non-trivial source: a fixed physical polynomial pulled back
+    # into each triangle's reference frame.
+    phys = [Float64(k) + 0.25 for k in 1:n_phys]
+    n_lag = n_simplices(lag)
+    src = zeros(n_phys, n_lag)
+    for i in 1:n_lag
+        T_mat = reference_to_physical_pullback(src_frames[i], P)
+        src[:, i] = T_mat' \ phys
+    end
+    n_eul = n_cells(frame.mesh)
+    dst = zeros(n_phys, n_eul)
+    return (; lag, frame, overlap, src_frames, dst_frames, P, src, dst)
+end
+
+"""
+    run_polynomial_remap_l_to_e(state, backend)
+
+Hot loop: dispatch the polynomial remap with the given backend.
+"""
+function run_polynomial_remap_l_to_e(state, backend::AbstractParallelBackend)
+    return polynomial_remap_l_to_e!(state.dst, state.src, state.overlap,
+                                      state.src_frames, state.dst_frames,
+                                      state.P, state.P;
+                                      backend = backend)
+end
+
+# ----------------------------------------------------------------------------
+# Workload :polynomial_remap_e_to_l
+# ----------------------------------------------------------------------------
+
+"""
+    build_polynomial_remap_e_to_l(size) -> NamedTuple
+
+Same fixture as `:polynomial_remap_l_to_e` but with the source coefficients
+defined on the Eulerian side and a Lagrangian destination.
+"""
+function build_polynomial_remap_e_to_l(size::Symbol)
+    base = build_compute_overlap(size)
+    lag = base.lag
+    frame = base.frame
+    P = 2
+    overlap = compute_overlap(lag, frame; moment_order = 2 * P)
+    src_frames = CellReferenceFrame{2, Float64}[lagrangian_frame(lag, i)
+                                                 for i in 1:n_simplices(lag)]
+    dst_frames = CellReferenceFrame{2, Float64}[eulerian_frame(frame, j)
+                                                 for j in 1:n_cells(frame.mesh)]
+    n_phys = HierarchicalGrids.moments_length(2, P)
+    phys = [Float64(k) * 0.6 - 0.1 for k in 1:n_phys]
+    n_eul = n_cells(frame.mesh)
+    src = zeros(n_phys, n_eul)
+    for j in 1:n_eul
+        T_mat = reference_to_physical_pullback(dst_frames[j], P)
+        src[:, j] = T_mat' \ phys
+    end
+    n_lag = n_simplices(lag)
+    dst = zeros(n_phys, n_lag)
+    return (; lag, frame, overlap, src_frames, dst_frames, P, src, dst)
+end
+
+function run_polynomial_remap_e_to_l(state, backend::AbstractParallelBackend)
+    # In e_to_l, the public API expects src_frames=Eulerian, dst_frames=Lagrangian.
+    return polynomial_remap_e_to_l!(state.dst, state.src, state.overlap,
+                                      state.dst_frames, state.src_frames,
+                                      state.P, state.P;
+                                      backend = backend)
+end
+
+# ----------------------------------------------------------------------------
+# Workload :init_field_from
+# ----------------------------------------------------------------------------
+
+"""
+    build_init_field_from(size) -> NamedTuple
+
+Construct a refined `EulerianFrame` and a fresh `PolynomialFieldSet` so each
+benchmark call runs the L²-projection on the same workload.
+"""
+function build_init_field_from(size::Symbol)
+    if size === :small
+        n_eul_refine = 2
+    elseif size === :medium
+        n_eul_refine = 4
+    elseif size === :large
+        n_eul_refine = 5
+    else
+        throw(ArgumentError("Unknown size: $size"))
+    end
+    eul = HierarchicalMesh{2}()
+    for _ in 1:n_eul_refine
+        leaves = enumerate_leaves(eul)
+        refine_cells!(eul, leaves)
+    end
+    frame = EulerianFrame(eul, (0.0, 0.0), (1.0, 1.0))
+    basis = BernsteinBasis{2, 2}()
+    n = n_cells(eul)
+    f = x -> sin(2π * x[1]) + cos(3π * x[2])
+    return (; frame, basis, n, f)
+end
+
+"""
+    run_init_field_from(state, backend)
+"""
+function run_init_field_from(state, backend::AbstractParallelBackend)
+    field = allocate_polynomial_fields(SoA(), state.basis, state.n; u = Float64)
+    init_field_from!(field, state.frame, state.f; backend = backend)
+    return field
+end
+
+# ----------------------------------------------------------------------------
 # Registry
 # ----------------------------------------------------------------------------
 
@@ -205,6 +340,21 @@ const WORKLOADS = Dict{Symbol, NamedTuple}(
     :refine_by_indicator => (
         build = build_refine_by_indicator,
         run   = run_refine_by_indicator,
+        sizes = [:small, :medium, :large],
+    ),
+    :polynomial_remap_l_to_e => (
+        build = build_polynomial_remap_l_to_e,
+        run   = run_polynomial_remap_l_to_e,
+        sizes = [:small, :medium, :large],
+    ),
+    :polynomial_remap_e_to_l => (
+        build = build_polynomial_remap_e_to_l,
+        run   = run_polynomial_remap_e_to_l,
+        sizes = [:small, :medium, :large],
+    ),
+    :init_field_from => (
+        build = build_init_field_from,
+        run   = run_init_field_from,
         sizes = [:small, :medium, :large],
     ),
 )
