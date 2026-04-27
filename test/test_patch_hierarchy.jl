@@ -7,7 +7,9 @@ using HierarchicalGrids: HierarchicalMesh, refine_cells!, n_cells,
     Sequential, OhMyThreadsBackend,
     PatchHierarchy, PatchBoundaryBC, PatchView, PatchHaloView,
     add_patches!, for_each_patch!,
-    restrict_to_parents!, prolong_from_parents!
+    restrict_to_parents!, prolong_from_parents!,
+    step_patch_pipeline!,
+    cell_physical_box, is_leaf
 
 # Pull the unexported accessor + validator from the Solver submodule so
 # we can run them directly from tests.
@@ -455,4 +457,131 @@ end
     @test nb_idx != 0
     @test captured[] ≈ fine_pfs.rho[nb_idx][1]
     @test captured[] != 999.0
+end
+
+# ============================================================================
+# 7. step_patch_pipeline! — Berger-Oliger correct ordering
+# ============================================================================
+
+# Snapshot every cell's :rho constant coefficient into a Vector{Float64}.
+function _snapshot_rho(pfs)
+    return [pfs.rho[i][1] for i in 1:length(pfs.rho)]
+end
+
+# Doubling kernel: rho_out = 2 * rho_in. Level-agnostic.
+const _double_kernel = function (pv::PatchView, hv::PatchHaloView, ctx)
+    old = pv[:rho]
+    pv[:rho] = ntuple(k -> 2.0 * old[k], length(old))
+    return nothing
+end
+
+# Identity kernel: rho_out = rho_in. Used for mass-conservation tests.
+const _identity_kernel = function (pv::PatchView, hv::PatchHaloView, ctx)
+    pv[:rho] = pv[:rho]
+    return nothing
+end
+
+@testset "step_patch_pipeline!: matches manual prolong/fine/coarse/restrict" begin
+    # Two-level hierarchy: coarse 2×2 base, fine 2×2 patch on the centred
+    # half-square. The fine patch covers all four base leaves with positive
+    # but not full overlap.
+    base_frame = _make_uniform_2d_frame(1, (0.0, 0.0), (1.0, 1.0))
+    fine_frame = _make_uniform_2d_frame(1, (0.25, 0.25), (0.75, 0.75))
+
+    # Build TWO copies of the field-sets so we can run the pipeline helper on
+    # one and the manual sequence on the other, then byte-compare.
+    function _build_fields()
+        base_in  = _make_field(base_frame); _fill_per_index!(base_in,  i -> 1.0 + 0.5 * i)
+        base_out = _make_field(base_frame)
+        fine_in  = _make_field(fine_frame); _fill_per_index!(fine_in,  i -> 10.0 + 0.25 * i)
+        fine_out = _make_field(fine_frame)
+        return (base_in, base_out, fine_in, fine_out)
+    end
+
+    A_base_in, A_base_out, A_fine_in, A_fine_out = _build_fields()
+    B_base_in, B_base_out, B_fine_in, B_fine_out = _build_fields()
+
+    ph = PatchHierarchy(base_frame)
+    add_patches!(ph, 2, [fine_frame])
+
+    # Manual sequence on copy A — replicates the example's `step!`.
+    prolong_from_parents!([_views(A_fine_in)], [_views(A_base_in)],
+                           ph; level = 2, fieldname = :rho)
+    for_each_patch!(_double_kernel,
+                     [_views(A_fine_out)], [_views(A_fine_in)],
+                     ph; level = 2, ghost_depth = 1,
+                     fields_in_parent = [_views(A_base_in)],
+                     backend = Sequential())
+    for_each_patch!(_double_kernel,
+                     [_views(A_base_out)], [_views(A_base_in)],
+                     ph; level = 1, ghost_depth = 1,
+                     backend = Sequential())
+    restrict_to_parents!([_views(A_base_out)], [_views(A_fine_out)],
+                          ph; level = 2, fieldname = :rho)
+
+    # Helper on copy B.
+    fields_in  = [[_views(B_base_in)],  [_views(B_fine_in)]]
+    fields_out = [[_views(B_base_out)], [_views(B_fine_out)]]
+    step_patch_pipeline!(_double_kernel, fields_out, fields_in, ph;
+                          ghost_depth = 1, backend = Sequential())
+
+    # Byte-equal field-set comparison (rho only).
+    @test _snapshot_rho(A_base_in)  == _snapshot_rho(B_base_in)
+    @test _snapshot_rho(A_base_out) == _snapshot_rho(B_base_out)
+    @test _snapshot_rho(A_fine_in)  == _snapshot_rho(B_fine_in)
+    @test _snapshot_rho(A_fine_out) == _snapshot_rho(B_fine_out)
+end
+
+@testset "step_patch_pipeline!: identity kernel preserves total mass" begin
+    # An identity kernel (rho_out = rho_in) on a hierarchy where the fine
+    # patch exactly tiles a contiguous block of coarse cells. Total mass
+    # on the coarse base patch must be preserved to round-off after one
+    # pipeline step (the prolong/restrict are degree-0 conservative on a
+    # cell-aligned fine patch; the identity update changes nothing).
+    base_frame = _make_uniform_2d_frame(2, (0.0, 0.0), (1.0, 1.0))   # 4×4 = 16 leaves
+    # Fine patch on the lower-left quadrant: covers exactly 4 coarse cells.
+    fine_frame = _make_uniform_2d_frame(2, (0.0, 0.0), (0.5, 0.5))   # 4×4 = 16 fine leaves
+
+    base_in  = _make_field(base_frame); _fill_per_index!(base_in,  i -> Float64(i))
+    base_out = _make_field(base_frame); _fill_per_index!(base_out, i -> Float64(i))
+    fine_in  = _make_field(fine_frame)
+    fine_out = _make_field(fine_frame)
+
+    ph = PatchHierarchy(base_frame)
+    add_patches!(ph, 2, [fine_frame])
+
+    # Seed the fine input from the parent (so we start in a consistent
+    # state — same value as constant prolongation would produce).
+    prolong_from_parents!([_views(fine_in)], [_views(base_in)],
+                           ph; level = 2, fieldname = :rho)
+    # Mirror into fine_out so the post-step restrict sees the consistent value.
+    for i in 1:n_cells(fine_frame.mesh)
+        fine_out.rho[i] = fine_in.rho[i]
+    end
+
+    # Total coarse mass = Σ rho · V over base leaves.
+    function _coarse_mass(pfs)
+        s = 0.0
+        for ci in 1:n_cells(base_frame.mesh)
+            is_leaf(base_frame.mesh.cells[ci]) || continue
+            lo, hi = cell_physical_box(base_frame, ci)
+            v = (hi[1] - lo[1]) * (hi[2] - lo[2])
+            s += pfs.rho[ci][1] * v
+        end
+        return s
+    end
+
+    mass_before = _coarse_mass(base_in)
+
+    fields_in  = [[_views(base_in)],  [_views(fine_in)]]
+    fields_out = [[_views(base_out)], [_views(fine_out)]]
+    step_patch_pipeline!(_identity_kernel, fields_out, fields_in, ph;
+                          ghost_depth = 1, backend = Sequential())
+
+    mass_after = _coarse_mass(base_out)
+
+    # Identity update + cell-aligned conservative restrict ⇒ mass invariant
+    # to round-off.
+    @test isapprox(mass_after, mass_before; atol = 1e-12,
+                    rtol = 1e-12)
 end
