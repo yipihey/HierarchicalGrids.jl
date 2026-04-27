@@ -169,6 +169,7 @@ export mean, variance, std_dev, skewness, kurtosis, excess_kurtosis
 export ExponentialMovingAverage, update!, value, reset!
 export PerCellStats
 export RemapDiagnostics
+export OverlapAuditReport, audit_overlap
 
 # Layer 4: geometric-overlap and remap operators
 include("Overlap/Overlap.jl")
