@@ -193,6 +193,70 @@ function run_refine_by_indicator(state, backend::AbstractParallelBackend)
 end
 
 # ----------------------------------------------------------------------------
+# Workload :build_neighbor_graph
+# ----------------------------------------------------------------------------
+
+"""
+    build_build_neighbor_graph(size) -> NamedTuple
+
+Construct a `HierarchicalMesh{2}` with the requested leaf budget. Sizes:
+
+  :small  → 16 leaves    (root + 2 uniform refines)
+  :medium → 256 leaves   (root + 4 uniform refines)
+  :large  → 4096 leaves  (root + 6 uniform refines)
+"""
+function build_build_neighbor_graph(size::Symbol)
+    n_refines = if size === :small
+        2  # 4^2 = 16 leaves
+    elseif size === :medium
+        4  # 4^4 = 256 leaves
+    elseif size === :large
+        6  # 4^6 = 4096 leaves
+    else
+        throw(ArgumentError("Unknown size: $size"))
+    end
+
+    mesh = HierarchicalMesh{2}()
+    for _ in 1:n_refines
+        leaves = enumerate_leaves(mesh)
+        refine_cells!(mesh, leaves)
+    end
+    return (mesh = mesh,)
+end
+
+"""
+    run_build_neighbor_graph(state, backend)
+
+Run `build_neighbor_graph` (one full build) under the supplied backend.
+Each call rebuilds; the cached graph machinery in `ensure_neighbor_graph!`
+is bypassed so every sample exercises the parallel build path.
+"""
+function run_build_neighbor_graph(state, backend::AbstractParallelBackend)
+    return HierarchicalGrids.build_neighbor_graph(state.mesh; backend = backend)
+end
+
+# ----------------------------------------------------------------------------
+# Workload :audit_overlap_canonical
+# ----------------------------------------------------------------------------
+
+"""
+    build_audit_overlap_canonical(size) -> NamedTuple
+
+The canonical-polytope battery is fixed-size; `size` is ignored other
+than to satisfy the workload-registry contract.
+"""
+function build_audit_overlap_canonical(::Symbol)
+    return (;)
+end
+
+"""
+    run_audit_overlap_canonical(state, backend)
+"""
+function run_audit_overlap_canonical(state, backend::AbstractParallelBackend)
+    return HierarchicalGrids.audit_overlap(; backend = backend)
+end
+
+# ----------------------------------------------------------------------------
 # Workload :polynomial_remap_l_to_e
 # ----------------------------------------------------------------------------
 
@@ -340,6 +404,16 @@ const WORKLOADS = Dict{Symbol, NamedTuple}(
     :refine_by_indicator => (
         build = build_refine_by_indicator,
         run   = run_refine_by_indicator,
+        sizes = [:small, :medium, :large],
+    ),
+    :build_neighbor_graph => (
+        build = build_build_neighbor_graph,
+        run   = run_build_neighbor_graph,
+        sizes = [:small, :medium, :large],
+    ),
+    :audit_overlap_canonical => (
+        build = build_audit_overlap_canonical,
+        run   = run_audit_overlap_canonical,
         sizes = [:small, :medium, :large],
     ),
     :polynomial_remap_l_to_e => (

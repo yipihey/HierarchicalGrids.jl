@@ -30,6 +30,10 @@ using HierarchicalGrids
         include("test_neighbors.jl")
     end
 
+    @testset "Layer 1: Face-neighbor graph (parallel build, PR-2)" begin
+        include("test_neighbor_graph_threading.jl")
+    end
+
     @testset "Layer 1: Cell-adjacency sparsity" begin
         include("test_adjacency_sparsity.jl")
     end
@@ -108,6 +112,10 @@ using HierarchicalGrids
 
     @testset "Layer 3 (foundational): IntExact audit harness" begin
         include("test_exact_audit.jl")
+    end
+
+    @testset "Layer 3 (foundational): IntExact audit threading (PR-2)" begin
+        include("test_audit_overlap_threading.jl")
     end
 
     @testset "Layer 4: Overlap" begin
