@@ -176,8 +176,8 @@ version = "1.11.0"
 
 [[deps.R3D]]
 deps = ["StaticArrays"]
-git-tree-sha1 = "b08c3633dd45700e8330c70a2b5c449f9b882fd2"
-repo-rev = "main"
+git-tree-sha1 = "e7a1adaf0421459cb0caf1ba0d9485f72403e65b"
+repo-rev = "ff23853fae4b551a09b5ae91805ee9fbf65d33d5"
 repo-subdir = "R3D.jl"
 repo-url = "https://github.com/yipihey/r3djl"
 uuid = "6888587b-6711-4ff3-8558-83329515e735"

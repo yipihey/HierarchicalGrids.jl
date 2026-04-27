@@ -251,14 +251,11 @@ out_moments)` when the simplex is outside the box, fully clipped
 away, or numerically degenerate (signed area / volume ≤ 0 — same
 convention as the float path's `vol > 0` guard).
 
-D = 2, D = 3, and D = 4 are supported. D = 4 supports `moment_order = 0`
-only (volume): upstream `R3D.IntExact.moments_exact!` errors at D ≥ 4
-because polynomial moments at D = 4 are still research-grade in r3djl
-(sqrt-free fan-triangulation moments at D = 4 require a separate
-implementation that is not yet shipped). The D = 4 dispatch here calls
-`R3D.IntExact.volume_exact` for `moment_order == 0` and throws an
-informative error for `moment_order >= 1` so callers see the upstream
-limitation at the adapter boundary, not somewhere deeper.
+D = 2, D = 3, and D = 4 are supported with full polynomial moments via
+`R3D.IntExact.moments_exact!` (D=4 polynomial-moments support landed
+upstream in r3djl commit `943135f1`, dispatched through
+`_moments_exact_dgeneric_4plus!`). Higher D (D = 5, D = 6) is
+research-grade upstream and intentionally not exposed here.
 
 # Centroid convention
 
@@ -295,8 +292,10 @@ end
 # Per-D dispatch
 # ============================================================================
 
-# Generic catch-all: D ≥ 5 still not supported. PR-5 unlocks D=4 (volume
-# only). Higher-D dispatch waits on upstream `R3D.IntExact` D ≥ 5 support.
+# Generic catch-all: D ∉ {2, 3, 4} not supported. Upstream R3D.IntExact
+# has experimental D=5/D=6 paths but HG does not surface them — the
+# downstream geometry / lattice / quantization stack is targeted at
+# D ∈ {1, 2, 3, 4}.
 function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
                                   scratch::IntPairScratch{D, T},
                                   simplex_vertices,
@@ -306,9 +305,10 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
                                   ::Val{D}) where {D, T<:Signed, R<:Signed}
     throw(ErrorException(
         "overlap_simplex_box_exact! at D=$D not supported. " *
-        "Currently supported: D=2 (full moments), D=3 (full moments), " *
-        "D=4 (volume only, P=0). Higher D awaits upstream R3D.IntExact " *
-        "support. See src/Overlap/r3d_int_adapter.jl for the dispatch table."))
+        "Currently supported: D=2, D=3, D=4 (full polynomial moments). " *
+        "Higher D (D=5, D=6) is research-grade upstream and not surfaced " *
+        "in HierarchicalGrids. See src/Overlap/r3d_int_adapter.jl for the " *
+        "dispatch table."))
 end
 
 # ----------------------------------------------------------------------------
@@ -462,19 +462,12 @@ end
 # ----------------------------------------------------------------------------
 # D = 4
 #
-# Upstream `R3D.IntExact.moments_exact!` errors at D ≥ 4 (polynomial
-# moments at D = 4 are research-grade in r3djl: the sqrt-free fan
-# triangulation only ships `volume_exact(D=4)` today). The D = 4
-# dispatch therefore supports ONLY `moment_order == 0`: it initializes
-# the pentachoron, clips against the 8 axis-aligned box planes, and
-# reads the 4-volume via `R3D.IntExact.volume_exact`. The volume lands
-# in `out_moments[1]` to match the graded-lex layout of `moments_exact!`
-# at D = 2, 3.
-#
-# A `moment_order >= 1` request throws a scoped error pointing at the
-# upstream limitation. PR-3 will surface this at the `compute_overlap`
-# layer for the `:exact` backend (D=4 means `P=0` only until r3djl
-# ships D=4 polynomial moments).
+# As of r3djl commit 943135f1 (`IntExact polynomial moments at D ∈ {4, 5,
+# 6} via simplex decomposition`), `R3D.IntExact.moments_exact!` ships
+# full polynomial moments for D = 4. The dispatch in `intexact.jl` routes
+# `D == 4` to `_moments_exact_dgeneric_4plus!`, so this method now mirrors
+# the D=2 / D=3 paths exactly: clip the pentachoron against the 8
+# axis-aligned box planes, then call `moments_exact!` to fill `out_moments`.
 #
 # Vertex orientation (positive 4-volume): the 5! / 2 = 60 even
 # permutations on 5 vertices give a positive `det(V)`, the 60 odd ones
@@ -509,14 +502,6 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
                                   box_hi::NTuple{4, T},
                                   moment_order::Int,
                                   ::Val{4}) where {T<:Signed, R<:Signed}
-    moment_order == 0 || throw(ErrorException(
-        "overlap_simplex_box_exact! at D=4 supports moment_order = 0 only. " *
-        "Got moment_order = $moment_order. Upstream R3D.IntExact.moments_exact! " *
-        "errors at D = 4 because polynomial moments at D ≥ 4 are not yet " *
-        "implemented in r3djl (only `volume_exact(D=4)` ships). " *
-        "PR-3's compute_overlap :exact backend will surface this at the " *
-        "user-facing layer."))
-
     if box_lo[1] >= box_hi[1] || box_lo[2] >= box_hi[2] ||
        box_lo[3] >= box_hi[3] || box_lo[4] >= box_hi[4]
         return _empty_result(out_moments, Val(4), R)
@@ -562,19 +547,20 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
         return _empty_result(out_moments, Val(4), R)
     end
 
-    # Volume only — moments_exact!(D=4) is unimplemented upstream.
-    vol = R3D.IntExact.volume_exact(poly, R)
+    R3D.IntExact.moments_exact!(out_moments, poly, moment_order)
+    vol = out_moments[1]
     if vol <= zero(Rational{R})
         fill!(out_moments, zero(Rational{R}))
         return _empty_result(out_moments, Val(4), R)
     end
 
-    @inbounds out_moments[1] = vol
-    # Centroid is not derivable from P=0 moments alone: it would require
-    # the 5 first-order moments which `moments_exact!` cannot produce at
-    # D = 4. Return a zero placeholder and document the convention.
-    centroid = (zero(Rational{R}), zero(Rational{R}),
-                zero(Rational{R}), zero(Rational{R}))
+    centroid = if moment_order >= 1
+        (out_moments[2] // vol, out_moments[3] // vol,
+         out_moments[4] // vol, out_moments[5] // vol)
+    else
+        (zero(Rational{R}), zero(Rational{R}),
+         zero(Rational{R}), zero(Rational{R}))
+    end
     return (vol, centroid, out_moments)
 end
 

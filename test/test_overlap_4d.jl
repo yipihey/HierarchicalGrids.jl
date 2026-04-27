@@ -7,10 +7,12 @@ using Test
 #
 # Coverage scope reflects upstream R3D.IntExact's D = 4 capabilities:
 #   - `volume_exact(D=4)` ships and is exercised end-to-end here
-#   - `moments_exact!(D=4)` ERRORS upstream (research-grade); the adapter
-#     therefore exposes only `moment_order = 0` at D = 4 and we test
-#     that `moment_order >= 1` throws a scoped error rather than letting
-#     the upstream error bubble up at depth.
+#   - `moments_exact!(D=4)` SHIPS as of r3djl commit 943135f1 (polynomial
+#     moments at D ∈ {4, 5, 6} via simplex decomposition); the adapter
+#     therefore now supports full polynomial moments at D = 4. We test
+#     P = 0, P = 1 (centroid), P = 2 (second moments), conservation
+#     across a Kuhn-style 24-pentachoron tile decomposition, and the
+#     empty case at P = 1.
 #
 # All inputs are exact integers on a discretized lattice; the adapter
 # returns exact `Rational{R}` values throughout. PR-3 will dequantize
@@ -258,17 +260,24 @@ end
 end
 
 # ----------------------------------------------------------------------------
-# 8. moment_order >= 1 at D=4 throws a scoped adapter error.
+# 8. moment_order = 1 at D=4: bit-exact centroid via R3D.IntExact.moments_exact!
 #
-# Upstream R3D.IntExact.moments_exact! errors at D ≥ 4 because polynomial
-# moments at D = 4 are research-grade. The adapter surfaces this at the
-# entry point, not deep in r3djl, so callers see a clean error message.
+# Upstream r3djl commit 943135f1 ships polynomial moments at D ∈ {4, 5, 6}
+# via simplex decomposition, dispatched in `moments_exact!` through
+# `_moments_exact_dgeneric_4plus!`. The adapter now mirrors the D=2/D=3
+# paths exactly and returns the centroid from the first-order moments.
+# For the corner pentachoron with vertices (0, s e_1, ..., s e_4):
+#   M(0,0,0,0) = vol = s^4 / 24
+#   M(1,0,0,0) = M(0,1,0,0) = M(0,0,1,0) = M(0,0,0,1) = vol * s / 5
+# So centroid = (s/5, s/5, s/5, s/5) bit-exact in Rational arithmetic.
 # ----------------------------------------------------------------------------
 
-@testset "IntExact D=4: moment_order ≥ 1 throws scoped error" begin
-    s = Int64(12)
+@testset "IntExact D=4: P=1 centroid on unit pentachoron" begin
+    s = Int64(12)   # s/5 = 12/5 (non-integer rational ⇒ tests Rational handling)
     scratch = IntPairScratch(Val(4), Int64; capacity = 64)
     R = BigInt
+    P = 1
+    m = Vector{Rational{R}}(undef, moments_length(4, P))
 
     verts = ((Int64(0), Int64(0), Int64(0), Int64(0)),
              (s, Int64(0), Int64(0), Int64(0)),
@@ -278,10 +287,167 @@ end
     box_lo = (Int64(0), Int64(0), Int64(0), Int64(0))
     box_hi = (s, s, s, s)
 
-    for P in (1, 2)
-        m = Vector{Rational{R}}(undef, moments_length(4, P))
-        @test_throws ErrorException overlap_simplex_box_exact!(
-            m, scratch, verts, box_lo, box_hi, P; accumulator = R)
+    vol, centroid, mout = overlap_simplex_box_exact!(m, scratch,
+                                                       verts, box_lo, box_hi, P;
+                                                       accumulator = R)
+
+    @test vol == Rational{R}(s)^4 // 24
+    expected_centroid_axis = Rational{R}(s) // 5
+    for d in 1:4
+        @test centroid[d] == expected_centroid_axis
+    end
+    # First-order moments: M(e_d) = vol * s / 5  (graded-lex index d+1).
+    expected_first = vol * Rational{R}(s) // 5
+    for d in 1:4
+        @test mout[d + 1] == expected_first
+    end
+end
+
+# ----------------------------------------------------------------------------
+# 9. moment_order = 2 at D=4: analytic second moments (diagonal & off-diagonal).
+#
+# For the corner simplex with vertices (0, s e_1, ..., s e_n):
+#   ∫ x_i x_j dV = vol · s² · (1 + δ_ij) / ((n+1)(n+2))
+# At n = 4: ((n+1)(n+2)) = 30, so
+#   diagonal  ∫ x_i² dV = vol · s² · 2 / 30 = vol · s² / 15
+#   off-diag  ∫ x_i x_j dV = vol · s² / 30   (for i ≠ j)
+# Graded-lex P=2 layout (D=4): indices 6..15 carry the second-degree
+# multi-indices in the order (2,0,0,0), (1,1,0,0), (1,0,1,0), (1,0,0,1),
+# (0,2,0,0), (0,1,1,0), (0,1,0,1), (0,0,2,0), (0,0,1,1), (0,0,0,2).
+# ----------------------------------------------------------------------------
+
+@testset "IntExact D=4: P=2 second moments on unit pentachoron" begin
+    s = Int64(12)
+    scratch = IntPairScratch(Val(4), Int64; capacity = 64)
+    R = BigInt
+    P = 2
+    m = Vector{Rational{R}}(undef, moments_length(4, P))
+
+    verts = ((Int64(0), Int64(0), Int64(0), Int64(0)),
+             (s, Int64(0), Int64(0), Int64(0)),
+             (Int64(0), s, Int64(0), Int64(0)),
+             (Int64(0), Int64(0), s, Int64(0)),
+             (Int64(0), Int64(0), Int64(0), s))
+    box_lo = (Int64(0), Int64(0), Int64(0), Int64(0))
+    box_hi = (s, s, s, s)
+
+    vol, _, mout = overlap_simplex_box_exact!(m, scratch,
+                                                verts, box_lo, box_hi, P;
+                                                accumulator = R)
+
+    @test vol == Rational{R}(s)^4 // 24
+    multi = HierarchicalGrids.Overlap.moment_multiindices(4, 2)
+    diag_expected = vol * Rational{R}(s)^2 // 15
+    offd_expected = vol * Rational{R}(s)^2 // 30
+    # Walk the multi-indices and check second-degree entries against
+    # the analytic prediction.
+    for k in eachindex(multi)
+        α = multi[k]
+        deg = sum(α)
+        deg == 2 || continue
+        if maximum(α) == 2
+            # diagonal ∫ x_i^2 dV
+            @test mout[k] == diag_expected
+        else
+            # mixed ∫ x_i x_j dV
+            @test mout[k] == offd_expected
+        end
+    end
+end
+
+# ----------------------------------------------------------------------------
+# 10. moment_order = 1 at D=4: empty pentachoron ⇒ all moments zero.
+#
+# When the pentachoron sits entirely outside the box, the empty-clip
+# guard fires and `out_moments` is zeroed. Centroid is the zero tuple.
+# ----------------------------------------------------------------------------
+
+@testset "IntExact D=4: P=1 empty pentachoron ⇒ zero moments" begin
+    s = Int64(12)
+    scratch = IntPairScratch(Val(4), Int64; capacity = 64)
+    R = BigInt
+    P = 1
+    m = Vector{Rational{R}}(undef, moments_length(4, P))
+
+    off = Int64(100)
+    verts = ((off, off, off, off),
+             (off + s, off, off, off),
+             (off, off + s, off, off),
+             (off, off, off + s, off),
+             (off, off, off, off + s))
+    box_lo = (Int64(0), Int64(0), Int64(0), Int64(0))
+    box_hi = (s, s, s, s)
+
+    vol, centroid, mout = overlap_simplex_box_exact!(m, scratch,
+                                                       verts, box_lo, box_hi, P;
+                                                       accumulator = R)
+
+    @test vol == zero(Rational{R})
+    @test all(mout .== zero(Rational{R}))
+    @test all(centroid .== zero(Rational{R}))
+end
+
+# ----------------------------------------------------------------------------
+# 11. moment_order = 1 conservation across the 24-pentachoron Kuhn tiling.
+#
+# The Kuhn-style tile decomposition of [0, s]^4 into 24 pentachora (one
+# per permutation of (1, 2, 3, 4)) is mass-conserving: the volume-weighted
+# centroid sum equals the cube's centroid (s/2, s/2, s/2, s/2), and the
+# first-moment sum equals s * vol_cube / 2 along each axis. We aggregate
+# the first-degree moments (graded-lex indices 2..5) directly rather than
+# centroids — this is the cleaner conservation statement (centroids are
+# vol-divided whereas raw moments are vol-weighted).
+# ----------------------------------------------------------------------------
+
+@testset "IntExact D=4: Kuhn-tile P=1 first-moment conservation" begin
+    s = Int64(6)
+    scratch = IntPairScratch(Val(4), Int64; capacity = 64)
+    R = BigInt
+    P = 1
+    m = Vector{Rational{R}}(undef, moments_length(4, P))
+
+    box_lo = (Int64(0), Int64(0), Int64(0), Int64(0))
+    box_hi = (s, s, s, s)
+
+    perms = NTuple{4, Int}[]
+    for a in 1:4, b in 1:4, c in 1:4, d in 1:4
+        if a != b && a != c && a != d && b != c && b != d && c != d
+            push!(perms, (a, b, c, d))
+        end
+    end
+    @test length(perms) == 24
+
+    total_vol = zero(Rational{R})
+    total_first = ntuple(_ -> zero(Rational{R}), Val(4))
+    for π in perms
+        vk = NTuple{5, NTuple{4, Int64}}(ntuple(k -> begin
+            v = [Int64(0), Int64(0), Int64(0), Int64(0)]
+            for i in 1:(k - 1)
+                v[π[i]] = s
+            end
+            (v[1], v[2], v[3], v[4])
+        end, 5))
+
+        vol, _, mout = overlap_simplex_box_exact!(m, scratch,
+                                                    vk, box_lo, box_hi, P;
+                                                    accumulator = R)
+        @test vol == Rational{R}(s)^4 // 24
+        total_vol += vol
+        total_first = ntuple(d -> total_first[d] + mout[d + 1], Val(4))
+    end
+    # Conservation:
+    #   sum_pent vol = vol_cube = s^4
+    @test total_vol == Rational{R}(s)^4
+    #   sum_pent ∫ x_d dV = ∫_cube x_d dV = s^5 / 2
+    expected_first = Rational{R}(s)^5 // 2
+    for d in 1:4
+        @test total_first[d] == expected_first
+    end
+    # Equivalently, the volume-weighted centroid lands at (s/2, s/2, s/2, s/2).
+    centroid_total = ntuple(d -> total_first[d] // total_vol, Val(4))
+    half_s = Rational{R}(s) // 2
+    for d in 1:4
+        @test centroid_total[d] == half_s
     end
 end
 
