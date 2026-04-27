@@ -174,6 +174,10 @@ own files:
   invokes `refine_by_indicator!` on a hysteresis schedule. Kept
   intentionally minimal; per-cell state stays consistent via the
   refinement-listener mechanism.
+- [Exact-rational overlap backend](exact_backend.md) — `IntegerLattice`
+  quantization, `overlap_simplex_box_exact!`, and the `audit_overlap`
+  harness. Bit-exact, deterministic, robust on degenerate orientations,
+  and the only path that reaches `D = 4` (volume only) today.
 
 ## What we expect to add
 
