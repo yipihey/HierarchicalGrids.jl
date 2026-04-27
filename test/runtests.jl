@@ -98,6 +98,10 @@ using HierarchicalGrids
         include("test_overlap_3d.jl")
     end
 
+    @testset "Layer 4: Overlap IntExact adapter (D=2,3)" begin
+        include("test_overlap_int_adapter.jl")
+    end
+
     @testset "Layer 4: Polynomial remap" begin
         include("test_polynomial_remap.jl")
     end
