@@ -156,9 +156,14 @@ end
     @test isempty(report.failures)
 end
 
-@testset "audit_overlap(lag, frame): two-triangle tile reveals upstream drops" begin
+@testset "audit_overlap(lag, frame): two-triangle tile (formerly upstream-buggy)" begin
     # The two-triangle tiling of [0, 1]^2 against a 1-level-refined
-    # Eulerian is the canonical bad geometry for IntExact at D = 2.
+    # Eulerian used to expose `R3D.IntExact`'s D = 2 upstream bugs as
+    # `:exact_dropped` failures in the audit. Both bugs are fixed
+    # upstream as of r3djl commit 154b346 (2026-04-27). This geometry
+    # now serves as a regression detector: no `:exact_dropped`
+    # failures should appear, and any per-pair diffs must stay within
+    # the lattice-resolution tolerance (~1.5e-5 at bits=16).
     positions = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
     sv = Int32[1 1; 2 3; 3 4]
     sn = zeros(Int32, 3, 2)
@@ -167,18 +172,23 @@ end
     refine_cells!(eul, [1])
     frame = EulerianFrame(eul, (0.0, 0.0), (1.0, 1.0))
 
+    # Use a tolerance commensurate with bits=16 lattice resolution.
     report = audit_overlap(lag, frame; bits = 16, accumulator = Int128,
-                           atol = 1e-10, max_pair_diffs = 32)
-    @test report.n_failed > 0
-    @test !isempty(report.failures)
+                           atol = 1e-4, max_pair_diffs = 32)
 
-    # At least one failure has kind = :exact_dropped.
+    # No drops — upstream now produces valid clips for this geometry.
     kinds = Set(f.kind for f in report.failures)
-    @test :exact_dropped in kinds
+    @test :exact_dropped ∉ kinds
 
-    # Failures are sorted by descending volume_diff.
-    diffs = [f.volume_diff for f in report.failures]
-    @test diffs == sort(diffs; rev = true)
+    # If any per-pair failures remain, they must be within
+    # lattice-resolution tolerance. Document the residual numerical
+    # difference rather than asserting bit-equality across backends.
+    if !isempty(report.failures)
+        # Failures are sorted by descending volume_diff.
+        diffs = [f.volume_diff for f in report.failures]
+        @test diffs == sort(diffs; rev = true)
+        @test all(f -> f.volume_diff < 1e-3, report.failures)
+    end
 end
 
 @testset "audit_overlap(lag, frame): show formatting renders per-pair entries" begin

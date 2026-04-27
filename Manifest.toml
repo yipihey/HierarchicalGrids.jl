@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "ec84e7851a2c5e0c2a51dfdb6ae7b5dc2020bd8b"
+project_hash = "b380c4cce4beeb23c036bdc8bc83a4d72a7e547a"
 
 [[deps.Accessors]]
 deps = ["CompositionsBase", "ConstructionBase", "Dates", "InverseFunctions", "MacroTools"]
@@ -104,6 +104,14 @@ path = "."
 uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 version = "0.1.0"
 
+    [deps.HierarchicalGrids.extensions]
+    HierarchicalGridsHwlocExt = "Hwloc"
+    HierarchicalGridsThreadPinningExt = "ThreadPinning"
+
+    [deps.HierarchicalGrids.weakdeps]
+    Hwloc = "0e44f5e4-bd66-52a0-8798-143a42290a1d"
+    ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
+
 [[deps.InitialValues]]
 git-tree-sha1 = "4da0f88e9a39111c2fa3add390ab15f3a44f3ca3"
 uuid = "22cec73e-a1b8-11e9-2c92-598750a2cf9c"
@@ -176,8 +184,8 @@ version = "1.11.0"
 
 [[deps.R3D]]
 deps = ["StaticArrays"]
-git-tree-sha1 = "e7a1adaf0421459cb0caf1ba0d9485f72403e65b"
-repo-rev = "ff23853fae4b551a09b5ae91805ee9fbf65d33d5"
+git-tree-sha1 = "4b8f995ca50ef22910ce45deda1e2a6661c61a01"
+repo-rev = "154b346ba2fa9c381f58497cd490a920fb3876e9"
 repo-subdir = "R3D.jl"
 repo-url = "https://github.com/yipihey/r3djl"
 uuid = "6888587b-6711-4ff3-8558-83329515e735"

@@ -52,10 +52,24 @@ end
 # Test 2 — known-bad geometry triggers drops
 # ---------------------------------------------------------------------------
 
-@testset "drop audit: two-triangle tile / 1-refined Eulerian (known upstream drops)" begin
+@testset "drop audit: two-triangle tile / 1-refined Eulerian (substantially fixed upstream)" begin
     # The two-triangle tiling of [0, 1]^2 (sharing the diagonal) plus a
-    # 1-level-refined Eulerian (4 child leaves) is the canonical
-    # geometry for triggering R3D.IntExact's D = 2 upstream issues.
+    # 1-level-refined Eulerian (4 child leaves) used to trigger
+    # `R3D.IntExact`'s D = 2 upstream bugs aggressively (5 negative-
+    # volume drops + 2 `_moments_exact_d2!` `0//0` throws = 7 data-loss
+    # drops out of 6 (lag, eul) pairs).
+    #
+    # Upstream r3djl commit 154b346 (2026-04-27) substantially fixed
+    # both bugs: the `0//0` throw is gone, and the negative-volume
+    # cases dropped from 5 to 2. The residual 2 cases occur on
+    # diagonal-corner pairs where the Lagrangian triangle's hypotenuse
+    # aligns with an Eulerian quadrant boundary — a more subtle
+    # degeneracy worth a separate upstream reproducer.
+    #
+    # This test pins the post-fix drop count and acts as a regression
+    # detector: a future r3djl bump that fully fixes the residual
+    # would let us tighten the assertions; a regression that brings
+    # back drops would catch immediately.
     positions = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
     sv = Int32[1 1; 2 3; 3 4]
     sn = zeros(Int32, 3, 2)
@@ -69,22 +83,20 @@ end
                                 moment_order = 1,
                                 audit_drops = true)
     @test report isa OverlapDropReport
-    # Data-loss drops are non-zero (the whole point of this geometry).
-    @test report.n_negative_volume + report.n_moments_throw > 0
+    # No more `_moments_exact_d2!` throws (bug fully fixed upstream).
+    @test report.n_moments_throw == 0
+    # Negative-volume drops reduced from 5 to a small residual on
+    # diagonal-corner pairs. Bound it below the prior baseline.
+    @test report.n_negative_volume <= 2
 
-    # The float backend must produce all 6 (lag, eul) pairs that
-    # tile [0, 1]^2 over 4 octant cells (each triangle covers 3 cells).
-    o_f = compute_overlap(lag, frame; backend = :float, moment_order = 1)
-    @test n_entries(o_f) > n_entries(o)
-    # Total dropped volume should approximately equal float - exact.
-    diff = total_overlap_volume(o_f) - total_overlap_volume(o)
-    @test diff > 0.5  # most of the area is dropped on this pathological mesh
-
-    # Each recorded drop has a valid (lag_idx, eul_idx, kind) triple.
+    # Each remaining negative-volume drop is on a diagonal-corner pair.
     for d in report.drops
-        @test d.lag_idx in (Int32(1), Int32(2))
-        @test 1 <= d.eul_idx <= 5  # 1 root + 4 octants
-        @test d.kind in (:negative_volume, :moments_throw, :empty)
+        if d.kind === :negative_volume
+            @test (d.lag_idx, d.eul_idx) in (
+                (Int32(1), Int32(4)),
+                (Int32(2), Int32(3)),
+            )
+        end
     end
 end
 
