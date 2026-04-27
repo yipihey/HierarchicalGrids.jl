@@ -271,7 +271,8 @@ using .Solver: CellView, ghost_depth, cell_view, halo_view_multi,
                 AdaptiveField, dispose!,
                 PatchHierarchy, PatchBoundaryBC, PatchView, PatchHaloView,
                 add_patches!, for_each_patch!,
-                restrict_to_parents!, prolong_from_parents!
+                restrict_to_parents!, prolong_from_parents!,
+                step_patch_pipeline!
 export CellView, BlockView, BlockHaloView
 export ghost_depth, cell_view, halo_view_multi, block_view, block_halo_view
 export for_each_cell!, for_each_face!, for_each_block!
@@ -286,5 +287,6 @@ export AdaptiveField, dispose!
 export PatchHierarchy, PatchBoundaryBC, PatchView, PatchHaloView
 export add_patches!, for_each_patch!
 export restrict_to_parents!, prolong_from_parents!
+export step_patch_pipeline!
 
 end # module HierarchicalGrids

@@ -75,5 +75,6 @@ export AdaptiveField, dispose!
 export PatchHierarchy, PatchBoundaryBC, PatchView, PatchHaloView
 export add_patches!, n_levels, n_patches, patches_at, validate
 export for_each_patch!, restrict_to_parents!, prolong_from_parents!
+export step_patch_pipeline!
 
 end # module Solver

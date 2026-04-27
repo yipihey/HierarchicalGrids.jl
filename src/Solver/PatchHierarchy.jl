@@ -777,3 +777,126 @@ function prolong_from_parents!(fields_out_fine::Vector,
     end
     return nothing
 end
+
+# ----------------------------------------------------------------------------
+# step_patch_pipeline! — Berger-Oliger time step with the correct ordering
+# ----------------------------------------------------------------------------
+
+"""
+    step_patch_pipeline!(kernel, fields_out, fields_in,
+                          ph::PatchHierarchy{D, T};
+                          ctx = nothing,
+                          fieldname::Symbol = :rho,
+                          ghost_depth::Int = 1,
+                          backend::AbstractParallelBackend = default_backend()
+                         ) where {D, T}
+
+One time-step of a Berger-Oliger patch hierarchy, with the
+empirically-verified sub-step ordering:
+
+  1. **Prolong** — for every fine level (level 2..n_levels), fill
+     `fields_in[ℓ]` from `fields_in[ℓ - 1]` via `prolong_from_parents!`.
+     This makes the fine boundary halos in step 2 read pre-step parent
+     values.
+  2. **Update fine** — for each fine level, finest first, run
+     `for_each_patch!(kernel, fields_out[ℓ], fields_in[ℓ], ph; level = ℓ,
+     fields_in_parent = fields_in[ℓ - 1], ...)`.
+  3. **Update coarse** — run the same kernel on level 1 (the base patch).
+  4. **Restrict** — for every fine level, finest first, push the volume-
+     weighted fine averages back to the parent's `fields_out` via
+     `restrict_to_parents!`.
+
+The same `kernel` is invoked at every level. The orchestrator passes the
+correct per-cell `PatchView` (which carries `pv.level`) so the kernel
+can dispatch on level if it needs to. For uniform first-order schemes
+the kernel is level-agnostic.
+
+# Arguments
+
+- `kernel(pv::PatchView, hv::PatchHaloView, ctx)` — the per-cell update
+  callable, identical to the one accepted by `for_each_patch!`.
+- `fields_out::Vector{<:Vector}` — `fields_out[ℓ]` holds the output
+  field-set views for every patch at level `ℓ` (one `NamedTuple` of
+  `PolynomialFieldView`s per patch). Length must equal `n_levels(ph)`.
+- `fields_in::Vector{<:Vector}` — same shape as `fields_out`, holding
+  the input views.
+- `ph::PatchHierarchy` — the hierarchy.
+- `ctx` — opaque per-call context, threaded through to the kernel.
+- `fieldname::Symbol` — the field touched by `prolong_from_parents!`
+  and `restrict_to_parents!` (degree-0 path; defaults to `:rho`).
+- `ghost_depth::Int` — same semantics as `for_each_patch!`.
+- `backend::AbstractParallelBackend` — same semantics as
+  `for_each_patch!`.
+
+# Conservation
+
+This ordering is documented (see `docs/src/patch_based_amr.md`) to give
+bit-exact mass conservation when combined with the conservative degree-0
+`restrict_to_parents!` and a fine patch that exactly tiles whole coarse
+cells. The naive textbook ordering ("coarse first, then fine") produces
+`O(dt)` per-step drift and is **not** the recommended pattern.
+
+# Notes
+
+- The helper only reads from `fields_in` and writes to `fields_out`; it
+  does **not** swap buffers. Callers that double-buffer should perform
+  the swap externally between steps.
+- Step 1 writes into `fields_in` (the fine input buffer's ghost-zone
+  cells get refreshed from the parent). This matches the worked
+  example's pipeline in `examples/cfd_patch_amr/src/CFDPatchAMR.jl`.
+- Step 4 writes into `fields_out` of the parent level; the overwrite
+  is intentional — covered coarse cells' post-coarse values are
+  replaced by the volume-weighted fine averages.
+"""
+function step_patch_pipeline!(kernel,
+                                fields_out::Vector,
+                                fields_in::Vector,
+                                ph::PatchHierarchy{D, T};
+                                ctx = nothing,
+                                fieldname::Symbol = :rho,
+                                ghost_depth::Int = 1,
+                                backend::AbstractParallelBackend = default_backend()
+                                ) where {D, T}
+    n_lev = length(ph.levels)
+    length(fields_out) == n_lev ||
+        throw(ArgumentError("step_patch_pipeline!: fields_out has " *
+                             "$(length(fields_out)) entries, expected " *
+                             "$(n_lev) (one vector-of-views per level)"))
+    length(fields_in) == n_lev ||
+        throw(ArgumentError("step_patch_pipeline!: fields_in has " *
+                             "$(length(fields_in)) entries, expected " *
+                             "$(n_lev)"))
+
+    # Step 1: Prolong fine levels from their parents (top-down: coarsest
+    # parent first, so each level's input buffer is consistent before its
+    # update runs). This fills fine ghost zones via the parent.
+    for ℓ in 2:n_lev
+        prolong_from_parents!(fields_in[ℓ], fields_in[ℓ - 1],
+                               ph; level = ℓ, fieldname = fieldname)
+    end
+
+    # Step 2: Update fine levels, finest first. Each level's update reads
+    # parent halos through `fields_in_parent` (= the pre-step parent
+    # input buffer).
+    for ℓ in n_lev:-1:2
+        for_each_patch!(kernel, fields_out[ℓ], fields_in[ℓ], ph;
+                          level = ℓ, ghost_depth = ghost_depth,
+                          fields_in_parent = fields_in[ℓ - 1],
+                          ctx = ctx, backend = backend)
+    end
+
+    # Step 3: Update the coarse base on the full domain.
+    for_each_patch!(kernel, fields_out[1], fields_in[1], ph;
+                      level = 1, ghost_depth = ghost_depth,
+                      ctx = ctx, backend = backend)
+
+    # Step 4: Restrict fine outputs back onto parent outputs (finest
+    # first; covered parent cells get overwritten by volume-weighted
+    # averages).
+    for ℓ in n_lev:-1:2
+        restrict_to_parents!(fields_out[ℓ - 1], fields_out[ℓ],
+                              ph; level = ℓ, fieldname = fieldname)
+    end
+
+    return nothing
+end
