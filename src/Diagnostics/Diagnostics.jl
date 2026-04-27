@@ -42,6 +42,7 @@ export skewness, kurtosis, excess_kurtosis, count_samples, merge_stats!
 export ExponentialMovingAverage, update!, value, reset!
 export PerCellStats
 export RemapDiagnostics
+export OverlapAuditReport, audit_overlap
 
 # ============================================================================
 # WelfordStats — online mean, variance, skewness, kurtosis
@@ -428,6 +429,26 @@ function Base.show(io::IO, d::RemapDiagnostics{T}) where {T}
               ", total_volume_in=", d.total_volume_in,
               ", total_volume_out=", d.total_volume_out,
               ", n_negative_jacobian_cells=", d.n_negative_jacobian_cells, ")")
+end
+
+# ============================================================================
+# IntExact audit harness (spans the float and integer-exact backends)
+# ============================================================================
+#
+# Lives in Diagnostics for organizational reasons (a diagnostic harness)
+# but reaches across to the Overlap submodule at call time. The module-
+# load consistency check is invoked from `__init__` below, which runs
+# after the entire HierarchicalGrids package has finished loading, so
+# Overlap's symbols are resolvable.
+include("exact_audit.jl")
+
+# Run the IntExact consistency check once at package load, mirroring
+# `_verify_moment_ordering` in `src/Overlap/r3d_adapter.jl`. Gated by
+# the `HG_INTEXACT_VERIFY` environment variable so it can be disabled
+# in latency-sensitive contexts; default behavior is "always run".
+function __init__()
+    _verify_intexact_consistency()
+    return nothing
 end
 
 end # module Diagnostics

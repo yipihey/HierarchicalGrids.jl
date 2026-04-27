@@ -86,6 +86,10 @@ using HierarchicalGrids
         include("test_diagnostics.jl")
     end
 
+    @testset "Layer 3 (foundational): IntExact audit harness" begin
+        include("test_exact_audit.jl")
+    end
+
     @testset "Layer 4: Overlap" begin
         include("test_overlap.jl")
     end
