@@ -702,6 +702,258 @@ function _compute_overlap_parallel(lag::SimplicialMesh{D, T},
     return finalize_overlap(final_builder, n_simplices(lag), n_cells(eul))
 end
 
+# ============================================================================
+# EulerianFrame × EulerianFrame overlap (PR-12)
+#
+# Box-vs-box geometric overlap between two `EulerianFrame`s. For each pair
+# of leaves whose physical AABBs intersect with positive measure, emit one
+# `OverlapEntry` carrying volume, centroid, and full polynomial moments
+# up to `moment_order`. The moments follow the same convention as the
+# (SimplicialMesh, EulerianFrame) path: integrated over the overlap box
+# with origin at the physical origin (not the centroid). For an
+# axis-aligned box the integral factors per axis as
+#
+#     M(α) = ∫_{lo..hi} x^α dV = ∏_d (hi_d^{α_d+1} - lo_d^{α_d+1}) / (α_d + 1)
+#
+# The entry's `lag_idx` field stores the leaf index of `frame_a`; `eul_idx`
+# stores the leaf index of `frame_b`. Downstream callers (e.g. PR-13's
+# patch-based AMR) treat `frame_a` as the "source" / Lagrangian-side frame
+# and `frame_b` as the "destination" / Eulerian-side frame, matching the
+# CSR-style indexing built by `finalize_overlap`.
+#
+# Periodic ghost-overlap is OUT of scope for PR-12 — neither frame's
+# `FrameBoundaries` is consulted. PR-13 may extend this to handle periodic
+# axes by translating one frame's leaves through the period table; the
+# non-periodic path here is the building block. Callers that need periodic
+# matching today should expand the source frame's domain to include ghost
+# images explicitly before computing the overlap.
+# ============================================================================
+
+"""
+    compute_overlap(frame_a::EulerianFrame{D, Float64},
+                     frame_b::EulerianFrame{D, Float64};
+                     moment_order::Integer = 3,
+                     parallel::Bool = true,
+                     backend::AbstractParallelBackend = default_backend(),
+                    ) -> GeometricOverlap{D, Float64}
+
+Geometric overlap between two Eulerian hierarchical frames, both wrapped
+in physical-coordinate `EulerianFrame`s. For every pair `(leaf_a, leaf_b)`
+whose physical AABBs intersect with positive measure, the result contains
+one `OverlapEntry` carrying:
+
+- `volume`     — the measure of the intersection box.
+- `centroid`   — its geometric center in physical coordinates.
+- `moments`    — the full polynomial moment vector up to `moment_order`,
+                  integrated over the intersection box with origin at the
+                  physical origin (matching the convention used by the
+                  `(SimplicialMesh, EulerianFrame)` overlap path).
+
+The entry's `lag_idx` field stores `leaf_a` and `eul_idx` stores `leaf_b`,
+following the same CSR-style indexing built by `finalize_overlap`. This
+choice is intentional: downstream callers (patch-based AMR remap) treat
+`frame_a` as the "source" half and `frame_b` as the "destination" half,
+mirroring the (Lagrangian, Eulerian) split used elsewhere in the layer.
+
+# Algorithm
+
+A direct O(N × M) box-vs-box clip filtered by `aabbs_overlap`. The clip
+itself is closed-form per axis (`max(lo)`, `min(hi)`), and moments factor
+per axis exactly. No BVH is built — for the small mesh sizes typical of
+patch-based AMR this is faster than a tree query, and avoids introducing
+a second tree variant alongside `SimplicialAABBTree`. PR-13 may revisit
+this if frame sizes grow.
+
+# Arguments
+
+- `frame_a`, `frame_b` — two Eulerian frames over the same dimension and
+  scalar type. The frames need not share a common root box; their
+  physical extents may overlap, be translated, be nested, or be disjoint.
+- `moment_order` — order of polynomial moments to integrate per overlap.
+  Default `3` matches the rest of the overlap layer.
+- `parallel` — when `true` (the default), the outer leaf loop is
+  parallelized via the configured backend. Single-threaded callers see
+  the same numerical answer. The sequential path is exercised when
+  `parallel = false`, when `backend isa Sequential`, or when there are
+  fewer than 2 leaves to chunk.
+- `backend` — the `AbstractParallelBackend` used when `parallel = true`.
+  Defaults to `default_backend()`. Pass `Sequential()` for a deterministic
+  reference path.
+
+# Returns
+
+A `GeometricOverlap{D, Float64}` with all nonzero pairs and CSR-style
+indexing both ways. Iterate by source frame leaf with `entries_for_lag`,
+or by destination frame leaf with `entries_for_eul` — both are valid
+since this overlap is purely geometric and symmetric in role.
+
+# Periodic boundaries
+
+Periodic ghost-overlap is NOT computed here: neither frame's
+`FrameBoundaries` is consulted. This is a deliberate scope cut for PR-12;
+PR-13 may extend this method (or add a sibling) to translate one frame's
+leaves through the period table when periodic axes are present. Callers
+that need periodic matching today should explicitly include ghost-image
+copies of the source frame's leaves before computing the overlap.
+"""
+function compute_overlap(frame_a::EulerianFrame{D, Float64},
+                          frame_b::EulerianFrame{D, Float64};
+                          moment_order::Integer = 3,
+                          parallel::Bool = true,
+                          backend::AbstractParallelBackend = default_backend(),
+                         ) where {D}
+    mom_order = Int(moment_order)
+    mom_order >= 0 ||
+        throw(ArgumentError("moment_order must be ≥ 0 (got $mom_order)"))
+
+    # Force the lazy parent/level caches on both meshes BEFORE entering
+    # any parallel section. `cell_physical_box` lazily resizes the parent
+    # cache on first call, which races under concurrent access (see the
+    # comment in `_compute_overlap_parallel` for the same precaution).
+    Mesh.ensure_caches!(frame_a.mesh)
+    Mesh.ensure_caches!(frame_b.mesh)
+
+    leaves_a = enumerate_leaves(frame_a.mesh)
+    leaves_b = enumerate_leaves(frame_b.mesh)
+
+    n_a = n_cells(frame_a.mesh)
+    n_b = n_cells(frame_b.mesh)
+
+    # Empty edge cases: bail out with a well-formed empty overlap. This
+    # keeps the parallel section's `tmapreduce` from seeing a zero-chunk
+    # iterator (which OhMyThreads does not handle uniformly).
+    if isempty(leaves_a) || isempty(leaves_b)
+        return finalize_overlap(OverlapBuilder{D, Float64}(mom_order),
+                                  n_a, n_b)
+    end
+
+    # Precompute frame_b leaf boxes once. The leaves are typically small
+    # (patches in PR-13's use case) and reusing the boxes avoids redundant
+    # `cell_physical_box` walks inside the inner loop.
+    boxes_b = Vector{Tuple{NTuple{D, Float64}, NTuple{D, Float64}}}(undef,
+                                                                   length(leaves_b))
+    @inbounds for (k, ib) in enumerate(leaves_b)
+        boxes_b[k] = cell_physical_box(frame_b, ib)
+    end
+
+    use_parallel = parallel && (backend isa OhMyThreadsBackend) &&
+                   length(leaves_a) >= 2 && Threads.nthreads() > 1
+
+    if !use_parallel
+        builder = OverlapBuilder{D, Float64}(mom_order)
+        moments_buf = Vector{Float64}(undef, moments_length(D, mom_order))
+        _frame_pair_chunk!(builder, moments_buf, frame_a, leaves_a,
+                            boxes_b, leaves_b, 1:length(leaves_a), mom_order)
+        return finalize_overlap(builder, n_a, n_b)
+    end
+
+    # Parallel path: chunk `leaves_a` across tasks. Each task allocates
+    # its own builder + scratch, processes its chunk, then the builders
+    # are merged via `merge_builder!`. We dispatch directly to
+    # `OhMyThreads.tmapreduce` here (rather than `parallel_mapreduce`)
+    # because the latter requires an `init` argument, and `merge_builder!`
+    # mutates its first argument in place — passing the SAME init builder
+    # to all tasks would race on the shared `entries` vector. Without
+    # `init`, OhMyThreads seeds the reduction with one of the mapped
+    # values (a fresh per-task builder), exactly what we want. This
+    # mirrors the precaution taken in `_compute_overlap_parallel`. For
+    # `Sequential()` backends we fell through to the non-parallel path
+    # above; the `tmapreduce` branch only executes under
+    # `OhMyThreadsBackend`.
+    omt_backend = backend::OhMyThreadsBackend
+    n_chunks = min(length(leaves_a), max(1, Threads.nthreads()))
+    chunks = OhMyThreads.index_chunks(1:length(leaves_a); n = n_chunks)
+
+    final_builder = OhMyThreads.tmapreduce(
+        merge_builder!,
+        chunks;
+        scheduler = omt_backend.scheduler,
+    ) do chunk_range
+        b = OverlapBuilder{D, Float64}(mom_order)
+        buf = Vector{Float64}(undef, moments_length(D, mom_order))
+        _frame_pair_chunk!(b, buf, frame_a, leaves_a, boxes_b,
+                            leaves_b, chunk_range, mom_order)
+        b
+    end
+
+    return finalize_overlap(final_builder, n_a, n_b)
+end
+
+# Per-task body for the EulerianFrame × EulerianFrame overlap. Walks
+# `leaves_a[chunk]` and pairs each leaf against every `leaves_b` whose
+# physical AABB intersects with positive measure, pushing one entry per
+# nonzero overlap into `builder`. The `moments_buf` is reused across
+# every push (and copied inside `push_overlap!`).
+function _frame_pair_chunk!(builder::OverlapBuilder{D, Float64},
+                              moments_buf::Vector{Float64},
+                              frame_a::EulerianFrame{D, Float64},
+                              leaves_a::Vector{Int},
+                              boxes_b::Vector{Tuple{NTuple{D, Float64},
+                                                    NTuple{D, Float64}}},
+                              leaves_b::Vector{Int},
+                              chunk_range,
+                              mom_order::Int) where {D}
+    multi = moment_multiindices(Int(D), mom_order)
+    n_mom = length(moments_buf)
+    # Per-axis 1D moment table: `axis_mom[d, k+1] = (hi^{k+1} - lo^{k+1}) / (k+1)`.
+    # Allocated once per chunk; refilled per overlap box.
+    axis_mom = Matrix{Float64}(undef, D, mom_order + 1)
+
+    @inbounds for ka in chunk_range
+        ia = leaves_a[ka]
+        lo_a, hi_a = cell_physical_box(frame_a, ia)
+        for kb in 1:length(boxes_b)
+            lo_b, hi_b = boxes_b[kb]
+            aabbs_overlap(lo_a, hi_a, lo_b, hi_b) || continue
+
+            # Per-axis intersection.
+            empty = false
+            lo = ntuple(d -> max(lo_a[d], lo_b[d]), Val(D))
+            hi = ntuple(d -> min(hi_a[d], hi_b[d]), Val(D))
+            for d in 1:D
+                if hi[d] <= lo[d]
+                    empty = true; break
+                end
+            end
+            empty && continue
+
+            volume = 1.0
+            for d in 1:D
+                volume *= hi[d] - lo[d]
+            end
+            volume > 0.0 || continue
+
+            # Fill per-axis moments. `axis_mom[d, k+1]` is `∫_lo^hi x^k dx`.
+            for d in 1:D
+                lo_d = lo[d]; hi_d = hi[d]
+                # Power-up incrementally: hi_pow tracks hi_d^{k+1}.
+                lo_pow = lo_d
+                hi_pow = hi_d
+                for k in 0:mom_order
+                    axis_mom[d, k + 1] = (hi_pow - lo_pow) / Float64(k + 1)
+                    lo_pow *= lo_d
+                    hi_pow *= hi_d
+                end
+            end
+
+            # Assemble the D-D moment vector via per-axis product.
+            for k in 1:n_mom
+                m = multi[k]
+                acc = 1.0
+                for d in 1:D
+                    acc *= axis_mom[d, m[d] + 1]
+                end
+                moments_buf[k] = acc
+            end
+
+            centroid = ntuple(d -> 0.5 * (lo[d] + hi[d]), Val(D))
+            push_overlap!(builder, leaves_a[ka], leaves_b[kb], volume,
+                           centroid, moments_buf)
+        end
+    end
+    return builder
+end
+
 """
     install_r3d_overlap!(paired::PairedMesh, frame::EulerianFrame;
                           moment_order = 3, edge_kind = :linear, leaf_size = 8)
