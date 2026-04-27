@@ -28,13 +28,17 @@ module Initialization
 import LinearAlgebra
 using LinearAlgebra: cholesky, Symmetric, factorize
 
+using OhMyThreads.TaskLocalValues: TaskLocalValue
 using ..Bases: AbstractBasis, n_coeffs, evaluate
 using ..Quadrature: QuadRule, n_quad_points,
     gauss_quadrature_interval, gauss_quadrature_quad, gauss_quadrature_cube,
     gauss_quadrature_triangle, gauss_quadrature_tetrahedron
 using ..Storage: PolynomialFieldSet, basis_of, n_elements, n_coeffs_per_element
 using ..Mesh: SimplicialMesh, n_simplices, simplex_vertex_positions
+import ..Mesh
 using ..Overlap: EulerianFrame, cell_physical_box
+using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
+                   default_backend, parallel_foreach
 
 export init_field_from!
 
@@ -182,25 +186,38 @@ project a tuple-valued function and split afterwards.
 """
 function init_field_from!(field::PolynomialFieldSet,
                            frame::EulerianFrame{D, T}, f;
-                           quadrature_order::Int = 2 * _basis_degree(basis_of(field)) + 1) where {D, T}
+                           quadrature_order::Int = 2 * _basis_degree(basis_of(field)) + 1,
+                           backend::AbstractParallelBackend = default_backend()) where {D, T}
     basis = basis_of(field)
     _check_dim(basis, D)
     quad = _aabb_quadrature(Val(D), quadrature_order, T)
     M = _basis_mass_matrix(basis, quad)
     nc = n_coeffs(basis)
-    b = Vector{T}(undef, nc)
 
     n = n_elements(field)
-    for i in 1:n
+    # Pre-build the lazy per-cell caches on the calling thread before
+    # fanning out — the cache machinery is not thread-safe under
+    # concurrent first-access, so we touch it serially first.
+    Mesh.ensure_caches!(frame.mesh)
+    # Per-task scratch: each task gets its own RHS vector + mass-matrix
+    # working copy so the per-cell allocations happen once per task on
+    # first touch, not once per cell.
+    b_tls = TaskLocalValue{Vector{T}}(() -> Vector{T}(undef, nc))
+    Mwork_tls = TaskLocalValue{Matrix{T}}(() -> Matrix{T}(undef, nc, nc))
+    parallel_foreach(backend, function (i)
         lo, hi = cell_physical_box(frame, i)
         # Capture lo/hi as locals so the closure is non-allocating.
         affine = let lo = lo, hi = hi
             ξ -> ntuple(d -> lo[d] + (hi[d] - lo[d]) * T(ξ[d]), Val(D))
         end
+        b = b_tls[]
+        Mwork = Mwork_tls[]
         _assemble_rhs!(b, f, affine, basis, quad)
-        c = _solve_mass_system(copy(M), copy(b))
+        copyto!(Mwork, M)
+        c = _solve_mass_system(Mwork, b)
         _assign_cell!(field, i, c)
-    end
+        return
+    end, 1:n)
     return field
 end
 
@@ -225,20 +242,23 @@ practical degrees.
 """
 function init_field_from!(field::PolynomialFieldSet,
                            mesh::SimplicialMesh{D, T}, f;
-                           quadrature_order::Int = 2 * _basis_degree(basis_of(field)) + 1) where {D, T}
+                           quadrature_order::Int = 2 * _basis_degree(basis_of(field)) + 1,
+                           backend::AbstractParallelBackend = default_backend()) where {D, T}
     basis = basis_of(field)
     _check_dim(basis, D)
     order = _clamp_simplex_order(D, quadrature_order)
     quad = _simplex_quadrature(Val(D), order, T)
     M = _basis_mass_matrix(basis, quad)
     nc = n_coeffs(basis)
-    b = Vector{T}(undef, nc)
 
     ns = n_simplices(mesh)
     n_elements(field) == ns ||
         throw(DimensionMismatch("field has $(n_elements(field)) elements; mesh has $ns simplices"))
 
-    for s in 1:ns
+    # Per-task scratch: same pattern as the axis-aligned overload.
+    b_tls = TaskLocalValue{Vector{T}}(() -> Vector{T}(undef, nc))
+    Mwork_tls = TaskLocalValue{Matrix{T}}(() -> Matrix{T}(undef, nc, nc))
+    parallel_foreach(backend, function (s)
         verts = simplex_vertex_positions(mesh, s)
         anchor = ntuple(d -> T(verts[1][d]), Val(D))
         edges = ntuple(k -> ntuple(d -> T(verts[k+1][d]) - anchor[d], Val(D)), Val(D))
@@ -247,10 +267,14 @@ function init_field_from!(field::PolynomialFieldSet,
                               sum(edges[k][d] * T(ξ[k]) for k in 1:D),
                         Val(D))
         end
+        b = b_tls[]
+        Mwork = Mwork_tls[]
         _assemble_rhs!(b, f, affine, basis, quad)
-        c = _solve_mass_system(copy(M), copy(b))
+        copyto!(Mwork, M)
+        c = _solve_mass_system(Mwork, b)
         _assign_cell!(field, s, c)
-    end
+        return
+    end, 1:ns)
     return field
 end
 
