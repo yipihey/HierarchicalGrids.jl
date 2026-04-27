@@ -12,18 +12,30 @@ Each child cell inherits the parent's polynomial coefficients verbatim.
 The (now non-leaf) parent slot also retains its coefficients, since
 `event.index_remap[parent_old_idx]` points at the parent's NEW slot.
 
-# Coarsening (volume-weighted average)
+# Coarsening
 
 For degree-0 fields (basis with `n_coeffs == 1`), the parent receives
 the volume-weighted average of children's coefficients. Because children
 of any (an)isotropic split have equal volume by construction, this
 reduces to the arithmetic mean — exact and conservative.
 
-For degree ≥ 1 fields, only the constant moment is averaged; higher-
-order coefficients are zeroed and a single warning is emitted via
-`@warn_once`. Full L²-projection coarsening (with cross mass matrices
-between fine and coarse reference frames) is deferred to a follow-up
-PR — see TODO marker below.
+For degree ≥ 1 `MonomialBasis` fields, the parent receives the **exact
+L²-projection** of the children's piecewise-polynomial reconstruction
+onto the parent's polynomial space. Mathematically, with parent cell P,
+children {C_k}, basis functions φ_α on the parent reference cell:
+
+    ⟨p_P, φ_α⟩_P = Σ_k ⟨p_{C_k}, φ_α⟩_{C_k}    for all |α| ≤ P
+
+Solved as a per-event mass-matrix system `M_P · c_P = Σ_k M_{P,C_k} · c_{C_k}`
+where the cross mass matrices `M_{P,C_k}` are integrated analytically
+over each child's sub-box in the parent's reference frame. The result
+preserves all moments up to the basis degree — total mass, centroid×mass,
+second moments, etc. — exactly (modulo floating-point round-off).
+
+For non-`MonomialBasis` polynomial bases (`BernsteinBasis`, future
+`LagrangeBasis{D, P}` in D > 1), AdaptiveField falls back to
+constant-moment-only coarsening with a single warning. Convert via
+`change_basis` for full higher-order projection.
 
 # Field replacement
 
@@ -173,50 +185,260 @@ end
 # All columns are weighted equally (the exact volume-weighted average for any
 # isotropic or anisotropic split, since a single split level produces children
 # of equal volume).
+#
+# `parent_cell` is the (post-coarsen) parent's `CellMeta`; its `split_mask`
+# tells us how the children were laid out in [0, 1]^D. This is needed for
+# the higher-order L²-projection branch and ignored on the degree-0 fast path.
 function _write_coeffs_average!(
     pfs::PolynomialFieldSet{L, B, Names, ST, S},
-    snap, new_i::Int, src_cols, basis_degree_warned::Ref{Bool}) where {L, B, Names, ST, S}
+    snap, new_i::Int, src_cols, parent_cell,
+    basis_degree_warned::Ref{Bool}) where {L, B, Names, ST, S}
     nc = n_coeffs(pfs.basis)
     n_src = length(src_cols)
     n_src > 0 || return nothing
 
+    if nc == 1
+        # Degree-0 fast path: exact volume-weighted average. Bit-identical
+        # to the legacy implementation; the higher-order machinery is not
+        # set up to keep this path branch-free and allocation-free.
+        @inbounds for name in Names
+            M = getfield(snap, name)
+            T = eltype(M)
+            s = zero(T)
+            for c in src_cols
+                s += M[1, c]
+            end
+            avg = s / T(n_src)
+            _set_poly_coeff!(pfs, Val(name), new_i, 1, avg)
+        end
+        return nothing
+    end
+
+    # Degree ≥ 1: try the L²-projection path (exact recovery of all
+    # moments up to degree P). Falls back to the legacy constant-moment
+    # path with a warning if the basis is unsupported.
+    if pfs.basis isa MonomialBasis
+        _write_coeffs_l2_projection!(pfs, snap, new_i, src_cols, parent_cell)
+        return nothing
+    end
+
+    # Fallback: constant-moment only, with a once-per-AdaptiveField warning.
+    # Reached by `BernsteinBasis` and any future non-monomial bases at
+    # degree ≥ 1. Convert via `change_basis` to take the exact path.
+    if !basis_degree_warned[]
+        @warn "AdaptiveField: coarsening a degree>=1 field with " *
+              "$(typeof(pfs.basis).name.name) uses the constant-moment-only " *
+              "fallback (higher coefficients zeroed). Convert to MonomialBasis " *
+              "via `change_basis` for the exact L²-projection path."
+        basis_degree_warned[] = true
+    end
     @inbounds for name in Names
         M = getfield(snap, name)
         T = eltype(M)
-        if nc == 1
-            # Degree-0: exact volume-weighted average (children have equal
-            # volume from a single split level).
-            s = zero(T)
-            for c in src_cols
-                s += M[1, c]
-            end
-            avg = s / T(n_src)
-            _set_poly_coeff!(pfs, Val(name), new_i, 1, avg)
-        else
-            # Degree >= 1: only the constant moment is averaged; higher
-            # coefficients are zeroed. Issue one warning per AdaptiveField
-            # lifetime (across all fields), since the user only needs to be
-            # told once that they're using a deferred path.
-            if !basis_degree_warned[]
-                @warn "AdaptiveField: coarsening a degree>=1 field uses " *
-                      "constant-moment-only fallback (higher coefficients " *
-                      "zeroed). Full L^2-projection coarsening with cross " *
-                      "mass matrices is deferred to a follow-up PR."
-                basis_degree_warned[] = true
-            end
-            s = zero(T)
-            for c in src_cols
-                s += M[1, c]
-            end
-            avg = s / T(n_src)
-            _set_poly_coeff!(pfs, Val(name), new_i, 1, avg)
-            for k in 2:nc
-                _set_poly_coeff!(pfs, Val(name), new_i, k, zero(T))
-            end
+        s = zero(T)
+        for c in src_cols
+            s += M[1, c]
+        end
+        avg = s / T(n_src)
+        _set_poly_coeff!(pfs, Val(name), new_i, 1, avg)
+        for k in 2:nc
+            _set_poly_coeff!(pfs, Val(name), new_i, k, zero(T))
         end
     end
     return nothing
 end
+
+# ----------------------------------------------------------------------------
+# L²-projection coarsening (degree ≥ 1, MonomialBasis)
+# ----------------------------------------------------------------------------
+
+# Compute the per-axis sub-box [a_d, b_d] ⊂ [0, 1] for child `child_sib`
+# of a cell with `split_mask`. Mirrors `cell_unit_box` for one refinement
+# step but parameterized by the (sibling_index, split_mask) pair directly,
+# so we can recover the OLD children's geometry from the post-coarsen
+# parent metadata alone.
+function _child_unit_subbox(child_sib::Integer,
+                             split_mask::Unsigned, ::Val{D}) where {D}
+    # Walk axes serially, accumulating the (lo, hi) tuple. We can't use
+    # `ntuple` cleanly here because the lookup into `child_sib`/`split_mask`
+    # is stateful (we advance `bit_pos` only on split axes), so we build
+    # arrays first and convert to tuples at the end.
+    a = Vector{Float64}(undef, D)
+    b = Vector{Float64}(undef, D)
+    bit_pos = 0
+    @inbounds for axis in 1:D
+        axis_bit = oneunit(split_mask) << (axis - 1)
+        if (split_mask & axis_bit) != 0
+            lower_half = ((child_sib >> bit_pos) & 1) == 0
+            if lower_half
+                a[axis] = 0.0
+                b[axis] = 0.5
+            else
+                a[axis] = 0.5
+                b[axis] = 1.0
+            end
+            bit_pos += 1
+        else
+            a[axis] = 0.0
+            b[axis] = 1.0
+        end
+    end
+    return (NTuple{D, Float64}(a), NTuple{D, Float64}(b))
+end
+
+# Per-axis cross integration coefficient
+#
+#     A[i+1, k+1] = Σ_{j=0..i} C(i, j) · a^{i-j} · s^{j+1} / (j + k + 1)
+#
+# where `[a, a+s] ⊂ [0, 1]` is the child's sub-box on this axis. This is the
+# 1-D cross integral
+#
+#     A[i+1, k+1] = ∫_{a}^{a+s} ξ^i · ((ξ - a) / s)^k dξ
+#
+# By the per-axis tensor-product structure, the multi-D cross mass matrix
+# satisfies M_cross[α, β] = ∏_d A_d[α_d + 1, β_d + 1].
+function _per_axis_cross_coefs(a::T, s::T, P::Int) where T
+    A = Matrix{T}(undef, P + 1, P + 1)
+    @inbounds for i in 0:P, k in 0:P
+        acc = zero(T)
+        spow = s
+        api = a^i  # a^{i-j} starts at a^i (j=0); divide by a after — but a may be 0.
+        # Compute Σ_{j=0..i} C(i,j) a^{i-j} s^{j+1} / (j+k+1) directly with stable
+        # incremental updates would over-engineer this; the inner loop is tiny
+        # (i ≤ P, P typically ≤ 3), so use the straightforward form.
+        for j in 0:i
+            cij = T(binomial(i, j))
+            apow = a^(i - j)
+            sjp1 = s^(j + 1)
+            acc += cij * apow * sjp1 / T(j + k + 1)
+        end
+        A[i + 1, k + 1] = acc
+    end
+    return A
+end
+
+# Build the cross mass matrix M_cross[α, β] for one child sub-box, in
+# graded-lex order matching `MonomialBasis{D, P}` coefficient layout.
+function _cross_mass_matrix(a::NTuple{D, T}, b::NTuple{D, T},
+                              P::Int) where {D, T}
+    s = ntuple(d -> b[d] - a[d], Val(D))
+    # Per-axis cross coefficients.
+    A_axes = ntuple(d -> _per_axis_cross_coefs(a[d], s[d], P), Val(D))
+    multi = moment_multiindices(D, P)
+    n = length(multi)
+    M = Matrix{T}(undef, n, n)
+    @inbounds for αi in 1:n
+        α = multi[αi]
+        for βi in 1:n
+            β = multi[βi]
+            v = one(T)
+            for d in 1:D
+                v *= A_axes[d][α[d] + 1, β[d] + 1]
+            end
+            M[αi, βi] = v
+        end
+    end
+    return M
+end
+
+# Parent reference mass matrix on the unit cube [0, 1]^D, in graded-lex order.
+function _parent_reference_mass(::Type{T}, ::Val{D}, P::Int) where {T, D}
+    multi = moment_multiindices(D, P)
+    n = length(multi)
+    M = Matrix{T}(undef, n, n)
+    @inbounds for i in 1:n, j in i:n
+        v = one(T)
+        for d in 1:D
+            v *= one(T) / T(multi[i][d] + multi[j][d] + 1)
+        end
+        M[i, j] = v
+        M[j, i] = v
+    end
+    return M
+end
+
+# L²-projection coarsening for one cell. Performs the per-event mass-matrix
+# solve and writes the result into element `new_i` of `pfs`. Falls back to
+# constant-moment averaging if the mass-matrix solve fails (e.g. singular,
+# extremely ill-conditioned). For typical degrees P ≤ 3 the parent mass
+# matrix on the unit cube has condition number O(10^{2P}), which is fine.
+function _write_coeffs_l2_projection!(
+    pfs::PolynomialFieldSet{L, B, Names, ST, S},
+    snap, new_i::Int, src_cols, parent_cell) where {L, B, Names, ST, S}
+    basis = pfs.basis::MonomialBasis
+    D, P = _basis_dim_degree(basis)
+    nc = n_coeffs(basis)
+    @assert nc == moments_length(D, P) "MonomialBasis n_coeffs mismatch"
+    n_children = length(src_cols)
+    parent_mask = parent_cell.split_mask
+
+    # Determine T from the storage. Each named field may technically have
+    # its own scalar type; we pick the field's type as we iterate.
+    @inbounds for (field_idx, name) in enumerate(Names)
+        Mfield = getfield(snap, name)
+        T = eltype(Mfield)
+
+        # Per-cell parent reference mass and accumulated RHS.
+        # Both depend only on D, P, T — could be cached across fields, but
+        # the cost is dominated by the mass-matrix build (one D×D-tuple of
+        # (P+1)×(P+1) tables per child) which already dominates per-axis
+        # cubic loops; reusing across fields would save little.
+        Mp = _parent_reference_mass(T, Val(D), P)
+        rhs = zeros(T, nc)
+        # Working buffer for per-child cross mass matrix.
+        Mcross_scratch = nothing
+
+        # Iterate children in DFS order; their sibling indices are 0..n-1
+        # (refine_cells! always emits children in that order with the same
+        # split_mask as the parent). Build each cross mass matrix once and
+        # apply to that child's coefficients.
+        ci_offset = 0
+        for c in src_cols
+            child_sib = ci_offset
+            a, b = _child_unit_subbox(child_sib, parent_mask, Val(D))
+            a_T = ntuple(d -> T(a[d]), Val(D))
+            b_T = ntuple(d -> T(b[d]), Val(D))
+            Mcross = _cross_mass_matrix(a_T, b_T, P)
+            # rhs += Mcross * c_child
+            for αi in 1:nc
+                acc = zero(T)
+                for βi in 1:nc
+                    acc += Mcross[αi, βi] * Mfield[βi, c]
+                end
+                rhs[αi] += acc
+            end
+            ci_offset += 1
+        end
+
+        # Solve M_P · c_P = rhs. The parent reference mass matrix is the
+        # *unit cube* mass matrix; both M_P and rhs are integrated over
+        # the parent reference cell, so the volume factors cancel.
+        # On singular failure (shouldn't happen for moderate P), fall back
+        # to constant-moment-only as a safety net.
+        coeffs = try
+            Mp \ rhs
+        catch err
+            # Graceful degradation: constant moment only.
+            s_const = zero(T)
+            for col in src_cols
+                s_const += Mfield[1, col]
+            end
+            avg = s_const / T(n_children)
+            @warn "AdaptiveField: mass-matrix solve failed during coarsening " *
+                  "(field $name); falling back to constant-moment average." err
+            fb = zeros(T, nc)
+            fb[1] = avg
+            fb
+        end
+        for k in 1:nc
+            _set_poly_coeff!(pfs, Val(name), new_i, k, coeffs[k])
+        end
+    end
+    return nothing
+end
+
+# Tiny helper: pull (D, P) out of a MonomialBasis type.
+@inline _basis_dim_degree(::MonomialBasis{D, P}) where {D, P} = (D, P)
 
 # ----------------------------------------------------------------------------
 # Event handler
@@ -309,7 +531,8 @@ function _handle_event!(af::AdaptiveField, event::RefinementEvent)
             n_children = children_count(parent_cell)
             # OLD children are immediately after the OLD parent in DFS.
             src_cols = (parent_old + 1):(parent_old + n_children)
-            _write_coeffs_average!(pfs_new, snap, pn, src_cols, warned)
+            _write_coeffs_average!(pfs_new, snap, pn, src_cols,
+                                   parent_cell, warned)
             # The parent slot itself was written in Phase 1 from the OLD
             # parent's (non-leaf) coefficients; overwrite that with the
             # averaged children's coefficients.

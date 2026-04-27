@@ -62,6 +62,63 @@ listener that registers or unregisters another listener does not see
 the in-flight event. Listener exceptions are caught and rethrown after
 cache invalidation, leaving the mesh in a consistent state.
 
+## AdaptiveField — auto-tracking polynomial fields
+
+`AdaptiveField` is a thin wrapper that registers a refinement listener on
+construction and resizes/permutes the wrapped `PolynomialFieldSet` as the
+mesh evolves. The user keeps writing/reading per-cell polynomial
+coefficients with the usual storage syntax; index alignment with the
+mesh is maintained automatically.
+
+```julia
+basis = MonomialBasis{2, 2}()
+field = allocate_polynomial_fields(SoA(), basis, n_cells(mesh); rho=Float64)
+af = AdaptiveField(field, mesh)
+# ... user code: write rho coefficients, refine_cells!, coarsen_cells!, ...
+dispose!(af)   # unregister the listener (also runs in the finalizer)
+```
+
+### Refinement: constant prolongation
+
+When a parent splits, every child inherits the parent's coefficient
+vector verbatim. The (now non-leaf) parent slot also retains its
+coefficients. This is exact for degree-0 fields and a reasonable
+fallback for higher degrees (no information added or lost — the children's
+piecewise reconstruction equals the parent's polynomial only in the
+degree-0 case; higher-degree applications usually re-initialize via
+their physics step or a re-projection helper after refinement).
+
+### Coarsening: L²-projection (degree ≥ 1, MonomialBasis)
+
+When children are coarsened back into a parent, the parent's coefficients
+are computed by **L²-projection** of the children's piecewise polynomial
+onto the parent's polynomial space:
+
+```
+⟨p_parent, φ_α⟩_P = Σ_k ⟨p_{C_k}, φ_α⟩_{C_k}     for all |α| ≤ P
+```
+
+solved as a per-event mass-matrix system
+
+```
+M_P · c_parent = Σ_k M_{P, C_k} · c_{C_k}
+```
+
+where `M_P` is the parent's reference mass matrix on `[0, 1]^D` and
+`M_{P, C_k}` is the cross mass matrix integrated analytically over child
+`k`'s sub-box in the parent's reference frame. All moments up to the
+basis degree are preserved exactly (modulo round-off): total mass,
+centroid×mass, second moments, and so on.
+
+For degree-0 fields the projection collapses to the volume-weighted
+average — bit-exact equal to the legacy implementation.
+
+For non-`MonomialBasis` polynomial bases (currently `BernsteinBasis` at
+degree ≥ 1, plus any future bases without a direct monomial-coefficient
+path), the wrapper falls back to constant-moment-only coarsening with a
+single warning. Convert via `change_basis` to the monomial basis to get
+the exact L²-projection.
+
 ## Where this fits
 
 Hand-written refinement-aware fields, the [`step_with_amr!`](amr_driver.md)
@@ -73,6 +130,7 @@ the first structural change after the graph is built.
 ## See also
 
 - `refine_cells!`, `coarsen_cells!` — what fires the event.
+- `AdaptiveField`, `dispose!` — the auto-tracking polynomial-field wrapper.
 - [`step_with_amr!`](amr_driver.md) — a topology-only driver that
   composes with this listener pattern.
 - [`face_neighbors`](neighbors_and_halos.md) — derived data that is

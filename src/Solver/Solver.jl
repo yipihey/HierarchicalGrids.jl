@@ -46,7 +46,8 @@ using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView,
                  eval_point_samples, point_multi_to_flat
 using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_box,
                   enumerate_leaves, compute_overlap, aabbs_overlap,
-                  GeometricOverlap, OverlapEntry
+                  GeometricOverlap, OverlapEntry,
+                  moments_length, moment_multiindices
 using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
                     default_backend, parallel_foreach
 
