@@ -174,6 +174,10 @@ using HierarchicalGrids
         include("test_polynomial_remap_streaming.jl")
     end
 
+    @testset "Phase 2 (Solver): CellView and HaloView" begin
+        include("test_views.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end
