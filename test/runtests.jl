@@ -225,4 +225,8 @@ using HierarchicalGrids
     @testset "Examples (smoke): cfd_block_diffusion" begin
         include("test_example_cfd_block_diffusion.jl")
     end
+
+    @testset "Worked example: CFDPatchAMR (PR-16)" begin
+        include("test_examples_cfd_patch_amr.jl")
+    end
 end
