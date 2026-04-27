@@ -134,27 +134,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The two D = 2 upstream bugs HG had documented as known limitations
   (`_moments_exact_d2!` `0//0` throw on degenerate clips, and
   `clip!` producing negative-volume polytopes on refined-Eulerian
-  geometry) are substantially fixed. On the canonical two-triangle
-  tile / 1-refined Eulerian geometry the data-loss drop count went
-  from 7 to 2; the residual 2 cases are zero-area diagonal-corner
-  boundary intersections that HG's adapter handles silently via the
-  existing `vol ≤ 0` guard.
+  geometry) are fully fixed. The 7 historical data-loss drops on
+  the canonical two-triangle tile / 1-refined Eulerian geometry are
+  gone.
+- **IntExact-adapter drop classification** corrected to distinguish
+  `vol == 0` (legitimate zero-area boundary intersection) from
+  `vol < 0` (orientation-flipped clip). Two diagonal-corner pairs
+  on the canonical two-triangle / 1-refined geometry — where the
+  Lagrangian triangle's hypotenuse meets an Eulerian quadrant
+  boundary at a single point — now classify as `:empty`, not
+  `:negative_volume`.
 - **`audit_overlap` and drop-audit tests updated** to act as
-  regression detectors for the post-fix drop count. Previous tests
-  asserted that drops were *present* (proving the upstream bug);
-  they now assert the bound `n_negative_volume ≤ 2` and pin which
-  pairs the residual touches.
+  regression detectors. They now assert the post-fix
+  `n_negative_volume == 0` and `n_moments_throw == 0` on the
+  canonical multi-tile / refined-Eulerian geometry; residual
+  per-pair float-vs-exact differences on this geometry are
+  sub-lattice-resolution (~1.5e-5 at `bits = 16`).
 
 ### Known limitations
 
-- `compute_overlap(..., backend = :exact)` may still register
-  silent-drop entries on geometries where Lagrangian-triangle
-  hypotenuses align exactly with Eulerian leaf boundaries (zero-area
-  degenerate intersections). The drops have no measurable mass-loss
-  effect because the corresponding float-path entries are also empty,
-  but the audit harness will report them. Cross-validate via
-  `audit_overlap(lag, frame; per_pair=true)` or
-  `compute_overlap(...; audit_drops=true)` on unfamiliar geometry.
 - `D = 2` `bits ≥ 24` overflow in r3djl's shared-denominator
   storage remains; stay at `bits = 16` (the default) unless you've
   audited the geometry.

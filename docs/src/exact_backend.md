@@ -405,26 +405,24 @@ a drop-in for downstream consumers.
 ## Known limitations of the upstream IntExact path
 
 The `D = 2` path in `R3D.IntExact` had two upstream bugs that HG
-encountered as the first consumer; both are substantially fixed
-upstream as of r3djl commit `154b346` (2026-04-27):
+encountered as the first consumer; both are fully fixed upstream
+as of r3djl commit `154b346` (2026-04-27):
 
 1. **`R3D.IntExact._moments_exact_d2!` `0//0` throw on degenerate
-   clips** — fully fixed upstream. The function no longer constructs
-   invalid rationals on shared-edge tile decompositions.
+   clips** — fully fixed upstream.
 
 2. **`D = 2` `clip!` returning negative-volume polytopes on
-   refined-Eulerian configurations** — substantially fixed upstream.
-   On the canonical "two-triangle tile / 1-refined Eulerian" geometry
-   that exposed the bug most aggressively, the data-loss drop count
-   went from 7 (out of 6 entries) to 2. The residual cases are
-   diagonal-corner pairs where the Lagrangian triangle's hypotenuse
-   exactly meets an Eulerian quadrant boundary — zero-area boundary
-   intersections that the float path silently treats as empty but
-   the integer path produces with flipped orientation. HG's adapter
-   guards `vol ≤ 0` and drops those entries; the `audit_drops` kwarg
-   on `compute_overlap` surfaces them when needed. Mass loss on this
-   geometry is now negligible; cross-validate via `audit_overlap` on
-   any unfamiliar geometry before relying on the result.
+   refined-Eulerian configurations** — fully fixed upstream. On the
+   canonical "two-triangle tile / 1-refined Eulerian" geometry that
+   exposed the bug most aggressively, all 7 historical data-loss
+   drops are gone. Two of the original 7 (lag, eul) pairs now
+   produce a clipped polygon with `vol == 0`: legitimate zero-area
+   boundary intersections (the Lagrangian-triangle hypotenuse meets
+   the Eulerian quadrant boundary at a single point). HG's adapter
+   classifies these as `:empty`, not `:negative_volume`, so they
+   are not data loss. Residual disagreements with the float backend
+   on this geometry are sub-lattice-resolution (~1.5e-5 at
+   `bits = 16`).
 
 3. **`D = 2` storage overflow at high bit counts**: at lattice
    scales corresponding to `bits ≥ 24`, the polygon clip's

@@ -52,24 +52,19 @@ end
 # Test 2 — known-bad geometry triggers drops
 # ---------------------------------------------------------------------------
 
-@testset "drop audit: two-triangle tile / 1-refined Eulerian (substantially fixed upstream)" begin
+@testset "drop audit: two-triangle tile / 1-refined Eulerian (fully fixed upstream)" begin
     # The two-triangle tiling of [0, 1]^2 (sharing the diagonal) plus a
     # 1-level-refined Eulerian (4 child leaves) used to trigger
     # `R3D.IntExact`'s D = 2 upstream bugs aggressively (5 negative-
     # volume drops + 2 `_moments_exact_d2!` `0//0` throws = 7 data-loss
     # drops out of 6 (lag, eul) pairs).
     #
-    # Upstream r3djl commit 154b346 (2026-04-27) substantially fixed
-    # both bugs: the `0//0` throw is gone, and the negative-volume
-    # cases dropped from 5 to 2. The residual 2 cases occur on
-    # diagonal-corner pairs where the Lagrangian triangle's hypotenuse
-    # aligns with an Eulerian quadrant boundary — a more subtle
-    # degeneracy worth a separate upstream reproducer.
-    #
-    # This test pins the post-fix drop count and acts as a regression
-    # detector: a future r3djl bump that fully fixes the residual
-    # would let us tighten the assertions; a regression that brings
-    # back drops would catch immediately.
+    # Upstream r3djl commit 154b346 (2026-04-27) fully fixed both
+    # bugs. The two diagonal-corner pairs that produce a clipped
+    # polygon with `vol == 0` are now correctly classified by the
+    # adapter as `:empty` (legitimate zero-area boundary intersection
+    # — the Lagrangian-triangle hypotenuse meets the Eulerian
+    # quadrant boundary at a single point), NOT `:negative_volume`.
     positions = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
     sv = Int32[1 1; 2 3; 3 4]
     sn = zeros(Int32, 3, 2)
@@ -83,20 +78,20 @@ end
                                 moment_order = 1,
                                 audit_drops = true)
     @test report isa OverlapDropReport
-    # No more `_moments_exact_d2!` throws (bug fully fixed upstream).
+    # No data-loss drops: upstream is fixed and the adapter
+    # correctly distinguishes zero-area boundary intersections
+    # (`:empty`) from orientation-flipped clips (`:negative_volume`).
     @test report.n_moments_throw == 0
-    # Negative-volume drops reduced from 5 to a small residual on
-    # diagonal-corner pairs. Bound it below the prior baseline.
-    @test report.n_negative_volume <= 2
+    @test report.n_negative_volume == 0
 
-    # Each remaining negative-volume drop is on a diagonal-corner pair.
+    # Float and exact backends agree on entry count.
+    o_f = compute_overlap(lag, frame; backend = :float, moment_order = 1)
+    @test n_entries(o_f) == n_entries(o)
+    @test isapprox(total_overlap_volume(o), total_overlap_volume(o_f); atol = 1e-4)
+
+    # Recorded drops (if any) only carry the `:empty` kind.
     for d in report.drops
-        if d.kind === :negative_volume
-            @test (d.lag_idx, d.eul_idx) in (
-                (Int32(1), Int32(4)),
-                (Int32(2), Int32(3)),
-            )
-        end
+        @test d.kind === :empty
     end
 end
 

@@ -440,19 +440,21 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
 
     R3D.IntExact.moments_exact!(out_moments, poly, moment_order)
     vol = out_moments[1]
-    if vol <= zero(Rational{R})
-        # Numerically degenerate (zero-area sliver) OR upstream IntExact
-        # produced a NEGATIVE-volume polytope (a known D = 2 bug —
-        # orientation flip after clip!). The adapter zeros out_moments
-        # and treats the pair as empty externally; we surface the
-        # distinction via `drop_kind = :negative_volume` for the audit
-        # path. `vol == 0` with a non-empty poly is also classed as
-        # `:negative_volume` since it indicates upstream returned a
-        # numerically-zero result for a polygon that geometrically
-        # had positive area (the `poly.nverts == 0` empty case is
-        # handled above).
+    if vol < zero(Rational{R})
+        # Upstream IntExact produced a NEGATIVE-volume polytope (a
+        # known D = 2 bug — orientation flip after clip!). The
+        # adapter zeros out_moments and surfaces the distinction via
+        # `drop_kind = :negative_volume` for the audit path.
         fill!(out_moments, zero(Rational{R}))
         return _empty_result(out_moments, Val(2), R, :negative_volume)
+    elseif iszero(vol)
+        # Legitimate zero-area boundary intersection (e.g.,
+        # diagonal-corner contact where a Lagrangian-triangle
+        # hypotenuse meets an Eulerian leaf boundary). Upstream
+        # correctly returns 0; classify as `:empty` since there is
+        # no data loss.
+        fill!(out_moments, zero(Rational{R}))
+        return _empty_result(out_moments, Val(2), R, :empty)
     end
 
     centroid = if moment_order >= 1
@@ -520,9 +522,12 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
 
     R3D.IntExact.moments_exact!(out_moments, poly, moment_order)
     vol = out_moments[1]
-    if vol <= zero(Rational{R})
+    if vol < zero(Rational{R})
         fill!(out_moments, zero(Rational{R}))
         return _empty_result(out_moments, Val(3), R, :negative_volume)
+    elseif iszero(vol)
+        fill!(out_moments, zero(Rational{R}))
+        return _empty_result(out_moments, Val(3), R, :empty)
     end
 
     centroid = if moment_order >= 1
@@ -623,9 +628,12 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
 
     R3D.IntExact.moments_exact!(out_moments, poly, moment_order)
     vol = out_moments[1]
-    if vol <= zero(Rational{R})
+    if vol < zero(Rational{R})
         fill!(out_moments, zero(Rational{R}))
         return _empty_result(out_moments, Val(4), R, :negative_volume)
+    elseif iszero(vol)
+        fill!(out_moments, zero(Rational{R}))
+        return _empty_result(out_moments, Val(4), R, :empty)
     end
 
     centroid = if moment_order >= 1
