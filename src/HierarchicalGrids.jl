@@ -170,6 +170,7 @@ export ExponentialMovingAverage, update!, value, reset!
 export PerCellStats
 export RemapDiagnostics
 export OverlapAuditReport, audit_overlap
+export OverlapDropReport
 
 # Layer 4: geometric-overlap and remap operators
 include("Overlap/Overlap.jl")
@@ -180,6 +181,7 @@ export FrameBoundaries, bc
 export OverlapEntry, GeometricOverlap, OverlapBuilder
 export n_entries, entries_for_lag, entries_for_eul, total_overlap_volume
 export push_overlap!, merge_builder!, finalize_overlap
+export describe
 export moments_length, moment_multiindices, moment_index,
        moment_volume, moment_centroid, shift_moments!, shift_moments
 export SimplicialAABBTree, simplex_aabb, build_simplex_aabb_tree,
