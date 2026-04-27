@@ -49,6 +49,11 @@ using OhMyThreads: tforeach, tmapreduce
 export ThreadChunk, partition_for_threads
 export parallel_for_cells, parallel_reduce_cells, parallel_for_chunks
 
+# Backend trait + verbs (defined below; exported here for re-export).
+export AbstractParallelBackend, Sequential, OhMyThreadsBackend
+export default_backend, set_default_backend!
+export parallel_foreach, parallel_mapreduce, parallel_chunked
+
 # ============================================================================
 # ThreadChunk — the unit of parallel work
 # ============================================================================
@@ -114,8 +119,22 @@ function partition_for_threads(mesh::HierarchicalMesh, n_chunks::Integer=Threads
 end
 
 # ============================================================================
+# Backend trait + verbs (PR-0)
+# ============================================================================
+
+include("Backends.jl")
+
+# ============================================================================
 # Parallel iteration
 # ============================================================================
+
+# Helper: resolve a (scheduler, backend) pair to an effective backend.
+# `:serial` maps to `Sequential()`; any other Symbol maps to a
+# fresh `OhMyThreadsBackend(scheduler)`. When `scheduler === nothing`,
+# the explicit `backend` argument is used.
+@inline _effective_backend(scheduler::Nothing, backend::AbstractParallelBackend) = backend
+@inline _effective_backend(scheduler::Symbol,  backend::AbstractParallelBackend) =
+    scheduler === :serial ? Sequential() : OhMyThreadsBackend(scheduler)
 
 """
     parallel_for_cells(f, mesh::HierarchicalMesh; scheduler = :dynamic, kwargs...)
@@ -139,13 +158,26 @@ machinery is not thread-safe under concurrent first-access; pre-building
 sidesteps the race.)
 """
 function parallel_for_cells(f, mesh::HierarchicalMesh;
-                              scheduler::Symbol = :dynamic, kwargs...)
+                              scheduler::Union{Symbol, Nothing} = :dynamic,
+                              backend::AbstractParallelBackend = default_backend(),
+                              kwargs...)
     n = n_cells(mesh)
     Mesh.ensure_caches!(mesh)
+    # Legacy short-circuit: nthreads()==1 or :serial → Sequential, no kwargs path.
     if Threads.nthreads() == 1 || scheduler === :serial
         @inbounds for i in 1:n
             f(mesh, i)
         end
+        return nothing
+    end
+    # When extra OhMyThreads kwargs are supplied (e.g. nchunks, chunksize,
+    # chunking), preserve the legacy direct call: the Backend trait does
+    # not currently model these knobs as parameters. The default code
+    # path (no kwargs, scheduler symbol or backend) routes through
+    # `parallel_foreach` so the abstraction is exercised.
+    if isempty(kwargs)
+        eff_backend = _effective_backend(scheduler, backend)
+        parallel_foreach(eff_backend, i -> f(mesh, i), 1:n)
         return nothing
     end
     tforeach(1:n; scheduler = scheduler, kwargs...) do i
@@ -173,7 +205,8 @@ here — this primitive is for explicit chunk-level control. Pass
 """
 function parallel_for_chunks(f, mesh::HierarchicalMesh,
                               n_chunks::Integer = Threads.nthreads();
-                              scheduler::Symbol = :dynamic)
+                              scheduler::Union{Symbol, Nothing} = :dynamic,
+                              backend::AbstractParallelBackend = default_backend())
     Mesh.ensure_caches!(mesh)
     chunks = partition_for_threads(mesh, n_chunks)
     if Threads.nthreads() == 1 || length(chunks) == 1 || scheduler === :serial
@@ -182,8 +215,17 @@ function parallel_for_chunks(f, mesh::HierarchicalMesh,
         end
         return nothing
     end
+    # Route through the parallel_chunked verb when no legacy kwargs apply.
+    eff_backend = _effective_backend(scheduler, backend)
+    if eff_backend isa Sequential
+        for chunk in chunks
+            f(mesh, chunk)
+        end
+        return nothing
+    end
     # `chunking = false` → exactly one task per chunk (we did our own chunking).
-    tforeach(eachindex(chunks); scheduler = scheduler, chunking = false) do k
+    sched = eff_backend isa OhMyThreadsBackend ? eff_backend.scheduler : scheduler
+    tforeach(eachindex(chunks); scheduler = sched, chunking = false) do k
         f(mesh, chunks[k])
     end
     return nothing
@@ -216,7 +258,9 @@ Forces `Mesh.ensure_caches!(mesh)` on the calling thread before any
 parallel fan-out. See `parallel_for_cells` for rationale.
 """
 function parallel_reduce_cells(f, op, mesh::HierarchicalMesh; init,
-                                  scheduler::Symbol = :dynamic, kwargs...)
+                                  scheduler::Union{Symbol, Nothing} = :dynamic,
+                                  backend::AbstractParallelBackend = default_backend(),
+                                  kwargs...)
     n = n_cells(mesh)
     Mesh.ensure_caches!(mesh)
     if Threads.nthreads() == 1 || n < 1000 || scheduler === :serial
@@ -225,6 +269,10 @@ function parallel_reduce_cells(f, op, mesh::HierarchicalMesh; init,
             result = op(result, f(mesh, i))
         end
         return result
+    end
+    if isempty(kwargs)
+        eff_backend = _effective_backend(scheduler, backend)
+        return parallel_mapreduce(eff_backend, i -> f(mesh, i), op, 1:n; init = init)
     end
     return tmapreduce(op, 1:n; init = init, scheduler = scheduler, kwargs...) do i
         f(mesh, i)

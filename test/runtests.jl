@@ -78,6 +78,14 @@ using HierarchicalGrids
         include("test_threading.jl")
     end
 
+    @testset "Layer 3 (foundational): Backend trait" begin
+        include("test_backends.jl")
+    end
+
+    @testset "Layer 3 (foundational): Backend dispatch overhead" begin
+        include("test_backend_dispatch.jl")
+    end
+
     @testset "Layer 3 (foundational): Memory" begin
         include("test_memory.jl")
     end

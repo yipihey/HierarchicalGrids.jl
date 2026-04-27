@@ -43,3 +43,7 @@ lcov.info
 
 # Logs
 *.log
+
+# Benchmark results (calibrated baselines land in PR-5).
+benchmarks/results/*.json
+benchmarks/Manifest.toml
