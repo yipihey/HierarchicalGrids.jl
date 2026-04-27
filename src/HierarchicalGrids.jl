@@ -106,8 +106,8 @@ export ensure_overlap!, invalidate_overlap!, overlap_cache
 export set_overlap_compute_function!
 export update_lagrangian_positions!
 
-# Indicator-driven refinement
-export refine_by_indicator!
+# Indicator-driven refinement: re-exported below, alongside the
+# `RefineByIndicator` submodule include (loaded after Threading).
 
 # Layer 2
 include("Geometry/Geometry.jl")
@@ -158,6 +158,13 @@ export parallel_for_cells, parallel_reduce_cells, parallel_for_chunks
 export AbstractParallelBackend, Sequential, OhMyThreadsBackend
 export default_backend, set_default_backend!
 export parallel_foreach, parallel_mapreduce, parallel_chunked
+
+# Layer 4 (depends on Mesh + Threading): generic indicator-driven refinement.
+# Loaded after Threading so the parallel candidate-evaluation passes can
+# reach the backend trait + verbs.
+include("Mesh/RefineByIndicator.jl")
+using .RefineByIndicator
+export refine_by_indicator!
 
 include("Memory/Memory.jl")
 using .Memory

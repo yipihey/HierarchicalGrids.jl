@@ -125,6 +125,74 @@ function run_compute_overlap(state, backend::AbstractParallelBackend)
 end
 
 # ----------------------------------------------------------------------------
+# Workload :refine_by_indicator
+# ----------------------------------------------------------------------------
+
+"""
+    build_refine_by_indicator(size) -> NamedTuple
+
+Construct a 2D `HierarchicalMesh` plus a deterministic per-cell indicator
+function for benchmarking the parallel candidate-evaluation passes.
+
+  :small  → ~16 leaves   (n_levels = 2)
+  :medium → ~256 leaves  (n_levels = 4)
+  :large  → ~4096 leaves (n_levels = 6)
+
+The indicator function performs a small CPU-bound computation per cell so
+the per-cell cost is representative of a real refinement criterion (an
+order-of-magnitude above the bare ~100 ns leaf-flag check). It returns a
+deterministic value computed from the cell index, so candidate ordering
+is stable across runs and parallel/sequential parity tests reproduce.
+"""
+function build_refine_by_indicator(size::Symbol)
+    if size === :small
+        n_levels = 2
+    elseif size === :medium
+        n_levels = 4
+    elseif size === :large
+        n_levels = 6
+    else
+        throw(ArgumentError("Unknown size: $size"))
+    end
+
+    mesh = HierarchicalMesh{2}()
+    for _ in 1:n_levels
+        leaves = [ci for ci in 1:n_cells(mesh) if is_leaf(mesh.cells[ci])]
+        refine_cells!(mesh, leaves)
+    end
+
+    # CPU-bound deterministic indicator: a 32-iteration recurrence per
+    # cell, seeded by the cell index. ~hundreds of ns per cell — small
+    # enough to keep the workload candidate-evaluation-bound, large
+    # enough that thread parallelism is observable on medium/large.
+    indicator = function (ci::Integer)
+        x = Float64(ci) * 0.123456789
+        @inbounds for k in 1:32
+            x = sin(x) + k * 1e-3
+        end
+        return x
+    end
+
+    return (mesh = mesh, indicator = indicator)
+end
+
+"""
+    run_refine_by_indicator(state, backend)
+
+Run a single `refine_by_indicator!` pass on a fresh copy of the mesh
+under the supplied backend. The mesh is `deepcopy`-ed inside the run so
+repeated benchmark samples don't accumulate refinement (the
+mesh-mutation step itself is sequential, but each sample exercises the
+parallel candidate-evaluation pass on the same starting topology).
+"""
+function run_refine_by_indicator(state, backend::AbstractParallelBackend)
+    m = deepcopy(state.mesh)
+    return refine_by_indicator!(m, state.indicator;
+                                  refine_threshold = 0.0,   # always-true predicate
+                                  backend = backend)
+end
+
+# ----------------------------------------------------------------------------
 # Registry
 # ----------------------------------------------------------------------------
 
@@ -132,6 +200,11 @@ const WORKLOADS = Dict{Symbol, NamedTuple}(
     :compute_overlap => (
         build = build_compute_overlap,
         run   = run_compute_overlap,
+        sizes = [:small, :medium, :large],
+    ),
+    :refine_by_indicator => (
+        build = build_refine_by_indicator,
+        run   = run_refine_by_indicator,
         sizes = [:small, :medium, :large],
     ),
 )

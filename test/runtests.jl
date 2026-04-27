@@ -86,6 +86,10 @@ using HierarchicalGrids
         include("test_backend_dispatch.jl")
     end
 
+    @testset "Layer 3 (foundational): refine_by_indicator! threading" begin
+        include("test_refine_by_indicator_threading.jl")
+    end
+
     @testset "Layer 3 (foundational): Memory" begin
         include("test_memory.jl")
     end
