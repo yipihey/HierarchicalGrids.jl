@@ -38,9 +38,12 @@ using ..BoundaryConditions: BCKind, BoundarySpec, is_periodic_axis,
 using ..Bases: AbstractBasis, MonomialBasis, BernsteinBasis, n_coeffs, evaluate
 using ..Storage
 using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView,
+                 PointSampleFieldSet, PointSampleFieldView, PointSampleView,
                  AbstractLayout, SoA, AoS, Blocked,
                  _layout_type_poly, _get_poly_coeff, _set_poly_coeff!,
-                 n_elements, field_names, basis_of, n_coeffs_per_element
+                 n_elements, field_names, basis_of, n_coeffs_per_element,
+                 n_points_per_cell, n_points_per_axis,
+                 eval_point_samples, point_multi_to_flat
 using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_box,
                   enumerate_leaves, compute_overlap, aabbs_overlap,
                   GeometricOverlap, OverlapEntry

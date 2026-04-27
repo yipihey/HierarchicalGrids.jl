@@ -38,6 +38,35 @@
 # ============================================================================
 
 # ----------------------------------------------------------------------------
+# Path B basis sentinel: a synthetic "basis" carried by point-sample blocks.
+# Records the spatial dimension `D` and the per-axis sample count `N` (so
+# `P = N - 1`), enabling the same `B`-parameter dispatch surface that Path A
+# uses for `MonomialBasis` / `BernsteinBasis`.
+#
+# Declared early because the inline evaluators below dispatch on it.
+# ----------------------------------------------------------------------------
+
+"""
+    PointSampleBasis{D, N}
+
+Sentinel "basis" type carried by Path B `BlockView` / `BlockHaloView`. The
+underlying interpolation is the tensor-product equispaced Lagrange nodal
+basis of degree `P = N - 1` over the unit cube `[0, 1]^D`.
+
+This type does NOT subtype `AbstractBasis` — Path A's basis-driven
+generated evaluators (`_eval_block_at`) are bypassed for Path B in favor
+of the explicit point-sample evaluator (`eval_point_samples`).
+"""
+struct PointSampleBasis{D, N} end
+
+@inline _basis_degree(::Type{<:PointSampleBasis{D, N}}) where {D, N} = N - 1
+
+# Number of "coefficients" per block for Path B = N^D point samples.
+@inline _n_coeffs_for_basis(::PointSampleBasis{D, N}) where {D, N} = N^D
+# Path A: defer to Bases.n_coeffs.
+@inline _n_coeffs_for_basis(b::AbstractBasis) = n_coeffs(b)
+
+# ----------------------------------------------------------------------------
 # Inline polynomial evaluators (zero-allocation for concrete bases)
 #
 # `Bases.evaluate` is correct but goes through a lookup-cached exponent
@@ -171,21 +200,67 @@ end
     return evaluate(basis, coeffs, point)
 end
 
+# Path B: PointSampleBasis. Tensor-product Lagrange interpolation at the
+# equispaced node set; reuses the explicit `eval_point_samples` from
+# Storage. The basis carries (D, N) at the type level so this is fully
+# type-stable.
+@inline function _eval_block_at(::PointSampleBasis{D, N}, coeffs, point) where {D, N}
+    return eval_point_samples(Val(D), Val(N), coeffs, point)
+end
+
 # Materialize a PolynomialView's coefficients as an NTuple for the
 # generated evaluator.
 @inline function _materialize_coeffs(pv::PolynomialView, ::Val{nc}) where {nc}
     return ntuple(k -> pv[k], Val(nc))
 end
 
+# Path B: Materialize a PointSampleView's flat point values as an NTuple.
+@inline function _materialize_coeffs(pv::PointSampleView, ::Val{nc}) where {nc}
+    return ntuple(k -> pv[k], Val(nc))
+end
+
 # ----------------------------------------------------------------------------
-# Helper: extract the basis from a NamedTuple of PolynomialFieldView's
+# Helper: extract the basis from a NamedTuple of field-set views
 # ----------------------------------------------------------------------------
 
-# All fields in a `PolynomialFieldSet`-backed NamedTuple share the same
-# basis; pull it from the first field. The basis type is a compile-time
-# parameter of the field-set, so this is fully type-stable.
+# Path A: PolynomialFieldView. All fields in a `PolynomialFieldSet`-backed
+# NamedTuple share the same basis; pull it from the first field. The basis
+# type is a compile-time parameter of the field-set, so this is fully
+# type-stable.
 @inline function _basis_from_fields(fields::NamedTuple{Names}) where {Names}
-    return getfield(fields, Names[1]).pfs.basis
+    return _basis_from_first(getfield(fields, Names[1]))
+end
+
+@inline _basis_from_first(fv::PolynomialFieldView) = fv.pfs.basis
+
+# Path B: PointSampleFieldView. Synthesize a `PointSampleBasis{D, N}` from
+# the field-set's compile-time (D, N) parameters.
+@inline function _basis_from_first(fv::PointSampleFieldView{PFS, name}
+                                     ) where {PFS, name}
+    D = _ptsfs_D(PFS)
+    N = _ptsfs_N(PFS)
+    return PointSampleBasis{D, N}()
+end
+
+@inline _ptsfs_D(::Type{<:PointSampleFieldSet{D, N, L, Names, ST, S}}
+                  ) where {D, N, L, Names, ST, S} = D
+@inline _ptsfs_N(::Type{<:PointSampleFieldSet{D, N, L, Names, ST, S}}
+                  ) where {D, N, L, Names, ST, S} = N
+
+# ----------------------------------------------------------------------------
+# `_coeffs_for_cell` / `_set_coeffs_for_cell!` for PointSampleFieldView
+# (Path B). Defined here in the Solver module since `_coeffs_for_cell` for
+# Path A lives in `Views.jl`; both paths plug into the same kernel-facing
+# accessor surface.
+# ----------------------------------------------------------------------------
+
+@inline function _coeffs_for_cell(field::PointSampleFieldView, i::Integer)
+    return field[Int(i)]
+end
+
+@inline function _set_coeffs_for_cell!(field::PointSampleFieldView, i::Integer, value)
+    field[Int(i)] = value
+    return value
 end
 
 # ----------------------------------------------------------------------------
@@ -281,7 +356,7 @@ end
     if name === :degree
         return _basis_degree(B)
     elseif name === :n_coeffs
-        return n_coeffs(getfield(bv, :basis))
+        return _n_coeffs_for_basis(getfield(bv, :basis))
     else
         return getfield(bv, name)
     end
@@ -326,6 +401,90 @@ end
 end
 
 # ----------------------------------------------------------------------------
+# BlockView point-indexed access (Path B only) — `bv[Val(:rho), (i, j)]`
+# ----------------------------------------------------------------------------
+#
+# For a `PointSampleBasis`-backed block, multi-index access is well-defined:
+# `bv[Val(:rho), (i, j)]` returns the point value at the `(i, j)` Lagrange
+# node. For Path A (polynomial blocks) the access doesn't make sense — the
+# block stores polynomial coefficients, not point values — so we provide a
+# clearly-worded error.
+
+@inline function Base.getindex(bv::BlockView{Names, Tin, Tout, D, T, B},
+                                ::Val{name},
+                                idx::NTuple{D2, Integer}
+                                ) where {Names, Tin, Tout, D, T, B, name, D2}
+    return _block_point_get(B, bv, Val(name), idx)
+end
+
+@inline function Base.getindex(bv::BlockView{Names, Tin, Tout, D, T, B},
+                                name::Symbol,
+                                idx::NTuple{D2, Integer}
+                                ) where {Names, Tin, Tout, D, T, B, D2}
+    return _block_point_get(B, bv, Val(name), idx)
+end
+
+@inline function Base.setindex!(bv::BlockView{Names, Tin, Tout, D, T, B},
+                                 value,
+                                 ::Val{name},
+                                 idx::NTuple{D2, Integer}
+                                 ) where {Names, Tin, Tout, D, T, B, name, D2}
+    return _block_point_set!(B, bv, Val(name), idx, value)
+end
+
+@inline function Base.setindex!(bv::BlockView{Names, Tin, Tout, D, T, B},
+                                 value,
+                                 name::Symbol,
+                                 idx::NTuple{D2, Integer}
+                                 ) where {Names, Tin, Tout, D, T, B, D2}
+    return _block_point_set!(B, bv, Val(name), idx, value)
+end
+
+# Path B (PointSampleBasis): translate the multi-index to flat and read/write
+# the underlying field directly. The `_get_poly_coeff_pts` /
+# `_set_poly_coeff!_pts` accessors do the layout-aware indexing.
+@inline function _block_point_get(::Type{<:PointSampleBasis{D, N}},
+                                    bv::BlockView, ::Val{name},
+                                    idx::NTuple{Da, Integer}) where {D, N, name, Da}
+    Da == D || throw(ArgumentError(
+        "PointSampleBasis{D=$D}: multi-index has length $Da, expected $D"))
+    flat = point_multi_to_flat(Val(N), ntuple(d -> Int(idx[d]), Val(D)))
+    field = getfield(getfield(bv, :fields_in), name)
+    pv = _coeffs_for_cell(field, getfield(bv, :index))
+    return pv[flat]
+end
+
+@inline function _block_point_set!(::Type{<:PointSampleBasis{D, N}},
+                                     bv::BlockView, ::Val{name},
+                                     idx::NTuple{Da, Integer}, value
+                                     ) where {D, N, name, Da}
+    Da == D || throw(ArgumentError(
+        "PointSampleBasis{D=$D}: multi-index has length $Da, expected $D"))
+    flat = point_multi_to_flat(Val(N), ntuple(d -> Int(idx[d]), Val(D)))
+    field = getfield(getfield(bv, :fields_out), name)
+    pv = _coeffs_for_cell(field, getfield(bv, :index))
+    pv[flat] = value
+    return value
+end
+
+# Path A: polynomial blocks don't have point indices. Error with a clear
+# message that points the user at the polynomial point-eval form.
+@inline function _block_point_get(::Type{<:AbstractBasis}, bv::BlockView,
+                                    ::Val{name}, idx::Tuple) where {name}
+    throw(ArgumentError(
+        "BlockView: polynomial blocks (Path A) don't support multi-index point access; " *
+        "use bv(:$name, ξ::NTuple{D, T}) for polynomial point evaluation, or use a " *
+        "PointSampleFieldSet (Path B) for explicit point storage."))
+end
+
+@inline function _block_point_set!(::Type{<:AbstractBasis}, bv::BlockView,
+                                     ::Val{name}, idx::Tuple, value) where {name}
+    throw(ArgumentError(
+        "BlockView: polynomial blocks (Path A) don't support multi-index point assignment; " *
+        "assign full coefficient tuples via bv[:$name] = (...) instead."))
+end
+
+# ----------------------------------------------------------------------------
 # BlockView point evaluation — `bv(Val(:rho), ξ)`
 # ----------------------------------------------------------------------------
 
@@ -342,7 +501,7 @@ unrolled, giving zero-allocation evaluation when called inside a hot loop.
         ::Val{name}, ξ::NTuple{D, T2}) where {Names, Tin, Tout, D, T, B, T2, name}
     field = getfield(getfield(bv, :fields_in), name)
     pv = _coeffs_for_cell(field, getfield(bv, :index))
-    nc = n_coeffs(getfield(bv, :basis))
+    nc = _n_coeffs_for_basis(getfield(bv, :basis))
     coeffs = _materialize_coeffs(pv, Val(nc))
     return _eval_block_at(getfield(bv, :basis), coeffs, ξ)
 end
@@ -351,7 +510,7 @@ end
         name::Symbol, ξ::NTuple{D, T2}) where {Names, Tin, Tout, D, T, B, T2}
     field = getfield(getfield(bv, :fields_in), name)
     pv = _coeffs_for_cell(field, getfield(bv, :index))
-    nc = n_coeffs(getfield(bv, :basis))
+    nc = _n_coeffs_for_basis(getfield(bv, :basis))
     coeffs = _materialize_coeffs(pv, Val(nc))
     return _eval_block_at(getfield(bv, :basis), coeffs, ξ)
 end
@@ -511,6 +670,53 @@ end
 end
 
 # ----------------------------------------------------------------------------
+# BlockHaloView point-indexed access (Path B only) — `bhv[Val(:rho), off, (i, j)]`
+# ----------------------------------------------------------------------------
+
+@inline function Base.getindex(bhv::BlockHaloView{Names, Tin, D, T, GhostDepth, BC, B},
+                                ::Val{name},
+                                off::NTuple{D, Int},
+                                idx::NTuple{D2, Integer}
+                                ) where {Names, Tin, D, T, GhostDepth, BC, B, name, D2}
+    return _bhv_point_get(B, bhv, Val(name), off, idx)
+end
+
+@inline function Base.getindex(bhv::BlockHaloView{Names, Tin, D, T, GhostDepth, BC, B},
+                                name::Symbol,
+                                off::NTuple{D, Int},
+                                idx::NTuple{D2, Integer}
+                                ) where {Names, Tin, D, T, GhostDepth, BC, B, D2}
+    return _bhv_point_get(B, bhv, Val(name), off, idx)
+end
+
+@inline function _bhv_point_get(::Type{<:PointSampleBasis{Db, N}},
+                                  bhv::BlockHaloView, ::Val{name},
+                                  off::NTuple{D, Int},
+                                  idx::NTuple{Da, Integer}
+                                  ) where {Db, N, name, D, Da}
+    Da == D || throw(ArgumentError(
+        "PointSampleBasis: multi-index has length $Da, expected $D"))
+    _bhv_check_offset(off, ghost_depth(bhv))
+    target = _walk_offset(getfield(bhv, :mesh),
+                           getfield(bhv, :cell_index),
+                           off,
+                           getfield(bhv, :bcs))
+    target === nothing && return nothing
+    flat = point_multi_to_flat(Val(N), ntuple(d -> Int(idx[d]), Val(D)))
+    field = getfield(getfield(bhv, :fields_in), name)
+    pv = _coeffs_for_cell(field, target)
+    return pv[flat]
+end
+
+@inline function _bhv_point_get(::Type{<:AbstractBasis}, bhv::BlockHaloView,
+                                  ::Val{name}, off::Tuple, idx::Tuple) where {name}
+    throw(ArgumentError(
+        "BlockHaloView: polynomial blocks (Path A) don't support multi-index point access; " *
+        "use bhv(:$name, off, ξ::NTuple{D, T}) for polynomial point evaluation, or use a " *
+        "PointSampleFieldSet (Path B) for explicit point storage."))
+end
+
+# ----------------------------------------------------------------------------
 # BlockHaloView point-evaluation
 # ----------------------------------------------------------------------------
 
@@ -539,7 +745,7 @@ extrapolation). PERIODIC wraps via the periodic-aware neighbor wiring.
     field = getfield(getfield(bhv, :fields_in), name)
     pv = _coeffs_for_cell(field, target)
     basis = getfield(bhv, :basis)
-    nc = n_coeffs(basis)
+    nc = _n_coeffs_for_basis(basis)
     coeffs = _materialize_coeffs(pv, Val(nc))
     return _eval_block_at(basis, coeffs, ξ)
 end
@@ -556,7 +762,7 @@ end
     field = getfield(getfield(bhv, :fields_in), name)
     pv = _coeffs_for_cell(field, target)
     basis = getfield(bhv, :basis)
-    nc = n_coeffs(basis)
+    nc = _n_coeffs_for_basis(basis)
     coeffs = _materialize_coeffs(pv, Val(nc))
     return _eval_block_at(basis, coeffs, ξ)
 end
