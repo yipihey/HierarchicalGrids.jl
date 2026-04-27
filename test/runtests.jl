@@ -198,6 +198,10 @@ using HierarchicalGrids
         include("test_for_each_block.jl")
     end
 
+    @testset "Phase 2 (Solver): AdaptiveField (PR-8)" begin
+        include("test_adaptive_field.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end

@@ -28,13 +28,19 @@ module Solver
 # ----------------------------------------------------------------------------
 
 using ..Mesh
-using ..Mesh: HierarchicalMesh, n_cells, is_leaf, level_of
+using ..Mesh: HierarchicalMesh, n_cells, is_leaf, level_of, children_count
 using ..Mesh: face_neighbors, face_fine_neighbors, face_neighbors_with_bcs,
               ensure_neighbor_graph!
+using ..Mesh: RefinementEvent, ListenerHandle,
+              register_refinement_listener!, unregister_refinement_listener!
 using ..BoundaryConditions: BCKind, BoundarySpec, is_periodic_axis,
                             PERIODIC, INFLOW, OUTFLOW, REFLECTING, DIRICHLET
-using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView
 using ..Bases: AbstractBasis, MonomialBasis, BernsteinBasis, n_coeffs, evaluate
+using ..Storage
+using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView,
+                 AbstractLayout, SoA, AoS, Blocked,
+                 _layout_type_poly, _get_poly_coeff, _set_poly_coeff!,
+                 n_elements, field_names, basis_of, n_coeffs_per_element
 using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_box,
                   enumerate_leaves
 using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
@@ -50,6 +56,7 @@ include("Views.jl")
 include("BlockView.jl")
 include("Orchestrators.jl")
 include("KernelContext.jl")
+include("AdaptiveField.jl")
 
 # ----------------------------------------------------------------------------
 # Exports
@@ -59,5 +66,6 @@ export CellView, HaloView, BlockView, BlockHaloView
 export ghost_depth, cell_view, halo_view_multi, block_view, block_halo_view
 export for_each_cell!, for_each_face!, for_each_block!
 export KernelContext
+export AdaptiveField, dispose!
 
 end # module Solver
