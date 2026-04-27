@@ -58,6 +58,11 @@ export PolynomialFieldView, PolynomialView
 export gradient_at, n_coeffs_per_element, basis_of
 export polynomial_action_error, polynomial_action_error_per_element
 export is_strictly_positive
+export PointSampleFieldSet, allocate_point_sample_fields
+export PointSampleFieldView, PointSampleView
+export n_points_per_cell, n_points_per_axis
+export point_multi_to_flat, point_flat_to_multi
+export eval_point_samples
 export HaloView, halo_view
 
 # ============================================================================
@@ -420,6 +425,12 @@ end
 # Polynomial field storage (depends on Bases for n_coeffs/evaluate/gradient)
 # ============================================================================
 include("PolynomialFieldSet.jl")
+
+# ============================================================================
+# Point-sample field storage (Path B for block-based AMR — PR-11). Reuses
+# the layout machinery from PolynomialFieldSet.jl.
+# ============================================================================
+include("PointSampleFieldSet.jl")
 
 # ============================================================================
 # Halo view over a PolynomialFieldView (depends on Mesh's NeighborGraph; PR-C)

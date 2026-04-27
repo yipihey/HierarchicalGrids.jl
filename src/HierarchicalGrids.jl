@@ -147,6 +147,11 @@ export PolynomialFieldView, PolynomialView
 export gradient_at, n_coeffs_per_element, basis_of
 export polynomial_action_error, polynomial_action_error_per_element
 export is_strictly_positive
+export PointSampleFieldSet, allocate_point_sample_fields
+export PointSampleFieldView, PointSampleView
+export n_points_per_cell, n_points_per_axis
+export point_multi_to_flat, point_flat_to_multi
+export eval_point_samples
 export HaloView, halo_view
 
 # Layer 3 (foundational pieces, full implementation later)
