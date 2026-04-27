@@ -133,3 +133,97 @@ end
     @test report.max_moment_relative_diff isa Float64
     @test report.failures isa Vector{NamedTuple}
 end
+
+# ============================================================================
+# 7. Per-mesh audit overload (Item B of the debuggability batch)
+# ============================================================================
+
+@testset "audit_overlap(lag, frame): clean single-triangle case" begin
+    positions = [(0.2, 0.2), (0.8, 0.2), (0.5, 0.8)]
+    sv = reshape(Int32[1, 2, 3], 3, 1)
+    sn = zeros(Int32, 3, 1)
+    lag = SimplicialMesh{2, Float64}(positions, sv, sn)
+    eul = HierarchicalMesh{2}()
+    frame = EulerianFrame(eul, (0.0, 0.0), (1.0, 1.0))
+
+    report = audit_overlap(lag, frame; bits = 16, accumulator = Int128,
+                           atol = 1e-3)
+    @test report isa OverlapAuditReport
+    @test report.n_polytopes_checked == 1   # the single overlap pair
+    @test report.n_failed == 0
+    @test report.n_passed == 1
+    @test report.max_volume_relative_diff < 1e-3
+    @test isempty(report.failures)
+end
+
+@testset "audit_overlap(lag, frame): two-triangle tile reveals upstream drops" begin
+    # The two-triangle tiling of [0, 1]^2 against a 1-level-refined
+    # Eulerian is the canonical bad geometry for IntExact at D = 2.
+    positions = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    sv = Int32[1 1; 2 3; 3 4]
+    sn = zeros(Int32, 3, 2)
+    lag = SimplicialMesh{2, Float64}(positions, sv, sn)
+    eul = HierarchicalMesh{2}()
+    refine_cells!(eul, [1])
+    frame = EulerianFrame(eul, (0.0, 0.0), (1.0, 1.0))
+
+    report = audit_overlap(lag, frame; bits = 16, accumulator = Int128,
+                           atol = 1e-10, max_pair_diffs = 32)
+    @test report.n_failed > 0
+    @test !isempty(report.failures)
+
+    # At least one failure has kind = :exact_dropped.
+    kinds = Set(f.kind for f in report.failures)
+    @test :exact_dropped in kinds
+
+    # Failures are sorted by descending volume_diff.
+    diffs = [f.volume_diff for f in report.failures]
+    @test diffs == sort(diffs; rev = true)
+end
+
+@testset "audit_overlap(lag, frame): show formatting renders per-pair entries" begin
+    positions = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    sv = Int32[1 1; 2 3; 3 4]
+    sn = zeros(Int32, 3, 2)
+    lag = SimplicialMesh{2, Float64}(positions, sv, sn)
+    eul = HierarchicalMesh{2}()
+    refine_cells!(eul, [1])
+    frame = EulerianFrame(eul, (0.0, 0.0), (1.0, 1.0))
+
+    report = audit_overlap(lag, frame)
+    s = sprint(show, report)
+    @test occursin("OverlapAuditReport", s)
+    @test occursin("failed=", s)
+    @test occursin("lag=", s)
+    @test occursin("eul=", s)
+    @test occursin("kind=", s)
+    @test occursin("vol_diff=", s)
+end
+
+@testset "audit_overlap(lag, frame): max_pair_diffs cap respected" begin
+    positions = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    sv = Int32[1 1; 2 3; 3 4]
+    sn = zeros(Int32, 3, 2)
+    lag = SimplicialMesh{2, Float64}(positions, sv, sn)
+    eul = HierarchicalMesh{2}()
+    refine_cells!(eul, [1])
+    frame = EulerianFrame(eul, (0.0, 0.0), (1.0, 1.0))
+
+    report = audit_overlap(lag, frame; max_pair_diffs = 2)
+    @test length(report.failures) <= 2
+end
+
+@testset "audit_overlap(lag, frame): per_pair=false leaves failures empty" begin
+    positions = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    sv = Int32[1 1; 2 3; 3 4]
+    sn = zeros(Int32, 3, 2)
+    lag = SimplicialMesh{2, Float64}(positions, sv, sn)
+    eul = HierarchicalMesh{2}()
+    refine_cells!(eul, [1])
+    frame = EulerianFrame(eul, (0.0, 0.0), (1.0, 1.0))
+
+    report = audit_overlap(lag, frame; per_pair = false)
+    @test isempty(report.failures)
+    # n_failed still tracks count even though we don't list them.
+    @test report.n_failed > 0
+end

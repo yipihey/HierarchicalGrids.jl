@@ -43,6 +43,7 @@ export ExponentialMovingAverage, update!, value, reset!
 export PerCellStats
 export RemapDiagnostics
 export OverlapAuditReport, audit_overlap
+export OverlapDropReport
 
 # ============================================================================
 # WelfordStats — online mean, variance, skewness, kurtosis

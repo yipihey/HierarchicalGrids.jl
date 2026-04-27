@@ -115,6 +115,153 @@ function Base.show(io::IO, o::GeometricOverlap{D, T}) where {D, T}
           ")")
 end
 
+"""
+    describe(o::GeometricOverlap{D, T}; io::IO = stdout) -> nothing
+
+Print a distributional summary of `o` to `io`:
+
+- total entry count
+- total volume ([`total_overlap_volume`](@ref))
+- entries with zero or near-zero volume (count + percent)
+- volume distribution percentiles (min / 10 / 50 / 90 / max)
+- entries-per-Eulerian-leaf distribution (min / median / max + which
+  leaf has each)
+- entries-per-Lagrangian-simplex distribution (min / median / max +
+  which simplex has each)
+
+Useful for sanity-checking a freshly computed overlap before remap.
+The output is human-readable and intentionally compact (one or two
+screens at most). Quantiles are computed inline (no `Statistics`
+dependency); ties on min/max counts are broken by the first index.
+"""
+function describe(o::GeometricOverlap{D, T};
+                  io::IO = stdout) where {D, T}
+    n = n_entries(o)
+    println(io, "GeometricOverlap{", D, ", ", T, "} summary")
+    println(io, "  spatial dimension: ", D)
+    println(io, "  moment order:      ", o.moment_order)
+    println(io, "  n_entries:         ", n)
+    println(io, "  n_lag (simplices): ", o.n_lag)
+    println(io, "  n_eul (cells):     ", o.n_eul)
+
+    if n == 0
+        println(io, "  (overlap is empty — no entries to summarize)")
+        return nothing
+    end
+
+    # Volume statistics.
+    total_vol = total_overlap_volume(o)
+    vols = Vector{T}(undef, n)
+    n_zero = 0
+    @inbounds for k in 1:n
+        v = o.entries[k].volume
+        vols[k] = v
+        if v <= zero(T) || v < eps(T) * abs(total_vol)
+            n_zero += 1
+        end
+    end
+    println(io, "  total volume:      ", total_vol)
+    println(io, "  n_empty (vol≈0):   ", n_zero,
+                "  (", _pct(n_zero, n), "%)")
+
+    # Volume percentiles. Allocate a sorted copy.
+    sorted_vols = sort(vols)
+    p_min = sorted_vols[1]
+    p_10  = _percentile_sorted(sorted_vols, 0.10)
+    p_50  = _percentile_sorted(sorted_vols, 0.50)
+    p_90  = _percentile_sorted(sorted_vols, 0.90)
+    p_max = sorted_vols[end]
+    println(io, "  volume percentiles:")
+    println(io, "    min:   ", p_min)
+    println(io, "    p10:   ", p_10)
+    println(io, "    p50:   ", p_50)
+    println(io, "    p90:   ", p_90)
+    println(io, "    max:   ", p_max)
+
+    # Per-Eulerian-leaf entry-count distribution. eul_to_entries is
+    # already vector-of-vectors, length n_eul (one slot per cell, leaf
+    # or otherwise). Skip non-leaf cells (empty arrays).
+    eul_leaves_with_entries = 0
+    eul_min = typemax(Int); eul_min_at = 0
+    eul_max = 0;            eul_max_at = 0
+    eul_counts = Int[]
+    @inbounds for ci in 1:o.n_eul
+        c = length(o.eul_to_entries[ci])
+        c == 0 && continue
+        eul_leaves_with_entries += 1
+        push!(eul_counts, c)
+        if c < eul_min
+            eul_min = c; eul_min_at = ci
+        end
+        if c > eul_max
+            eul_max = c; eul_max_at = ci
+        end
+    end
+    if eul_leaves_with_entries == 0
+        println(io, "  entries-per-leaf:  (no Eulerian leaves carry entries)")
+    else
+        eul_med = _percentile_sorted(sort(eul_counts), 0.50)
+        println(io, "  entries-per-Eulerian-leaf:")
+        println(io, "    min: ", eul_min, " (cell ", eul_min_at, ")")
+        println(io, "    med: ", Int(round(eul_med)))
+        println(io, "    max: ", eul_max, " (cell ", eul_max_at, ")")
+        println(io, "    leaves with entries: ", eul_leaves_with_entries,
+                    " / ", o.n_eul)
+    end
+
+    # Per-Lagrangian-simplex entry-count distribution.
+    simp_with_entries = 0
+    simp_min = typemax(Int); simp_min_at = 0
+    simp_max = 0;            simp_max_at = 0
+    simp_counts = Int[]
+    @inbounds for li in 1:o.n_lag
+        c = length(o.lag_to_entries[li])
+        c == 0 && continue
+        simp_with_entries += 1
+        push!(simp_counts, c)
+        if c < simp_min
+            simp_min = c; simp_min_at = li
+        end
+        if c > simp_max
+            simp_max = c; simp_max_at = li
+        end
+    end
+    if simp_with_entries == 0
+        println(io, "  entries-per-simplex: (no Lagrangian simplex carries entries)")
+    else
+        simp_med = _percentile_sorted(sort(simp_counts), 0.50)
+        println(io, "  entries-per-Lagrangian-simplex:")
+        println(io, "    min: ", simp_min, " (simplex ", simp_min_at, ")")
+        println(io, "    med: ", Int(round(simp_med)))
+        println(io, "    max: ", simp_max, " (simplex ", simp_max_at, ")")
+        println(io, "    simplices with entries: ", simp_with_entries,
+                    " / ", o.n_lag)
+    end
+    return nothing
+end
+
+# Linear-interpolation percentile on a pre-sorted vector. q ∈ [0, 1].
+@inline function _percentile_sorted(sorted::AbstractVector, q::Real)
+    n = length(sorted)
+    n == 0 && return zero(eltype(sorted))
+    n == 1 && return sorted[1]
+    # Linear interpolation between adjacent ranks (R's "type 7" /
+    # numpy default).
+    h = (n - 1) * q
+    lo = floor(Int, h) + 1
+    hi = min(lo + 1, n)
+    frac = h - (lo - 1)
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * frac
+end
+
+# Integer percent display (rounded to 1 decimal place) without
+# pulling in Printf.
+@inline function _pct(num::Integer, den::Integer)
+    den == 0 && return "0.0"
+    p = 100.0 * num / den
+    return string(round(p, digits = 1))
+end
+
 # ============================================================================
 # Builder — accumulates entries during compute_overlap
 # ============================================================================

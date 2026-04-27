@@ -284,6 +284,62 @@ function overlap_simplex_box_exact!(
         throw(DimensionMismatch(
             "out_moments has length $(length(out_moments)), expected $expected_len"))
     fill!(out_moments, zero(Rational{R}))
+    vol, cent, moms, _kind = _overlap_dispatch_int!(out_moments, scratch,
+                                                     simplex_vertices,
+                                                     box_lo, box_hi,
+                                                     Int(moment_order), Val(D))
+    return (vol, cent, moms)
+end
+
+"""
+    overlap_simplex_box_exact_with_drop_kind!(out_moments, scratch,
+                                                simplex_vertices,
+                                                box_lo, box_hi,
+                                                moment_order;
+                                                accumulator = ...)
+        -> (volume, centroid, out_moments, drop_kind::Symbol)
+
+Internal-API variant of [`overlap_simplex_box_exact!`](@ref) that ALSO
+returns a `drop_kind ∈ (:none, :empty, :negative_volume)` indicating
+whether the per-pair clip was empty (no overlap), produced a negative
+or zero-area polytope (a known upstream bug at D = 2 — the adapter
+zeros out_moments and reports the drop), or completed normally.
+
+`drop_kind = :none` means a non-empty positively-oriented overlap was
+produced. `:empty` means the simplex is outside the box / fully
+clipped / degenerate (not a bug — counted for completeness). The
+`:negative_volume` kind is the actual data-loss case: r3djl's
+`R3D.IntExact.moments_exact!` returned a non-positive volume for a
+non-degenerate clip polytope, which the adapter treats as empty
+(volume == 0) on the outward-facing path. Used by
+[`compute_overlap`](@ref)'s `audit_drops = true` mode and the
+`OverlapDropReport` it returns.
+
+This function does NOT surface `:moments_throw` drops (where
+`moments_exact!` itself raises an exception on a degenerate
+polytope). Those are caught in the caller (`compute_overlap`) via a
+try/catch, since they manifest as a Julia exception rather than a
+post-call inspection.
+"""
+function overlap_simplex_box_exact_with_drop_kind!(
+        out_moments::AbstractVector{Rational{R}},
+        scratch::IntPairScratch{D, T},
+        simplex_vertices,
+        box_lo::NTuple{D, T},
+        box_hi::NTuple{D, T},
+        moment_order::Integer;
+        accumulator::Type{<:Signed} = _default_accumulator(T, Val(D))
+    ) where {D, T<:Signed, R<:Signed}
+    accumulator === R ||
+        throw(ArgumentError(
+            "overlap_simplex_box_exact_with_drop_kind!: accumulator type " *
+            "($accumulator) must match the element type of out_moments " *
+            "(Rational{$R})."))
+    expected_len = moments_length(D, Int(moment_order))
+    length(out_moments) == expected_len ||
+        throw(DimensionMismatch(
+            "out_moments has length $(length(out_moments)), expected $expected_len"))
+    fill!(out_moments, zero(Rational{R}))
     return _overlap_dispatch_int!(out_moments, scratch, simplex_vertices,
                                    box_lo, box_hi, Int(moment_order), Val(D))
 end
@@ -311,6 +367,16 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
         "dispatch table."))
 end
 
+# Return shape for the per-D dispatch tuple: every leaf returns the
+# 4-tuple `(volume::Rational{R}, centroid::NTuple{D, Rational{R}},
+# out_moments, drop_kind::Symbol)`. The `drop_kind` is one of:
+#   :none             — non-empty positive overlap.
+#   :empty            — simplex outside / fully clipped / degenerate.
+#   :negative_volume  — r3djl returned a non-positive volume for a
+#                       non-degenerate clip polygon (upstream bug at
+#                       D = 2). Adapter zeros the moments and treats
+#                       as empty externally.
+
 # ----------------------------------------------------------------------------
 # D = 2
 # ----------------------------------------------------------------------------
@@ -324,7 +390,7 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
                                   ::Val{2}) where {T<:Signed, R<:Signed}
     # Quick AABB reject: degenerate / inverted box ⇒ empty.
     if box_lo[1] >= box_hi[1] || box_lo[2] >= box_hi[2]
-        return _empty_result(out_moments, Val(2), R)
+        return _empty_result(out_moments, Val(2), R, :empty)
     end
     poly = scratch.poly
     planes = scratch.plane_buf
@@ -345,7 +411,7 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
         v2, v3 = v3, v2
     elseif twoa == zero(R)
         # Degenerate triangle (collinear) — overlap is measure zero.
-        return _empty_result(out_moments, Val(2), R)
+        return _empty_result(out_moments, Val(2), R, :empty)
     end
 
     # Stack-allocated 2-element vectors per vertex (init_simplex! takes
@@ -369,16 +435,24 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
             "expected geometry."))
     end
     if poly.nverts == 0
-        return _empty_result(out_moments, Val(2), R)
+        return _empty_result(out_moments, Val(2), R, :empty)
     end
 
     R3D.IntExact.moments_exact!(out_moments, poly, moment_order)
     vol = out_moments[1]
     if vol <= zero(Rational{R})
-        # Numerically degenerate (zero-area sliver) — treat as empty,
-        # mirroring the float adapter's `vol <= 0 ⇒ empty` convention.
+        # Numerically degenerate (zero-area sliver) OR upstream IntExact
+        # produced a NEGATIVE-volume polytope (a known D = 2 bug —
+        # orientation flip after clip!). The adapter zeros out_moments
+        # and treats the pair as empty externally; we surface the
+        # distinction via `drop_kind = :negative_volume` for the audit
+        # path. `vol == 0` with a non-empty poly is also classed as
+        # `:negative_volume` since it indicates upstream returned a
+        # numerically-zero result for a polygon that geometrically
+        # had positive area (the `poly.nverts == 0` empty case is
+        # handled above).
         fill!(out_moments, zero(Rational{R}))
-        return _empty_result(out_moments, Val(2), R)
+        return _empty_result(out_moments, Val(2), R, :negative_volume)
     end
 
     centroid = if moment_order >= 1
@@ -386,7 +460,7 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
     else
         (zero(Rational{R}), zero(Rational{R}))
     end
-    return (vol, centroid, out_moments)
+    return (vol, centroid, out_moments, :none)
 end
 
 # ----------------------------------------------------------------------------
@@ -401,7 +475,7 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
                                   moment_order::Int,
                                   ::Val{3}) where {T<:Signed, R<:Signed}
     if box_lo[1] >= box_hi[1] || box_lo[2] >= box_hi[2] || box_lo[3] >= box_hi[3]
-        return _empty_result(out_moments, Val(3), R)
+        return _empty_result(out_moments, Val(3), R, :empty)
     end
     poly = scratch.poly
     planes = scratch.plane_buf
@@ -420,7 +494,7 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
     if sixv < zero(R)
         v3, v4 = v4, v3
     elseif sixv == zero(R)
-        return _empty_result(out_moments, Val(3), R)
+        return _empty_result(out_moments, Val(3), R, :empty)
     end
 
     # `init_tet!` D=3 takes an `NTuple{4, <:AbstractVector}`.
@@ -441,14 +515,14 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
             "expected geometry."))
     end
     if poly.nverts == 0
-        return _empty_result(out_moments, Val(3), R)
+        return _empty_result(out_moments, Val(3), R, :empty)
     end
 
     R3D.IntExact.moments_exact!(out_moments, poly, moment_order)
     vol = out_moments[1]
     if vol <= zero(Rational{R})
         fill!(out_moments, zero(Rational{R}))
-        return _empty_result(out_moments, Val(3), R)
+        return _empty_result(out_moments, Val(3), R, :negative_volume)
     end
 
     centroid = if moment_order >= 1
@@ -456,7 +530,7 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
     else
         (zero(Rational{R}), zero(Rational{R}), zero(Rational{R}))
     end
-    return (vol, centroid, out_moments)
+    return (vol, centroid, out_moments, :none)
 end
 
 # ----------------------------------------------------------------------------
@@ -504,7 +578,7 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
                                   ::Val{4}) where {T<:Signed, R<:Signed}
     if box_lo[1] >= box_hi[1] || box_lo[2] >= box_hi[2] ||
        box_lo[3] >= box_hi[3] || box_lo[4] >= box_hi[4]
-        return _empty_result(out_moments, Val(4), R)
+        return _empty_result(out_moments, Val(4), R, :empty)
     end
 
     poly = scratch.poly
@@ -520,7 +594,7 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
         v4, v5 = v5, v4
     elseif sv == zero(R)
         # Degenerate pentachoron (coplanar in 4D) — measure zero.
-        return _empty_result(out_moments, Val(4), R)
+        return _empty_result(out_moments, Val(4), R, :empty)
     end
 
     # `init_simplex!` D=4 takes a length-5 indexable collection of
@@ -544,14 +618,14 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
             "expected geometry."))
     end
     if poly.nverts == 0
-        return _empty_result(out_moments, Val(4), R)
+        return _empty_result(out_moments, Val(4), R, :empty)
     end
 
     R3D.IntExact.moments_exact!(out_moments, poly, moment_order)
     vol = out_moments[1]
     if vol <= zero(Rational{R})
         fill!(out_moments, zero(Rational{R}))
-        return _empty_result(out_moments, Val(4), R)
+        return _empty_result(out_moments, Val(4), R, :negative_volume)
     end
 
     centroid = if moment_order >= 1
@@ -561,7 +635,7 @@ function _overlap_dispatch_int!(out_moments::AbstractVector{Rational{R}},
         (zero(Rational{R}), zero(Rational{R}),
          zero(Rational{R}), zero(Rational{R}))
     end
-    return (vol, centroid, out_moments)
+    return (vol, centroid, out_moments, :none)
 end
 
 # ----------------------------------------------------------------------------
@@ -569,10 +643,12 @@ end
 # ----------------------------------------------------------------------------
 
 @inline function _empty_result(out_moments::AbstractVector{Rational{R}},
-                                ::Val{D}, ::Type{R}) where {D, R<:Signed}
+                                ::Val{D}, ::Type{R},
+                                kind::Symbol = :empty) where {D, R<:Signed}
     return (zero(Rational{R}),
             ntuple(_ -> zero(Rational{R}), Val(D)),
-            out_moments)
+            out_moments,
+            kind)
 end
 
 # ============================================================================

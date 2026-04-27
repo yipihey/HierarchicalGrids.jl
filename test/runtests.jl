@@ -118,6 +118,14 @@ using HierarchicalGrids
         include("test_overlap_exact_backend.jl")
     end
 
+    @testset "Layer 4: Overlap :exact backend drop audit" begin
+        include("test_overlap_drop_audit.jl")
+    end
+
+    @testset "Layer 4: GeometricOverlap describe" begin
+        include("test_overlap_describe.jl")
+    end
+
     @testset "Layer 4: Polynomial remap" begin
         include("test_polynomial_remap.jl")
     end

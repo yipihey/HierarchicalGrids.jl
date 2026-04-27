@@ -62,11 +62,28 @@ physical coordinates).
   (the default), `_default_accumulator(lattice.int_type, Val(D))`
   decides (`Int128` for D=2/3 with `Int16`/`Int32` lattice, `BigInt`
   for D=4 / wider lattices). Must be `nothing` when `backend = :float`.
+- `audit_drops` — diagnostic switch valid only with `backend = :exact`.
+  When `false` (the default), `compute_overlap` returns a single
+  `GeometricOverlap{D, T}` (existing behavior; bit-for-bit identical
+  to the old return path). When `true`, the per-pair loop tracks every
+  contribution that the upstream `R3D.IntExact` backend dropped — either
+  by returning a non-positive volume (a known D = 2 bug, classed as
+  `:negative_volume`), by throwing inside `moments_exact!` on a
+  degenerate clip (`:moments_throw`), or by producing an empty overlap
+  (`:empty`, informational only) — and `compute_overlap` returns the
+  TUPLE `(overlap::GeometricOverlap{D, T}, drops::OverlapDropReport)`.
+  The drop report counts negative-volume + moments-throw drops as
+  actual data loss; the empty count is recorded for completeness.
+  See [`HierarchicalGrids.OverlapDropReport`](@ref). Has no effect on
+  the float backend (where drops do not occur and the kwarg is
+  rejected with an `ArgumentError`).
 
 # Returns
 
 A `GeometricOverlap{D, T}` with all nonzero pairs and CSR-style indexing
-both ways. Iterate with `entries_for_lag` or `entries_for_eul`.
+both ways. Iterate with `entries_for_lag` or `entries_for_eul`. When
+`audit_drops = true` and `backend = :exact`, the return shape changes
+to a 2-tuple `(GeometricOverlap{D, T}, OverlapDropReport)`.
 
 # Performance
 
@@ -96,6 +113,7 @@ function compute_overlap(lag::SimplicialMesh{D, T},
                           backend::Symbol = :float,
                           lattice::Union{Nothing, IntegerLattice{D}} = nothing,
                           accumulator::Union{Type{<:Signed}, Nothing} = nothing,
+                          audit_drops::Bool = false,
                           ) where {D, T}
     edge_kind === :linear ||
         throw(ArgumentError("edge_kind=$edge_kind not yet supported (:linear only). " *
@@ -118,6 +136,10 @@ function compute_overlap(lag::SimplicialMesh{D, T},
         accumulator === nothing ||
             throw(ArgumentError(
                 "compute_overlap: `accumulator` is only valid when backend = :exact"))
+        audit_drops === false ||
+            throw(ArgumentError(
+                "compute_overlap: `audit_drops = true` is only valid when " *
+                "backend = :exact (the float backend does not drop pairs)."))
     else  # :exact
         T === Float64 ||
             throw(ArgumentError(
@@ -210,7 +232,8 @@ function compute_overlap(lag::SimplicialMesh{D, T},
                BigInt)
         return _compute_overlap_sequential_exact(lag, frame, tree,
                                                   Int(moment_order),
-                                                  ghost_shifts, lat, acc)
+                                                  ghost_shifts, lat, acc;
+                                                  audit_drops = audit_drops)
     end
 
     if !parallel || Threads.nthreads() == 1
@@ -390,7 +413,8 @@ function _compute_overlap_sequential_exact(
         moment_order::Int,
         ghost_shifts::Union{Nothing, Vector{NTuple{D, Float64}}},
         lat::IntegerLattice{D},
-        ::Type{R}) where {D, R<:Signed}
+        ::Type{R};
+        audit_drops::Bool = false) where {D, R<:Signed}
     builder = OverlapBuilder{D, Float64}(moment_order)
     scratch = IntPairScratch(Val(D), lat.int_type; capacity = 64)
     n_phys = moments_length(D, moment_order)
@@ -400,6 +424,13 @@ function _compute_overlap_sequential_exact(
     # Final physical-frame Float64 moments (after shift_moments!).
     phys_moments = Vector{Float64}(undef, n_phys)
     candidates = Int32[]; sizehint!(candidates, 64)
+
+    # Drop bookkeeping (only populated when audit_drops = true).
+    n_neg = 0
+    n_throw = 0
+    n_empty_cnt = 0
+    drops = Vector{NamedTuple{(:lag_idx, :eul_idx, :kind),
+                              Tuple{Int32, Int32, Symbol}}}()
 
     # Cache of per-flat-index total degrees for unscale_moment dispatch.
     # `moment_multiindices` is cached at the moments.jl layer; we just
@@ -423,14 +454,79 @@ function _compute_overlap_sequential_exact(
             for s in candidates
                 verts = simplex_vertex_positions(lag, Int(s))
                 q_verts = ntuple(k -> quantize(verts[k], lat), Val(D + 1))
-                vol_rat, _centroid_rat, _out_rats =
-                    overlap_simplex_box_exact!(int_moment_buf, scratch,
-                                                 q_verts, q_box_lo, q_box_hi,
-                                                 moment_order;
-                                                 accumulator = R)
-                iszero(vol_rat) && continue
+
+                # Audit-mode dispatch: use the drop-kind variant so we
+                # can distinguish empty-overlap from upstream-bug drops.
+                # Wrap in try/catch to surface `:moments_throw` drops
+                # (R3D.IntExact.moments_exact! can raise on degenerate
+                # clip polytopes — known D = 2 upstream issue).
+                vol_rat, _centroid_rat, _out_rats, drop_kind =
+                if audit_drops
+                    try
+                        overlap_simplex_box_exact_with_drop_kind!(
+                            int_moment_buf, scratch,
+                            q_verts, q_box_lo, q_box_hi,
+                            moment_order; accumulator = R)
+                    catch err
+                        # Capacity overflow is a programmer error
+                        # (scratch buffer too small) — do NOT mask
+                        # those as drops. Everything else (including
+                        # the upstream `ArgumentError("0//0")` from
+                        # `R3D.IntExact._vertex_rational_d2`) is
+                        # treated as a `:moments_throw` drop.
+                        if err isa OverflowError
+                            rethrow(err)
+                        end
+                        n_throw += 1
+                        push!(drops, (lag_idx = Int32(s),
+                                       eul_idx = Int32(ci),
+                                       kind = :moments_throw))
+                        # Synthesize an empty result so downstream stays
+                        # consistent — the entry is dropped, no push.
+                        fill!(int_moment_buf, zero(Rational{R}))
+                        (zero(Rational{R}),
+                         ntuple(_ -> zero(Rational{R}), Val(D)),
+                         int_moment_buf, :moments_throw)
+                    end
+                else
+                    vol, cent, out, _ =
+                        overlap_simplex_box_exact_with_drop_kind!(
+                            int_moment_buf, scratch,
+                            q_verts, q_box_lo, q_box_hi,
+                            moment_order; accumulator = R)
+                    (vol, cent, out, :none)
+                end
+
+                if iszero(vol_rat)
+                    if audit_drops
+                        if drop_kind === :negative_volume
+                            n_neg += 1
+                            push!(drops, (lag_idx = Int32(s),
+                                           eul_idx = Int32(ci),
+                                           kind = :negative_volume))
+                        elseif drop_kind === :empty
+                            n_empty_cnt += 1
+                            push!(drops, (lag_idx = Int32(s),
+                                           eul_idx = Int32(ci),
+                                           kind = :empty))
+                        end
+                        # :moments_throw was already recorded above.
+                    end
+                    continue
+                end
                 vol_phys = unscale_volume(vol_rat, lat)
-                vol_phys > 0.0 || continue
+                if vol_phys <= 0.0
+                    # Lattice-quantization rounded a non-zero rational down
+                    # to zero physical volume — informational; record as
+                    # :empty (not data loss).
+                    if audit_drops
+                        n_empty_cnt += 1
+                        push!(drops, (lag_idx = Int32(s),
+                                       eul_idx = Int32(ci),
+                                       kind = :empty))
+                    end
+                    continue
+                end
 
                 if moment_order == 0
                     # Volume-only path: no shift needed; centroid is a
@@ -466,7 +562,18 @@ function _compute_overlap_sequential_exact(
         # `nothing` on this code path.
     end
 
-    return finalize_overlap(builder, n_simplices(lag), n_cells(eul))
+    overlap = finalize_overlap(builder, n_simplices(lag), n_cells(eul))
+    if audit_drops
+        # Reach across to Diagnostics via the parent module — Overlap
+        # imports Diagnostics's `RemapDiagnostics` already, but
+        # `OverlapDropReport` is added in this batch and isn't on the
+        # `using ..Diagnostics` import list. The parent-module path
+        # avoids touching the Overlap module's import surface.
+        DropReportT = parentmodule(@__MODULE__).Diagnostics.OverlapDropReport
+        report = DropReportT(n_neg, n_throw, n_empty_cnt, drops)
+        return (overlap, report)
+    end
+    return overlap
 end
 
 # Helper: extract the total degree of every multi-index in `multi` as a

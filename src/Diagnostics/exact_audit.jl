@@ -80,9 +80,104 @@ function Base.show(io::IO, r::OverlapAuditReport)
     print(io, ", max_moment_rel_diff=", r.max_moment_relative_diff, ")")
     if r.n_failed > 0
         for f in r.failures
-            print(io, "\n  - ", f.polytope_name,
-                  " (D=", f.dim, "): expected=", f.expected,
-                  ", float=", f.got_float, ", exact=", f.got_exact)
+            # Per-pair audits (Item B) emit a different schema than the
+            # canonical-polytope path; render whichever fields exist.
+            fnames = propertynames(f)
+            if :polytope_name in fnames
+                print(io, "\n  - ", f.polytope_name,
+                      " (D=", f.dim, "): expected=", f.expected,
+                      ", float=", f.got_float, ", exact=", f.got_exact)
+            elseif :lag_idx in fnames
+                # User-mesh per-pair entry.
+                print(io, "\n  - lag=", f.lag_idx,
+                      " eul=", f.eul_idx,
+                      "  kind=", f.kind,
+                      "  vol_diff=", f.volume_diff,
+                      "  centroid_diff=", f.centroid_diff)
+            else
+                # Fallback: print whatever fields are present.
+                print(io, "\n  - ", f)
+            end
+        end
+    end
+end
+
+# ============================================================================
+# OverlapDropReport — :exact-backend drop audit
+# ============================================================================
+
+"""
+    OverlapDropReport
+
+Records pairs that the `:exact` backend dropped on the way through
+[`compute_overlap`](@ref). Drops have three sources, all upstream:
+
+1. `R3D.IntExact.clip!` produces (or `R3D.IntExact.moments_exact!`
+   integrates) a polytope with a non-positive volume — orientation
+   flip, known upstream bug at `D = 2`. The HG adapter zeros the
+   moments and the entry is suppressed; this is data loss.
+2. `R3D.IntExact.moments_exact!` throws on a degenerate polytope (e.g.
+   shared denominators of zero) — known upstream bug at `D = 2`.
+   Surfaced via try/catch in `compute_overlap`'s exact path; this is
+   also data loss.
+3. The clip is empty (no overlap) — not a bug, but counted for
+   completeness so callers can sanity-check broad-phase pruning.
+
+Each entry is `(lag_idx::Int32, eul_idx::Int32, kind::Symbol)` where
+`kind ∈ (:negative_volume, :moments_throw, :empty)`.
+
+`n_negative_volume` and `n_moments_throw` together count actual data
+loss; `n_empty` is informational.
+
+# Fields
+
+- `n_negative_volume::Int` — count of pairs dropped because upstream
+  produced a non-positive `vol_rat` for a non-empty clip polytope.
+- `n_moments_throw::Int` — count of pairs dropped because
+  `R3D.IntExact.moments_exact!` raised an exception on a degenerate
+  clip.
+- `n_empty::Int` — count of pairs whose clip was geometrically empty.
+- `drops::Vector{NamedTuple}` — per-pair records, in encounter order.
+
+See also [`compute_overlap`](@ref) (with `audit_drops = true`),
+[`audit_overlap`](@ref) (the per-mesh user audit, also reports drops).
+"""
+struct OverlapDropReport
+    n_negative_volume::Int
+    n_moments_throw::Int
+    n_empty::Int
+    drops::Vector{NamedTuple{(:lag_idx, :eul_idx, :kind),
+                             Tuple{Int32, Int32, Symbol}}}
+end
+
+function Base.show(io::IO, r::OverlapDropReport)
+    n_loss = r.n_negative_volume + r.n_moments_throw
+    if n_loss == 0
+        print(io, "OverlapDropReport: 0 data-loss drops",
+                  " (", r.n_empty, " empty)")
+        return
+    end
+    print(io, "OverlapDropReport: ", n_loss, " drops (",
+              r.n_negative_volume, " negative-volume, ",
+              r.n_moments_throw, " moments-throw, ",
+              r.n_empty, " empty)")
+    # List the first few data-loss drops.
+    loss_drops = NamedTuple[]
+    for d in r.drops
+        if d.kind === :negative_volume || d.kind === :moments_throw
+            push!(loss_drops, d)
+            length(loss_drops) >= 5 && break
+        end
+    end
+    if !isempty(loss_drops)
+        n_show = length(loss_drops)
+        print(io, "\n  first ", n_show, " data-loss drops:")
+        for d in loss_drops
+            print(io, "\n    lag=", d.lag_idx, " eul=", d.eul_idx,
+                  "  :", d.kind)
+        end
+        if n_loss > n_show
+            print(io, "\n    ... (", n_loss - n_show, " more)")
         end
     end
 end
@@ -445,6 +540,203 @@ function audit_overlap(; verbose::Bool = false, atol::Real = 1e-10)
 
     return OverlapAuditReport(n_total, n_passed, n_failed,
                               max_vol_rel, max_mom_rel, failures)
+end
+
+# ============================================================================
+# User-mesh per-pair audit — Item B
+# ============================================================================
+
+"""
+    audit_overlap(lag::SimplicialMesh{D, Float64},
+                  frame::EulerianFrame{D, Float64};
+                  bits::Int = 16,
+                  accumulator::Type{<:Signed} = Int128,
+                  per_pair::Bool = true,
+                  max_pair_diffs::Int = 32,
+                  atol::Real = 1e-10) -> OverlapAuditReport
+
+Run BOTH the `:float` and `:exact` backends on the user's actual mesh
+and report agreement. Useful for verifying the exact backend on a
+specific geometry before relying on it for production work — the
+canonical-polytope audit (`audit_overlap()` with no arguments) covers
+clean test polytopes, but real meshes can trip upstream `IntExact`
+edge cases that the canonical battery doesn't cover.
+
+Returns the same [`OverlapAuditReport`](@ref) struct used by the
+canonical-polytope audit, with `n_polytopes_checked` interpreted as
+the number of `(lag_idx, eul_idx)` pairs compared (the union of the
+keys produced by either backend). The `failures` vector schema for
+this overload is
+
+    NamedTuple{(:lag_idx, :eul_idx, :kind, :volume_diff, :centroid_diff,
+                :got_float, :got_exact)}
+
+where `kind ∈ (:exact_dropped, :volume_mismatch, :centroid_mismatch)`.
+The list is sorted by descending `volume_diff` and capped at
+`max_pair_diffs` entries.
+
+# Arguments
+
+- `lag` — Lagrangian mesh.
+- `frame` — Eulerian frame.
+- `bits` — lattice bit budget for the exact backend (default `16`).
+- `accumulator` — exact-rational accumulator type (default `Int128`;
+  pass `BigInt` for guaranteed safety on heavily refined meshes).
+- `per_pair` — when `true` (default), populate the `failures` field
+  with sorted per-pair disagreements; when `false`, only the summary
+  counts are reported (failures left empty).
+- `max_pair_diffs` — cap on the number of per-pair entries in the
+  report's `failures` field (default `32`).
+- `atol` — absolute tolerance for declaring a per-pair disagreement.
+  A pair is flagged when the volume difference or any centroid
+  component difference exceeds `atol` (default `1e-10`).
+
+# Drop surfacing
+
+When the `:exact` backend drops pairs (upstream `IntExact` known bugs
+at `D = 2` — see [`OverlapDropReport`](@ref)), those pairs appear in
+`failures` with `kind = :exact_dropped`. The `:exact` total volume
+report is then strictly less than `:float`'s and the audit's
+`max_volume_relative_diff` is bounded below by the dropped volume.
+"""
+function audit_overlap(lag, frame;
+                       bits::Int = 16,
+                       accumulator::Type{<:Signed} = Int128,
+                       per_pair::Bool = true,
+                       max_pair_diffs::Int = 32,
+                       atol::Real = 1e-10)
+    # Pull Overlap symbols at call time — Diagnostics is loaded BEFORE
+    # Overlap, but `__init__` deferral makes these resolvable.
+    HG = parentmodule(@__MODULE__)
+    Olap = HG.Overlap
+
+    # Type-check the inputs at the call boundary so the error message is
+    # clear (an alternative would be to constrain via `where {D}` on the
+    # method signature, but the canonical-polytope `audit_overlap()`
+    # method shares the same name and dispatches on `()` — the
+    # mesh-typed method has to take untyped args + an explicit check).
+    lag isa Olap.SimplicialMesh ||
+        throw(ArgumentError(
+            "audit_overlap(lag, frame): `lag` must be a SimplicialMesh, " *
+            "got $(typeof(lag))"))
+    frame isa Olap.EulerianFrame ||
+        throw(ArgumentError(
+            "audit_overlap(lag, frame): `frame` must be an EulerianFrame, " *
+            "got $(typeof(frame))"))
+
+    # Build a lattice on the requested bit budget.
+    D = Olap.spatial_dimension(frame)
+    lat = Olap.IntegerLattice(frame; bits = bits,
+                              int_type = (D == 4 ? Int64 : Int32))
+
+    # Run both backends. moment_order = 1 covers volume + centroid; the
+    # per-pair audit doesn't need higher moments.
+    o_float = Olap.compute_overlap(lag, frame;
+                                    backend = :float,
+                                    moment_order = 1)
+    o_exact, drops = Olap.compute_overlap(lag, frame;
+                                           backend = :exact,
+                                           moment_order = 1,
+                                           lattice = lat,
+                                           accumulator = accumulator,
+                                           audit_drops = true)
+
+    # Index entries by (lag_idx, eul_idx).
+    f_by_key = Dict{Tuple{Int32, Int32}, Any}()
+    for e in o_float.entries
+        f_by_key[(e.lag_idx, e.eul_idx)] = e
+    end
+    e_by_key = Dict{Tuple{Int32, Int32}, Any}()
+    for e in o_exact.entries
+        e_by_key[(e.lag_idx, e.eul_idx)] = e
+    end
+
+    all_keys = union(keys(f_by_key), keys(e_by_key))
+    n_total = length(all_keys)
+
+    # Per-pair comparison.
+    pair_failures = NamedTuple[]
+    max_vol_rel = 0.0
+    max_mom_rel = 0.0
+    n_passed = 0
+    n_failed = 0
+
+    # First, surface all dropped pairs (in `o_float` but not `o_exact`).
+    for k in all_keys
+        ef = get(f_by_key, k, nothing)
+        ee = get(e_by_key, k, nothing)
+        if ef === nothing && ee !== nothing
+            # Exact-only pair (rare; would mean float dropped — not
+            # currently expected). Treat as a failure with kind = :float_missing.
+            n_failed += 1
+            vol = Float64(ee.volume)
+            max_vol_rel = max(max_vol_rel, _rel_diff(0.0, vol))
+            push!(pair_failures, (
+                lag_idx = Int(k[1]), eul_idx = Int(k[2]),
+                kind = :float_missing,
+                volume_diff = vol,
+                centroid_diff = 0.0,
+                got_float = nothing,
+                got_exact = (volume = ee.volume, centroid = ee.centroid),
+            ))
+        elseif ef !== nothing && ee === nothing
+            # Exact-backend dropped this pair (upstream IntExact bug or
+            # numerical degeneracy). The volume_diff is the float volume
+            # since the exact contribution is 0.
+            n_failed += 1
+            vol = Float64(ef.volume)
+            max_vol_rel = max(max_vol_rel, _rel_diff(vol, 0.0))
+            push!(pair_failures, (
+                lag_idx = Int(k[1]), eul_idx = Int(k[2]),
+                kind = :exact_dropped,
+                volume_diff = vol,
+                centroid_diff = 0.0,
+                got_float = (volume = ef.volume, centroid = ef.centroid),
+                got_exact = nothing,
+            ))
+        else
+            # Both backends produced the pair: compare.
+            vol_diff = abs(Float64(ef.volume) - Float64(ee.volume))
+            cent_diff = 0.0
+            for d in 1:D
+                cent_diff = max(cent_diff,
+                                abs(Float64(ef.centroid[d]) -
+                                    Float64(ee.centroid[d])))
+            end
+            vol_rel = _rel_diff(Float64(ef.volume), Float64(ee.volume))
+            max_vol_rel = max(max_vol_rel, vol_rel)
+            # Centroid comparison contributes to the moment metric.
+            max_mom_rel = max(max_mom_rel, vol_rel)
+
+            if vol_diff > atol || cent_diff > atol
+                n_failed += 1
+                kind = vol_diff > atol ? :volume_mismatch : :centroid_mismatch
+                push!(pair_failures, (
+                    lag_idx = Int(k[1]), eul_idx = Int(k[2]),
+                    kind = kind,
+                    volume_diff = vol_diff,
+                    centroid_diff = cent_diff,
+                    got_float = (volume = ef.volume, centroid = ef.centroid),
+                    got_exact = (volume = ee.volume, centroid = ee.centroid),
+                ))
+            else
+                n_passed += 1
+            end
+        end
+    end
+
+    # Sort failures by descending volume_diff and cap.
+    if per_pair
+        sort!(pair_failures, by = f -> -f.volume_diff)
+        if length(pair_failures) > max_pair_diffs
+            resize!(pair_failures, max_pair_diffs)
+        end
+    else
+        empty!(pair_failures)
+    end
+
+    return OverlapAuditReport(n_total, n_passed, n_failed,
+                              max_vol_rel, max_mom_rel, pair_failures)
 end
 
 # ============================================================================
