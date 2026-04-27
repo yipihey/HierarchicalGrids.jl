@@ -357,7 +357,8 @@ function _path_face_neighbor(mesh::HierarchicalMesh{D, M},
 end
 
 """
-    build_neighbor_graph(mesh::HierarchicalMesh{D, M}) -> NeighborGraph{D, M}
+    build_neighbor_graph(mesh::HierarchicalMesh{D, M};
+                          backend = nothing) -> NeighborGraph{D, M}
 
 Build the face-neighbor adjacency by walking the parent chain of each leaf.
 For each leaf and each face `(axis d, side s)`, locate the lowest ancestor
@@ -368,23 +369,68 @@ multiple fine neighbors at hanging-node faces).
 Worst-case cost: `O(N · D · depth_max)` for the per-leaf path walks plus
 `O(adjacency)` for fine-leaf enumeration. The previous bucket-based
 implementation was `O(N²)` worst-case.
+
+# Parallelism (PR-2)
+
+The per-leaf path walks are independent and embarrassingly parallel. The
+build is parallelized with a two-phase pattern:
+
+1. **Phase 1 (parallel):** the leaf range is partitioned into chunks; each
+   task walks its chunk, writing its `representatives[i]` slot directly
+   (per-`i` writes are race-free) and accumulating any hanging-node `fine`
+   entries into a per-task `Vector{Pair{...}}`.
+2. **Phase 2 (sequential):** the per-task vectors are walked on the
+   calling thread and inserted into the single shared `fine::Dict`. The
+   merge cost is `O(adjacency)`, which is asymptotically dominated by
+   Phase 1, so a serial merge keeps the implementation simple without
+   sacrificing scalability.
+
+`ensure_caches!(mesh)` is forced before the parallel fan-out so per-task
+accesses see a populated, read-only cache (lazy first-access on the
+parent/level caches is not thread-safe).
+
+The `backend` kwarg accepts an `AbstractParallelBackend`; when `nothing`,
+the process-global `default_backend()` is consulted. Pass `Sequential()`
+to get the original byte-identical serial loop.
 """
-function build_neighbor_graph(mesh::HierarchicalMesh{D, M}) where {D, M}
+function build_neighbor_graph(mesh::HierarchicalMesh{D, M};
+                                backend = nothing) where {D, M}
     ensure_caches!(mesh)
     n = n_cells(mesh)
     F = 2 * D
-    representatives = fill(ntuple(_ -> UInt32(0), Val(2*D)), n)
+    representatives = Vector{NTuple{2*D, UInt32}}(undef, n)
     fine = Dict{Tuple{UInt32, UInt8}, Vector{UInt32}}()
 
     if n == 0
         return NeighborGraph{D, M}(representatives, fine)
     end
 
-    face_buf = Vector{UInt32}(undef, F)
+    # Resolve the backend lazily — Threading is loaded AFTER Mesh, so we
+    # can't statically reference its types here. We grab the verbs from
+    # the parent module at call time.
+    HG = parentmodule(@__MODULE__)
+    eff_backend = backend === nothing ? HG.Threading.default_backend() : backend
 
-    @inbounds for i in 1:n
-        is_leaf(mesh.cells[i]) || continue
-        i32 = UInt32(i)
+    return _build_neighbor_graph_impl(mesh, representatives, fine, n, F,
+                                       eff_backend, HG)
+end
+
+# Per-chunk worker: writes `representatives[i]` slots directly and returns
+# a vector of (key, value) pairs for the fine-neighbor dict. Each task
+# gets its own per-task buffer for the inner face_buf.
+function _neighbor_graph_chunk!(mesh::HierarchicalMesh{D, M},
+                                  representatives::Vector{NTuple{F, UInt32}},
+                                  cell_range,
+                                  ) where {D, M, F}
+    fine_pairs = Pair{Tuple{UInt32, UInt8}, Vector{UInt32}}[]
+    face_buf = Vector{UInt32}(undef, F)
+    @inbounds for i in cell_range
+        i_int = Int(i)
+        if !is_leaf(mesh.cells[i_int])
+            representatives[i_int] = ntuple(_ -> UInt32(0), Val(F))
+            continue
+        end
+        i32 = UInt32(i_int)
         for f in 1:F
             face_buf[f] = UInt32(0)
         end
@@ -393,17 +439,77 @@ function build_neighbor_graph(mesh::HierarchicalMesh{D, M}) where {D, M}
             (rep_lo, fl_lo) = _path_face_neighbor(mesh, i32, d, 0)
             face_buf[2*d - 1] = rep_lo
             if fl_lo !== nothing
-                fine[(i32, UInt8(2*d - 1))] = fl_lo
+                push!(fine_pairs, (i32, UInt8(2*d - 1)) => fl_lo)
             end
             # hi side (s = 1), face index 2d
             (rep_hi, fl_hi) = _path_face_neighbor(mesh, i32, d, 1)
             face_buf[2*d] = rep_hi
             if fl_hi !== nothing
-                fine[(i32, UInt8(2*d))] = fl_hi
+                push!(fine_pairs, (i32, UInt8(2*d)) => fl_hi)
             end
         end
-        representatives[i] = ntuple(f -> face_buf[f], Val(2*D))
+        representatives[i_int] = ntuple(f -> face_buf[f], Val(F))
     end
+    return fine_pairs
+end
+
+# Sequential serial path: identical byte-for-byte to the legacy loop.
+function _build_neighbor_graph_serial!(mesh::HierarchicalMesh{D, M},
+                                         representatives::Vector{NTuple{F, UInt32}},
+                                         fine::Dict{Tuple{UInt32, UInt8}, Vector{UInt32}},
+                                         n::Integer,
+                                         ) where {D, M, F}
+    pairs = _neighbor_graph_chunk!(mesh, representatives, 1:n)
+    @inbounds for kv in pairs
+        fine[kv.first] = kv.second
+    end
+    return nothing
+end
+
+# Phase-2 merge of an iterable of per-task Pair vectors into the shared dict.
+function _merge_fine_pairs!(fine::Dict{Tuple{UInt32, UInt8}, Vector{UInt32}},
+                              part_lists)
+    @inbounds for part in part_lists
+        for kv in part
+            fine[kv.first] = kv.second
+        end
+    end
+    return nothing
+end
+
+function _build_neighbor_graph_impl(mesh::HierarchicalMesh{D, M},
+                                      representatives::Vector{NTuple{F, UInt32}},
+                                      fine::Dict{Tuple{UInt32, UInt8}, Vector{UInt32}},
+                                      n::Integer, ::Integer,
+                                      backend, HG) where {D, M, F}
+    # Sequential fast-path: avoid any task plumbing, byte-equal to legacy.
+    if backend isa HG.Threading.Sequential
+        _build_neighbor_graph_serial!(mesh, representatives, fine, n)
+        return NeighborGraph{D, M}(representatives, fine)
+    end
+
+    # Parallel path. Partition the cell range into chunks (one task per
+    # chunk) and run the inner kernel under the supplied backend. We use
+    # `parallel_chunked` so that each task gets a contiguous range and a
+    # private `face_buf` allocation; per-task fine-pair vectors are
+    # collected via a thread-safe push under a lock (chunk count is small,
+    # so contention is negligible — this beats reaching for tmapreduce
+    # since we're collecting Vectors, not reducing).
+    n_chunks = max(1, min(Int(n), Threads.nthreads()))
+    # Manually partition (avoid depending on Mesh + Threading both being
+    # loaded for the chunked verb).
+    chunks = HG.Threading.partition_for_threads(mesh, n_chunks)
+    parts = Vector{Vector{Pair{Tuple{UInt32, UInt8}, Vector{UInt32}}}}(undef,
+                                                                       length(chunks))
+    HG.Threading.parallel_chunked(backend,
+        (m, chunk) -> begin
+            parts[Int(chunk.chunk_id)] =
+                _neighbor_graph_chunk!(m, representatives, chunk.cell_range)
+        end,
+        mesh, length(chunks))
+
+    # Phase 2: merge per-task fine-pair vectors into the shared dict.
+    _merge_fine_pairs!(fine, parts)
 
     return NeighborGraph{D, M}(representatives, fine)
 end
@@ -413,17 +519,22 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    ensure_neighbor_graph!(mesh::HierarchicalMesh{D, M}) -> NeighborGraph{D, M}
+    ensure_neighbor_graph!(mesh::HierarchicalMesh{D, M};
+                            backend = nothing) -> NeighborGraph{D, M}
 
 Build the neighbor graph if absent (or if invalidated by refinement) and
 return it. Registers a refinement listener on first build that invalidates
 the cache on every subsequent mesh modification.
+
+The `backend` kwarg is forwarded to [`build_neighbor_graph`](@ref). The
+listener wiring itself is single-threaded — only the build is parallel.
 """
-function ensure_neighbor_graph!(mesh::HierarchicalMesh{D, M}) where {D, M}
+function ensure_neighbor_graph!(mesh::HierarchicalMesh{D, M};
+                                  backend = nothing) where {D, M}
     g = mesh._cached_neighbor_graph
     F = 2 * D
     if g === nothing
-        new_g = build_neighbor_graph(mesh)
+        new_g = build_neighbor_graph(mesh; backend = backend)
         mesh._cached_neighbor_graph = new_g
         # Register a one-shot-style listener: zeroes the slot. Subsequent
         # accesses rebuild and re-register. (Cheaper than a permanent

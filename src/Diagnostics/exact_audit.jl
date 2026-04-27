@@ -502,44 +502,70 @@ The `OverlapAuditReport`. The maximum observed relative differences
 even when nothing fails: they tell downstream PRs (PR-3, PR-5) what
 realistic floor the float-vs-exact comparison sits at on this geometry.
 """
-function audit_overlap(; verbose::Bool = false, atol::Real = 1e-10)
+# Per-polytope worker. Returns a "partial" report (with at most one
+# polytope counted) so per-task partials can be merged via
+# [`_merge_audit_reports`](@ref).
+function _audit_one_partial(pt::NamedTuple, atol::Real, verbose::Bool)
+    passed, vol_rel, mom_rel, expected, got_float, got_exact =
+        _audit_one(pt, atol)
+    if passed
+        verbose && println("  [pass] ", pt.name,
+                            "  vol_rel=", vol_rel,
+                            "  mom_rel=", mom_rel)
+        return OverlapAuditReport(1, 1, 0, vol_rel, mom_rel, NamedTuple[])
+    else
+        verbose && println("  [FAIL] ", pt.name,
+                            "  vol_rel=", vol_rel,
+                            "  mom_rel=", mom_rel)
+        f = (polytope_name = pt.name,
+             dim = pt.dim,
+             expected = expected,
+             got_float = got_float,
+             got_exact = got_exact)
+        return OverlapAuditReport(1, 0, 1, vol_rel, mom_rel, NamedTuple[f])
+    end
+end
+
+# Associative merge for two partial OverlapAuditReports. Used as the
+# reducer in `parallel_mapreduce`. Since the canonical-polytope audit
+# does not cap `failures`, the merge simply concatenates them; the
+# user-mesh audit caps post-hoc.
+function _merge_audit_reports(a::OverlapAuditReport, b::OverlapAuditReport)
+    return OverlapAuditReport(
+        a.n_polytopes_checked + b.n_polytopes_checked,
+        a.n_passed + b.n_passed,
+        a.n_failed + b.n_failed,
+        max(a.max_volume_relative_diff, b.max_volume_relative_diff),
+        max(a.max_moment_relative_diff, b.max_moment_relative_diff),
+        vcat(a.failures, b.failures),
+    )
+end
+
+function audit_overlap(; verbose::Bool = false, atol::Real = 1e-10,
+                         backend = nothing)
     polytopes = vcat(_canonical_polytopes_2d(), _canonical_polytopes_3d())
 
-    n_total = length(polytopes)
-    n_passed = 0
-    n_failed = 0
-    max_vol_rel = 0.0
-    max_mom_rel = 0.0
-    failures = NamedTuple[]
-
-    for pt in polytopes
-        passed, vol_rel, mom_rel, expected, got_float, got_exact =
-            _audit_one(pt, atol)
-        max_vol_rel = max(max_vol_rel, vol_rel)
-        max_mom_rel = max(max_mom_rel, mom_rel)
-
-        if passed
-            n_passed += 1
-            verbose && println("  [pass] ", pt.name,
-                                "  vol_rel=", vol_rel,
-                                "  mom_rel=", mom_rel)
-        else
-            n_failed += 1
-            push!(failures, (
-                polytope_name = pt.name,
-                dim = pt.dim,
-                expected = expected,
-                got_float = got_float,
-                got_exact = got_exact,
-            ))
-            verbose && println("  [FAIL] ", pt.name,
-                                "  vol_rel=", vol_rel,
-                                "  mom_rel=", mom_rel)
-        end
+    if isempty(polytopes)
+        return OverlapAuditReport(0, 0, 0, 0.0, 0.0, NamedTuple[])
     end
 
-    return OverlapAuditReport(n_total, n_passed, n_failed,
-                              max_vol_rel, max_mom_rel, failures)
+    HG = parentmodule(@__MODULE__)
+    eff_backend = backend === nothing ? HG.Threading.default_backend() : backend
+
+    init = OverlapAuditReport(0, 0, 0, 0.0, 0.0, NamedTuple[])
+
+    # parallel_mapreduce: each polytope produces a unit partial report,
+    # then `_merge_audit_reports` combines them associatively. Verbose
+    # printing is sequential under `Sequential()` and best-effort under
+    # parallel backends (interleaved per-task output is acceptable for a
+    # diagnostic).
+    return HG.Threading.parallel_mapreduce(
+        eff_backend,
+        pt -> _audit_one_partial(pt, atol, verbose),
+        _merge_audit_reports,
+        polytopes;
+        init = init,
+    )
 end
 
 # ============================================================================
@@ -599,12 +625,65 @@ at `D = 2` — see [`OverlapDropReport`](@ref)), those pairs appear in
 report is then strictly less than `:float`'s and the audit's
 `max_volume_relative_diff` is bounded below by the dropped volume.
 """
+# Per-key audit. Returns a partial OverlapAuditReport (with at most one
+# pair counted, exactly one failure entry if the pair disagreed). Used as
+# the map function in `parallel_mapreduce` for the user-mesh audit.
+function _audit_pair_partial(k::Tuple{Int32, Int32},
+                              f_by_key::Dict, e_by_key::Dict, D::Int,
+                              atol::Real)
+    ef = get(f_by_key, k, nothing)
+    ee = get(e_by_key, k, nothing)
+    if ef === nothing && ee !== nothing
+        vol = Float64(ee.volume)
+        rel = _rel_diff(0.0, vol)
+        f = (lag_idx = Int(k[1]), eul_idx = Int(k[2]),
+             kind = :float_missing,
+             volume_diff = vol,
+             centroid_diff = 0.0,
+             got_float = nothing,
+             got_exact = (volume = ee.volume, centroid = ee.centroid))
+        return OverlapAuditReport(1, 0, 1, rel, 0.0, NamedTuple[f])
+    elseif ef !== nothing && ee === nothing
+        vol = Float64(ef.volume)
+        rel = _rel_diff(vol, 0.0)
+        f = (lag_idx = Int(k[1]), eul_idx = Int(k[2]),
+             kind = :exact_dropped,
+             volume_diff = vol,
+             centroid_diff = 0.0,
+             got_float = (volume = ef.volume, centroid = ef.centroid),
+             got_exact = nothing)
+        return OverlapAuditReport(1, 0, 1, rel, 0.0, NamedTuple[f])
+    else
+        vol_diff = abs(Float64(ef.volume) - Float64(ee.volume))
+        cent_diff = 0.0
+        for d in 1:D
+            cent_diff = max(cent_diff,
+                            abs(Float64(ef.centroid[d]) -
+                                Float64(ee.centroid[d])))
+        end
+        vol_rel = _rel_diff(Float64(ef.volume), Float64(ee.volume))
+        if vol_diff > atol || cent_diff > atol
+            kind = vol_diff > atol ? :volume_mismatch : :centroid_mismatch
+            f = (lag_idx = Int(k[1]), eul_idx = Int(k[2]),
+                 kind = kind,
+                 volume_diff = vol_diff,
+                 centroid_diff = cent_diff,
+                 got_float = (volume = ef.volume, centroid = ef.centroid),
+                 got_exact = (volume = ee.volume, centroid = ee.centroid))
+            return OverlapAuditReport(1, 0, 1, vol_rel, vol_rel, NamedTuple[f])
+        else
+            return OverlapAuditReport(1, 1, 0, vol_rel, vol_rel, NamedTuple[])
+        end
+    end
+end
+
 function audit_overlap(lag, frame;
                        bits::Int = 16,
                        accumulator::Type{<:Signed} = Int128,
                        per_pair::Bool = true,
                        max_pair_diffs::Int = 32,
-                       atol::Real = 1e-10)
+                       atol::Real = 1e-10,
+                       backend = nothing)
     # Pull Overlap symbols at call time — Diagnostics is loaded BEFORE
     # Overlap, but `__init__` deferral makes these resolvable.
     HG = parentmodule(@__MODULE__)
@@ -652,82 +731,39 @@ function audit_overlap(lag, frame;
     end
 
     all_keys = union(keys(f_by_key), keys(e_by_key))
-    n_total = length(all_keys)
+    # Sort to a deterministic order so the parallel reduction is associative
+    # over a stable sequence and Sequential-vs-parallel results are
+    # byte-identical (tasks may interleave, but the merge of partial
+    # reports is associative on counts/maxes; the failure list is
+    # canonicalized via sort below).
+    keys_vec = sort!(collect(all_keys))
+    n_total = length(keys_vec)
 
-    # Per-pair comparison.
-    pair_failures = NamedTuple[]
-    max_vol_rel = 0.0
-    max_mom_rel = 0.0
-    n_passed = 0
-    n_failed = 0
-
-    # First, surface all dropped pairs (in `o_float` but not `o_exact`).
-    for k in all_keys
-        ef = get(f_by_key, k, nothing)
-        ee = get(e_by_key, k, nothing)
-        if ef === nothing && ee !== nothing
-            # Exact-only pair (rare; would mean float dropped — not
-            # currently expected). Treat as a failure with kind = :float_missing.
-            n_failed += 1
-            vol = Float64(ee.volume)
-            max_vol_rel = max(max_vol_rel, _rel_diff(0.0, vol))
-            push!(pair_failures, (
-                lag_idx = Int(k[1]), eul_idx = Int(k[2]),
-                kind = :float_missing,
-                volume_diff = vol,
-                centroid_diff = 0.0,
-                got_float = nothing,
-                got_exact = (volume = ee.volume, centroid = ee.centroid),
-            ))
-        elseif ef !== nothing && ee === nothing
-            # Exact-backend dropped this pair (upstream IntExact bug or
-            # numerical degeneracy). The volume_diff is the float volume
-            # since the exact contribution is 0.
-            n_failed += 1
-            vol = Float64(ef.volume)
-            max_vol_rel = max(max_vol_rel, _rel_diff(vol, 0.0))
-            push!(pair_failures, (
-                lag_idx = Int(k[1]), eul_idx = Int(k[2]),
-                kind = :exact_dropped,
-                volume_diff = vol,
-                centroid_diff = 0.0,
-                got_float = (volume = ef.volume, centroid = ef.centroid),
-                got_exact = nothing,
-            ))
-        else
-            # Both backends produced the pair: compare.
-            vol_diff = abs(Float64(ef.volume) - Float64(ee.volume))
-            cent_diff = 0.0
-            for d in 1:D
-                cent_diff = max(cent_diff,
-                                abs(Float64(ef.centroid[d]) -
-                                    Float64(ee.centroid[d])))
-            end
-            vol_rel = _rel_diff(Float64(ef.volume), Float64(ee.volume))
-            max_vol_rel = max(max_vol_rel, vol_rel)
-            # Centroid comparison contributes to the moment metric.
-            max_mom_rel = max(max_mom_rel, vol_rel)
-
-            if vol_diff > atol || cent_diff > atol
-                n_failed += 1
-                kind = vol_diff > atol ? :volume_mismatch : :centroid_mismatch
-                push!(pair_failures, (
-                    lag_idx = Int(k[1]), eul_idx = Int(k[2]),
-                    kind = kind,
-                    volume_diff = vol_diff,
-                    centroid_diff = cent_diff,
-                    got_float = (volume = ef.volume, centroid = ef.centroid),
-                    got_exact = (volume = ee.volume, centroid = ee.centroid),
-                ))
-            else
-                n_passed += 1
-            end
-        end
+    if n_total == 0
+        return OverlapAuditReport(0, 0, 0, 0.0, 0.0, NamedTuple[])
     end
 
-    # Sort failures by descending volume_diff and cap.
+    eff_backend = backend === nothing ? HG.Threading.default_backend() : backend
+
+    init = OverlapAuditReport(0, 0, 0, 0.0, 0.0, NamedTuple[])
+
+    report = HG.Threading.parallel_mapreduce(
+        eff_backend,
+        k -> _audit_pair_partial(k, f_by_key, e_by_key, D, atol),
+        _merge_audit_reports,
+        keys_vec;
+        init = init,
+    )
+
+    # Sort failures by descending volume_diff and cap. The secondary sort
+    # key is `(lag_idx, eul_idx)` so the result is deterministic across
+    # backends even when several pairs tie on `volume_diff` (which is
+    # common — many `:exact_dropped` pairs land on the same lattice
+    # quantum).
+    pair_failures = report.failures
     if per_pair
-        sort!(pair_failures, by = f -> -f.volume_diff)
+        sort!(pair_failures,
+              by = f -> (-f.volume_diff, f.lag_idx, f.eul_idx))
         if length(pair_failures) > max_pair_diffs
             resize!(pair_failures, max_pair_diffs)
         end
@@ -735,8 +771,10 @@ function audit_overlap(lag, frame;
         empty!(pair_failures)
     end
 
-    return OverlapAuditReport(n_total, n_passed, n_failed,
-                              max_vol_rel, max_mom_rel, pair_failures)
+    return OverlapAuditReport(n_total, report.n_passed, report.n_failed,
+                              report.max_volume_relative_diff,
+                              report.max_moment_relative_diff,
+                              pair_failures)
 end
 
 # ============================================================================
@@ -760,7 +798,14 @@ function _verify_intexact_consistency()
     if get(ENV, "HG_INTEXACT_VERIFY", "1") != "1"
         return nothing
     end
-    report = audit_overlap()
+    # Force Sequential() for the module-load consistency check: the
+    # battery is tiny (9 polytopes), so the parallel overhead would
+    # dominate, and running parallel during `__init__` adds an
+    # opportunity for precompile-time task scheduling weirdness with no
+    # upside. Users who explicitly call `audit_overlap()` still get the
+    # default-backend parallel path.
+    HG = parentmodule(@__MODULE__)
+    report = audit_overlap(; backend = HG.Threading.Sequential())
     if report.n_failed > 0
         @error "IntExact consistency check failed at module load" report
         throw(ErrorException(
