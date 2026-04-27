@@ -10,10 +10,20 @@ R3D = "6888587b-6711-4ff3-8558-83329515e735"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
+[weakdeps]
+Hwloc = "0e44f5e4-bd66-52a0-8798-143a42290a1d"
+ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
+
+[extensions]
+HierarchicalGridsHwlocExt = "Hwloc"
+HierarchicalGridsThreadPinningExt = "ThreadPinning"
+
 [compat]
+Hwloc = "3"
 OhMyThreads = "0.8.5"
 R3D = "0.1.0"
 StaticArrays = "1"
+ThreadPinning = "1"
 julia = "1.10"
 
 [extras]

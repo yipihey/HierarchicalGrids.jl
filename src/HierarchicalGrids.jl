@@ -165,6 +165,12 @@ export FieldBufferPool, acquire_buffer!, release_buffer!, pool_stats
 export ScratchBuffer, with_scratch
 export Arena, allocate_in_arena, reset_arena!
 
+# Layer 3 (foundational): hardware introspection and thread-pinning façade.
+# Richer behavior comes from the Hwloc and ThreadPinning extensions.
+include("Hardware/Hardware.jl")
+using .Hardware
+export topology_summary, pin_threads!
+
 # Layer 3 (foundational): runtime diagnostics for self-consistency monitoring
 include("Diagnostics/Diagnostics.jl")
 using .Diagnostics

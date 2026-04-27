@@ -90,6 +90,10 @@ using HierarchicalGrids
         include("test_memory.jl")
     end
 
+    @testset "Layer 3 (foundational): Hardware façade" begin
+        include("test_hardware.jl")
+    end
+
     @testset "Layer 3 (foundational): Diagnostics" begin
         include("test_diagnostics.jl")
     end
