@@ -221,4 +221,8 @@ using HierarchicalGrids
     @testset "Integration tests" begin
         include("test_integration.jl")
     end
+
+    @testset "Examples (smoke): cfd_block_diffusion" begin
+        include("test_example_cfd_block_diffusion.jl")
+    end
 end
