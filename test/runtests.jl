@@ -229,4 +229,8 @@ using HierarchicalGrids
     @testset "Worked example: CFDPatchAMR (PR-16)" begin
         include("test_examples_cfd_patch_amr.jl")
     end
+
+    @testset "Phase 2 worked example: cell-based advection (PR-14)" begin
+        include("test_cfd_cell_advection.jl")
+    end
 end
