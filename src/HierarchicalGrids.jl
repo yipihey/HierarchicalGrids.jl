@@ -185,6 +185,10 @@ export SimplicialAABBTree, simplex_aabb, build_simplex_aabb_tree,
        query_aabb!, query_aabb, n_nodes
 export PairScratch, overlap_simplex_box!
 export IntPairScratch, overlap_simplex_box_exact!
+# IntExact quantization helpers (PR-2)
+export IntegerLattice, lat_resolution
+export quantize, quantize_strict, dequantize
+export unscale_volume, unscale_moment
 export compute_overlap, install_r3d_overlap!
 export RemapOperator, MassWeightedAverage, ConservativeFlux,
        TotalCovariance, TotalCumulants
