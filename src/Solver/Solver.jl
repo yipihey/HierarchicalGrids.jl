@@ -39,12 +39,15 @@ using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_bo
 using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
                     default_backend, parallel_foreach
 
+using OhMyThreads.TaskLocalValues: TaskLocalValue
+
 # ----------------------------------------------------------------------------
 # Includes
 # ----------------------------------------------------------------------------
 
 include("Views.jl")
 include("Orchestrators.jl")
+include("KernelContext.jl")
 
 # ----------------------------------------------------------------------------
 # Exports
@@ -53,5 +56,6 @@ include("Orchestrators.jl")
 export CellView, HaloView
 export ghost_depth, cell_view, halo_view_multi
 export for_each_cell!, for_each_face!
+export KernelContext
 
 end # module Solver

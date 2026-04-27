@@ -186,6 +186,10 @@ using HierarchicalGrids
         include("test_orchestrators_threading.jl")
     end
 
+    @testset "Phase 2 (Solver): KernelContext (PR-9)" begin
+        include("test_kernel_context.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end
