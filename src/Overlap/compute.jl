@@ -4,7 +4,11 @@
                      edge_kind::Symbol = :linear,
                      leaf_size::Integer = 8,
                      parallel::Bool = false,
-                     scheduler::Symbol = :dynamic) -> GeometricOverlap{D, T}
+                     scheduler::Symbol = :dynamic,
+                     backend::Symbol = :float,
+                     lattice::Union{Nothing, IntegerLattice{D}} = nothing,
+                     accumulator::Union{Type{<:Signed}, Nothing} = nothing,
+                     ) -> GeometricOverlap{D, T}
 
 Compute the full geometric overlap between a Lagrangian simplicial mesh
 and an Eulerian hierarchical mesh (wrapped in an `EulerianFrame` for
@@ -39,6 +43,27 @@ physical coordinates).
   `:greedy`, `:serial`). Only consulted when `parallel = true`. Default
   `:dynamic` for load balancing and composability with nested parallel
   calls.
+- `backend` — `:float` (default) routes the per-pair clip through r3djl's
+  Float64 backend (existing behavior). `:exact` routes through
+  `R3D.IntExact` via the `IntegerLattice` quantization helpers, returning
+  a `GeometricOverlap{D, Float64}` whose volumes/moments are dequantized
+  from exact-rational arithmetic. The `:exact` path requires
+  `T == Float64`. At `D = 4` the exact backend supports `moment_order = 0`
+  only (upstream `R3D.IntExact.moments_exact!` is not yet implemented at
+  D ≥ 4); the centroid stored in each `OverlapEntry` is a zero placeholder
+  in that case. At `D = 1` the `:float` path is already exact (closed-form
+  interval intersection), so `:exact` is rejected with a recommendation
+  to use `:float`.
+- `lattice` — optional `IntegerLattice{D}` controlling the quantization
+  grid for `backend = :exact`. When `nothing` (the default), an internal
+  lattice is auto-derived from the frame with `bits = 16` and
+  `int_type = (D == 4 ? Int64 : Int32)`. Must be `nothing` when
+  `backend = :float`.
+- `accumulator` — optional integer type for the exact-rational
+  accumulator passed to `overlap_simplex_box_exact!`. When `nothing`
+  (the default), `_default_accumulator(lattice.int_type, Val(D))`
+  decides (`Int128` for D=2/3 with `Int16`/`Int32` lattice, `BigInt`
+  for D=4 / wider lattices). Must be `nothing` when `backend = :float`.
 
 # Returns
 
@@ -69,7 +94,10 @@ function compute_overlap(lag::SimplicialMesh{D, T},
                           leaf_size::Integer = 8,
                           parallel::Bool = false,
                           scheduler::Symbol = :dynamic,
-                          frame_bcs::Union{Nothing, FrameBoundaries{D}} = nothing
+                          frame_bcs::Union{Nothing, FrameBoundaries{D}} = nothing,
+                          backend::Symbol = :float,
+                          lattice::Union{Nothing, IntegerLattice{D}} = nothing,
+                          accumulator::Union{Type{<:Signed}, Nothing} = nothing,
                           ) where {D, T}
     edge_kind === :linear ||
         throw(ArgumentError("edge_kind=$edge_kind not yet supported (:linear only). " *
@@ -77,6 +105,66 @@ function compute_overlap(lag::SimplicialMesh{D, T},
                              "but full polynomial remap requires r3djl higher-order moments " *
                              "(P ≥ 1) at D ≥ 4 (still pending). " *
                              "See src/Overlap/lifting.jl for status."))
+
+    # ------------------------------------------------------------------
+    # Backend validation
+    # ------------------------------------------------------------------
+    backend === :float || backend === :exact ||
+        throw(ArgumentError(
+            "compute_overlap: backend must be :float or :exact (got $(backend))"))
+
+    if backend === :float
+        lattice === nothing ||
+            throw(ArgumentError(
+                "compute_overlap: `lattice` is only valid when backend = :exact"))
+        accumulator === nothing ||
+            throw(ArgumentError(
+                "compute_overlap: `accumulator` is only valid when backend = :exact"))
+    else  # :exact
+        T === Float64 ||
+            throw(ArgumentError(
+                "compute_overlap: backend = :exact requires Float64 meshes/frame " *
+                "(got T = $(T)). The :exact path quantizes Float64 → integer " *
+                "lattice internally."))
+        D >= 2 ||
+            throw(ArgumentError(
+                "compute_overlap: backend = :exact is not supported at D = 1. " *
+                "The :float backend already uses closed-form interval " *
+                "intersection at D = 1 (bit-exact); use backend = :float."))
+        D <= 4 ||
+            throw(ArgumentError(
+                "compute_overlap: backend = :exact is not supported at D = $D. " *
+                "Currently supported: D = 2, 3 (full moments), D = 4 " *
+                "(volume only, moment_order = 0)."))
+        if D == 4 && moment_order != 0
+            throw(ArgumentError(
+                "compute_overlap: backend = :exact at D = 4 requires " *
+                "moment_order = 0 (got $(moment_order)). Upstream " *
+                "R3D.IntExact.moments_exact! is not yet implemented at D ≥ 4; " *
+                "only `volume_exact(D = 4)` ships."))
+        end
+        # Periodic-ghost interaction: defer for now. Quantizing a vertex
+        # that has been ghost-shifted by ±period can land outside the
+        # default lattice's representable range (the lattice is derived
+        # from the frame's interior). Rather than bake in lattice-padding
+        # logic that would silently change behavior, we error out and
+        # recommend :float — which already handles periodic ghosts
+        # correctly.
+        if frame_bcs !== nothing
+            for d in 1:D
+                if is_periodic_axis(frame_bcs, d)
+                    throw(ArgumentError(
+                        "compute_overlap: backend = :exact with periodic " *
+                        "frame_bcs is not yet supported. Periodic ghost " *
+                        "shifts can push vertices outside the auto-derived " *
+                        "lattice's representable range. Use backend = :float " *
+                        "for periodic ghost-overlap; both backends produce " *
+                        "the same result up to ~1e-16 relative error on " *
+                        "canonical polytopes (see test_exact_audit.jl)."))
+                end
+            end
+        end
+    end
 
     # PR-D + follow-up: when `frame_bcs` is `nothing` (the default), the
     # geometric path is identical to pre-PR-D code (single branch, zero
@@ -94,6 +182,46 @@ function compute_overlap(lag::SimplicialMesh{D, T},
     # Build the BVH over Lagrangian simplices (sequential — small).
     tree = build_simplex_aabb_tree(lag; leaf_size = Int(leaf_size))
     eul = frame.mesh
+
+    # ------------------------------------------------------------------
+    # :exact backend dispatch — auto-derive lattice/accumulator and run
+    # the integer pipeline. Always sequential for now; the exact path is
+    # not yet thread-safe for the Rational{BigInt} accumulator (BigInt
+    # allocations per call don't compose cleanly with the per-task
+    # builders). PR-D introduced a parallel float path; PR-3 keeps the
+    # exact path single-threaded until a follow-up profiles the threading
+    # overhead vs the BigInt allocation cost.
+    # ------------------------------------------------------------------
+    if backend === :exact
+        lat = lattice !== nothing ? lattice :
+              IntegerLattice(frame; bits = 16,
+                             int_type = (D == 4 ? Int64 : Int32))
+        # Default-accumulator pick: at the per-pair level
+        # `_default_accumulator(T, Val(D))` would suffice for the simple
+        # canonical polytopes audited by PR-4 (Int128 for D=2/3 with
+        # Int16/Int32 lattice). In the broader compute_overlap setting
+        # — where Lagrangian simplices clip against many leaf boxes
+        # whose corners can sit anywhere on the lattice — the polygon
+        # clipper accumulates positions_num × positions_den products
+        # whose subsequent moment-integration in Rational{Int128}
+        # arithmetic overflows for many clip configurations even at
+        # moment_order = 1. We therefore promote the default to
+        # `BigInt` when `moment_order >= 1`, which is bulletproof at the
+        # cost of ~5-10x slowdown vs Int128. Callers who know their
+        # geometry stays small can pass `accumulator = Int128`
+        # explicitly.
+        # `moment_order = 0` (volume-only) integrates only `twoa // 2`
+        # per polygon edge — the simpler 0-order recursion fits
+        # comfortably in `_default_accumulator` 's Int128 default and
+        # we keep that default in the volume-only case.
+        acc = accumulator !== nothing ? accumulator :
+              (moment_order == 0 ?
+               _default_accumulator(lat.int_type, Val(D)) :
+               BigInt)
+        return _compute_overlap_sequential_exact(lag, frame, tree,
+                                                  Int(moment_order),
+                                                  ghost_shifts, lat, acc)
+    end
 
     if !parallel || Threads.nthreads() == 1
         return _compute_overlap_sequential(lag, frame, tree, Int(moment_order),
@@ -230,6 +358,140 @@ function _compute_overlap_sequential(lag::SimplicialMesh{D, T},
     end
 
     return finalize_overlap(builder, n_simplices(lag), n_cells(eul))
+end
+
+# ----------------------------------------------------------------------------
+# :exact backend — sequential integer-rational pipeline.
+#
+# The per-pair flow:
+#
+#   1. Quantize the leaf box and the simplex's physical vertices onto
+#      the integer lattice.
+#   2. Call `overlap_simplex_box_exact!` → `Rational{R}` moments in
+#      the LATTICE-INTEGER coordinate frame. The 0th moment (volume)
+#      is translation-invariant; higher-degree moments are "in lattice
+#      coordinates", i.e. with origin at `lat.lo`.
+#   3. Convert each lattice-frame Rational moment back to Float64:
+#        - 0th moment   → `unscale_volume(m, lat)`             (physical
+#                          volume, scale-only undo).
+#        - degree-k ≥ 1 → `unscale_moment(m, lat, k)`          (lattice-
+#                          frame physical units, scale-only undo).
+#   4. Translate the resulting Float64 moments from the lattice frame
+#      (origin at `lat.lo`) to the physical frame (origin at 0) using
+#      `shift_moments!` with `Δ = -lat.lo`.
+#
+#      Why `Δ = -lat.lo`? `shift_moments!` implements
+#         M_new(a) = ∫ (x - x_new)^a dV = Σ binomial(a, b) (-Δ)^(a-b) M_old(b)
+#      where `Δ = x_new - x_old` is the shift of the origin. The lattice
+#      coordinate is `x_lat = x_phys - lat.lo`; the lattice-frame moments
+#      take `x_old = lat.lo` as their origin. To get physical-frame
+#      moments (origin at 0) we set `x_new = 0`, hence
+#         Δ = x_new - x_old = 0 - lat.lo = -lat.lo
+#
+# The centroid is recomputed from the shifted physical-frame moments
+# (entries 2..D+1 of the moment vector divided by the volume) when
+# `moment_order >= 1`; otherwise the centroid is a zero placeholder
+# (consistent with the float adapter's convention at order 0 and with
+# the D=4 P=0 limitation).
+# ----------------------------------------------------------------------------
+function _compute_overlap_sequential_exact(
+        lag::SimplicialMesh{D, Float64},
+        frame::EulerianFrame{D, Float64},
+        tree::SimplicialAABBTree{D, Float64},
+        moment_order::Int,
+        ghost_shifts::Union{Nothing, Vector{NTuple{D, Float64}}},
+        lat::IntegerLattice{D},
+        ::Type{R}) where {D, R<:Signed}
+    builder = OverlapBuilder{D, Float64}(moment_order)
+    scratch = IntPairScratch(Val(D), lat.int_type; capacity = 64)
+    n_phys = moments_length(D, moment_order)
+    int_moment_buf = Vector{Rational{R}}(undef, n_phys)
+    # Lattice-frame Float64 moments (after unscale, before shift).
+    lat_phys_buf = Vector{Float64}(undef, n_phys)
+    # Final physical-frame Float64 moments (after shift_moments!).
+    phys_moments = Vector{Float64}(undef, n_phys)
+    candidates = Int32[]; sizehint!(candidates, 64)
+
+    # Cache of per-flat-index total degrees for unscale_moment dispatch.
+    # `moment_multiindices` is cached at the moments.jl layer; we just
+    # precompute total degrees once.
+    multi = moment_multiindices(Int(D), moment_order)
+    total_degrees = ntuple_or_vec_degrees(multi)
+
+    # `Δ` in `shift_moments!`: lattice origin is `lat.lo` in physical
+    # coordinates; physical origin is 0. See block comment above.
+    delta = ntuple(d -> -lat.lo[d], Val(D))
+
+    eul = frame.mesh
+    @inbounds for ci in 1:n_cells(eul)
+        is_leaf(eul.cells[ci]) || continue
+        leaf_lo, leaf_hi = cell_physical_box(frame, ci)
+        empty!(candidates)
+        query_aabb!(candidates, tree, leaf_lo, leaf_hi)
+        if !isempty(candidates)
+            q_box_lo = quantize(leaf_lo, lat)
+            q_box_hi = quantize(leaf_hi, lat)
+            for s in candidates
+                verts = simplex_vertex_positions(lag, Int(s))
+                q_verts = ntuple(k -> quantize(verts[k], lat), Val(D + 1))
+                vol_rat, _centroid_rat, _out_rats =
+                    overlap_simplex_box_exact!(int_moment_buf, scratch,
+                                                 q_verts, q_box_lo, q_box_hi,
+                                                 moment_order;
+                                                 accumulator = R)
+                iszero(vol_rat) && continue
+                vol_phys = unscale_volume(vol_rat, lat)
+                vol_phys > 0.0 || continue
+
+                if D == 4 || moment_order == 0
+                    # Volume-only path: no shift needed; centroid is a
+                    # zero placeholder (consistent with the int adapter
+                    # and float-order-0 convention).
+                    phys_moments[1] = vol_phys
+                    centroid = ntuple(_ -> 0.0, Val(D))
+                    push_overlap!(builder, s, ci, vol_phys, centroid,
+                                  phys_moments)
+                else
+                    # 1) Unscale every Rational moment to Float64 in the
+                    #    LATTICE-coordinate frame.
+                    for k in 1:n_phys
+                        kdeg = total_degrees[k]
+                        lat_phys_buf[k] = unscale_moment(int_moment_buf[k],
+                                                          lat, kdeg)
+                    end
+                    # 2) Translate to the PHYSICAL-coordinate frame.
+                    shift_moments!(phys_moments, lat_phys_buf,
+                                   D, moment_order, delta)
+                    # 3) Centroid from physical-frame moments.
+                    centroid = ntuple(d -> phys_moments[d + 1] / vol_phys,
+                                      Val(D))
+                    push_overlap!(builder, s, ci, vol_phys, centroid,
+                                  phys_moments)
+                end
+            end
+        end
+
+        # No periodic-ghost path here: validation upstream rejects
+        # backend = :exact when any periodic axis is present in
+        # `frame_bcs`. `ghost_shifts` is therefore guaranteed to be
+        # `nothing` on this code path.
+    end
+
+    return finalize_overlap(builder, n_simplices(lag), n_cells(eul))
+end
+
+# Helper: extract the total degree of every multi-index in `multi` as a
+# plain `Vector{Int}` (faster than re-summing inside the hot loop).
+@inline function ntuple_or_vec_degrees(multi::Vector{Vector{Int}})
+    out = Vector{Int}(undef, length(multi))
+    @inbounds for k in eachindex(multi)
+        s = 0
+        for e in multi[k]
+            s += e
+        end
+        out[k] = s
+    end
+    return out
 end
 
 # Parallel implementation — chunks the Eulerian leaves across tasks, each
