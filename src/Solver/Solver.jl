@@ -42,7 +42,8 @@ using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView,
                  _layout_type_poly, _get_poly_coeff, _set_poly_coeff!,
                  n_elements, field_names, basis_of, n_coeffs_per_element
 using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_box,
-                  enumerate_leaves
+                  enumerate_leaves, compute_overlap, aabbs_overlap,
+                  GeometricOverlap, OverlapEntry
 using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
                     default_backend, parallel_foreach
 
@@ -57,6 +58,7 @@ include("BlockView.jl")
 include("Orchestrators.jl")
 include("KernelContext.jl")
 include("AdaptiveField.jl")
+include("PatchHierarchy.jl")
 
 # ----------------------------------------------------------------------------
 # Exports
@@ -67,5 +69,8 @@ export ghost_depth, cell_view, halo_view_multi, block_view, block_halo_view
 export for_each_cell!, for_each_face!, for_each_block!
 export KernelContext
 export AdaptiveField, dispose!
+export PatchHierarchy, PatchBoundaryBC, PatchView, PatchHaloView
+export add_patches!, n_levels, n_patches, patches_at, validate
+export for_each_patch!, restrict_to_parents!, prolong_from_parents!
 
 end # module Solver
