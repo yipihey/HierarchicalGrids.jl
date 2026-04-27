@@ -247,4 +247,20 @@ include("Mesh/AMR.jl")
 using .AMR
 export step_with_amr!
 
+# Phase 2 (CFD orchestration): solver-facing per-cell views. Depends on
+# Mesh (neighbor graph + level), BoundaryConditions, Storage (PolynomialFieldSet),
+# and Overlap (EulerianFrame, FrameBoundaries, cell_physical_box).
+#
+# Note: The Solver submodule defines a multi-field `HaloView` type that
+# coexists with the single-field `Storage.HaloView` introduced in PR-C.
+# Both are accessible via their submodules; we re-export `CellView` and
+# the new constructors at the top level but deliberately do NOT re-export
+# `Solver.HaloView` to avoid colliding with `Storage.HaloView`. Reach the
+# multi-field halo via `HierarchicalGrids.Solver.HaloView` (or
+# `using .Solver: HaloView` in user code).
+include("Solver/Solver.jl")
+using .Solver: CellView, ghost_depth, cell_view, halo_view_multi
+export CellView
+export ghost_depth, cell_view, halo_view_multi
+
 end # module HierarchicalGrids
