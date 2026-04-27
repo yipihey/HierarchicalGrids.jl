@@ -75,6 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diff is at the machine-precision floor (~1.33e-16). Module-load
   consistency check runs in `Diagnostics.__init__()`, gated by
   `ENV["HG_INTEXACT_VERIFY"]` (default on).
+- **`compute_overlap(..., backend = :exact)`**: `backend::Symbol` kwarg
+  routes the per-pair clip through `overlap_simplex_box_exact!` with
+  an auto-derived `IntegerLattice` and accumulator. Result is a
+  drop-in `GeometricOverlap{D, Float64}`. Default `:float` backend is
+  byte-identical to today. Performance: ~4.6× slowdown vs `:float` at
+  D=2 with `moment_order=1` and the BigInt-promoted default
+  accumulator. `D=4` is volume-only; `D=1` is rejected (use `:float`,
+  already exact); periodic ghosts under `:exact` are deferred.
 - **D=4 dispatch under the `:exact` backend** (volume-only): integer
   pentachoron and tesseract-tile-decomposition tests pass with exact
   rational volumes. Float `compute_overlap` continues to error at
@@ -101,6 +109,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `boundary_conditions.md`, `amr_driver.md`, `exact_backend.md`.
   Updated: `architecture.md`, `getting_started.md`, `extending.md`,
   `overlap.md` to cover the additions above.
+
+### Known limitations
+
+- `compute_overlap(..., backend = :exact)` is reliable on the
+  single-simplex / single-tet against unrefined-Eulerian envelope at
+  the default `bits = 16` lattice. Two upstream `R3D.IntExact`
+  issues constrain wider use: (a) `_moments_exact_d2!` can produce
+  `0//0` on shared-edge tile decompositions; (b) certain
+  triangle/refined-Eulerian combinations at `bits = 16` produce
+  systematic ~10–30% volume errors despite the audit battery
+  passing at machine precision. `audit_overlap` should be run
+  against your specific geometry before relying on the exact backend
+  for production. The float backend remains the recommendation for
+  general multi-simplex / refined-Eulerian use.
 
 ## [0.1.0] — 2026-04-26
 

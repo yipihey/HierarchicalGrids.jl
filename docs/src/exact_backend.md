@@ -371,22 +371,79 @@ in exact-rational form, not of this adapter.
 
 ## `compute_overlap(..., backend = :exact)`
 
-A `backend` keyword on `compute_overlap` is forthcoming and will route
-each per-pair clip through `overlap_simplex_box_exact!` with the
-lattice and accumulator chosen automatically. Until it lands, callers
-who want the exact path drive it directly via the recipe above:
+`compute_overlap` accepts a `backend::Symbol` keyword (default
+`:float`). Setting `backend = :exact` routes each per-pair clip
+through `overlap_simplex_box_exact!` with an `IntegerLattice` and
+accumulator chosen automatically:
 
-1. Construct an `IntegerLattice` from the `EulerianFrame`.
-2. Quantize each Lagrangian-simplex vertex and each Eulerian-leaf box
-   corner with `quantize`.
-3. Call `overlap_simplex_box_exact!` per pair.
-4. Map results back to physical units via `unscale_volume` / pair of
-   `unscale_moment` + `shift_moments!`.
+```julia
+overlap = compute_overlap(lag, frame; moment_order = 1, backend = :exact)
+```
 
-The float and exact paths are identically organized at the per-pair
-boundary, so this composition is straightforward; the convenience of
-the upcoming kwarg is in not having to wire the lattice and
-accumulator yourself.
+Optional kwargs `lattice::IntegerLattice` and `accumulator::Type{<:Signed}`
+override the auto-derived defaults. The default lattice uses
+`bits = 16` and `int_type = Int32` (or `Int64` for `D = 4`); the
+default accumulator is promoted to `BigInt` when `moment_order ≥ 1`
+since `Int128` overflows for many real-mesh clip configurations on
+the bits=16 lattice. Pass `accumulator = Int128` explicitly to opt
+into the smaller accumulator if your geometry stays within its
+envelope.
+
+The float and exact backends are organized identically at the
+per-pair boundary, so the resulting `GeometricOverlap{D, Float64}` is
+a drop-in for downstream consumers.
+
+### Constraints
+
+- `backend = :exact` requires `T == Float64` for both the
+  `SimplicialMesh` and the `EulerianFrame`.
+- `D = 1` is rejected; the float path's closed-form interval
+  intersection is already exact, so use `backend = :float`.
+- `D = 4` is volume-only — pass `moment_order = 0`. Higher moments
+  await upstream `R3D.IntExact.moments_exact!` support at `D ≥ 4`.
+- Periodic-ghost overlap (`frame_bcs` with periodic axes) is not yet
+  supported under `backend = :exact`. Use `:float`, which handles
+  periodic ghosts correctly — backend agreement stays at the
+  machine-precision floor on all canonical test polytopes.
+
+## Known limitations of the upstream IntExact path
+
+`R3D.IntExact` is a young, undocumented submodule of r3djl that ships
+no upstream tests; HG is its first consumer. Two concrete issues
+have been observed:
+
+1. **Degenerate-collinear clip outputs at `D = 2`**:
+   `R3D.IntExact._moments_exact_d2!` can produce `0//0` on shared-edge
+   tile decompositions where two triangles meet exactly along an
+   edge. Avoid such tilings by perturbing the shared edge by one
+   lattice step, or stick to the `:float` backend.
+
+2. **`D = 2` accuracy on arbitrary triangle / refined-Eulerian
+   configurations at `bits = 16`**: systematic ~10–30% volume errors
+   have been observed on certain combinations of Lagrangian triangle
+   orientation and Eulerian leaf placement, even though the audit
+   harness's canonical battery passes at machine precision. The
+   adapter's error envelope is well-characterized only for
+   single-simplex inside an unrefined Eulerian box; complex
+   compositions should be cross-checked against the float backend
+   via `audit_overlap` before relying on the result.
+
+3. **`D = 2` storage overflow at high bit counts**: at lattice
+   scales corresponding to `bits ≥ 24`, the polygon clip's
+   shared-denominator integer storage can overflow `Int64` even with
+   `accumulator = BigInt` — the storage type, not the accumulator,
+   is the bound. Stay at `bits = 16` (the default) unless you have a
+   specific reason to increase resolution and have audited the
+   geometry.
+
+The audit harness (`audit_overlap`) and the load-time
+`_verify_intexact_consistency` check pass on a curated battery of
+canonical polytopes, so HG ships the exact backend as opt-in with
+these caveats. For applications that need bit-exact reproducibility
+on the supported envelope (single-simplex / single-tet at
+`bits = 16`), the exact backend is reliable; for general
+multi-simplex / refined-Eulerian production use, the float backend
+remains the recommendation pending upstream IntExact maturation.
 
 ## See also
 
