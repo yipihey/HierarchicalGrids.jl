@@ -158,6 +158,10 @@ using HierarchicalGrids
         include("test_inter_frame_overlap.jl")
     end
 
+    @testset "Layer 4: FrameFaceCache (PR-2 face-list cache)" begin
+        include("test_frame_face_cache.jl")
+    end
+
     @testset "Layer 4: Polynomial remap" begin
         include("test_polynomial_remap.jl")
     end

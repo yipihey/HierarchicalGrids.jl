@@ -20,16 +20,25 @@ HierarchicalMesh itself, so the core mesh layer stays pure
 integer-relative geometry. Different applications can attach different
 physical frames to the same mesh.
 """
-struct EulerianFrame{D, T}
+mutable struct EulerianFrame{D, T}
     mesh::HierarchicalMesh{D}
     lo::NTuple{D, T}
     hi::NTuple{D, T}
+
+    # Lazily-built cache for `for_each_face!` interior + boundary face
+    # enumeration (PR-2 face-list cache). Loosely typed (`Any`) to avoid
+    # a forward-declaration / circular-include problem with the
+    # `FrameFaceCache{D}` type, which is defined in `frame_face_cache.jl`
+    # (included after this file). The cache machinery type-asserts on read.
+    # `nothing` means "not yet built or invalidated"; a `FrameFaceCache{D}`
+    # value means "valid for the current mesh topology".
+    _cached_face_cache::Any
 
     function EulerianFrame{D, T}(mesh::HierarchicalMesh{D}, lo::NTuple{D, T}, hi::NTuple{D, T}) where {D, T}
         for d in 1:D
             hi[d] > lo[d] || throw(ArgumentError("hi[$d] must exceed lo[$d] (got hi=$(hi[d]), lo=$(lo[d]))"))
         end
-        return new{D, T}(mesh, lo, hi)
+        return new{D, T}(mesh, lo, hi, nothing)
     end
 end
 

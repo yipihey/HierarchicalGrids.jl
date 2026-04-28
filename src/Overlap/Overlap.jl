@@ -84,6 +84,9 @@ export EulerianFrame, root_box, cell_unit_box, cell_physical_box, enumerate_leav
 # Boundary-condition companion (PR-D)
 export FrameBoundaries, bc
 
+# Face-list cache (PR-2)
+export FrameFaceCache, ensure_face_cache!
+
 export OverlapEntry, GeometricOverlap, OverlapBuilder
 export n_entries, moment_order, entries_for_lag, entries_for_eul, total_overlap_volume
 export push_overlap!, merge_builder!, finalize_overlap
@@ -135,6 +138,7 @@ export polynomial_remap_l_to_uniform_e!, polynomial_remap_uniform_e_to_l!
 
 include("frame.jl")
 include("frame_boundaries.jl")
+include("frame_face_cache.jl")
 include("moments.jl")
 include("data.jl")
 include("aabb.jl")
