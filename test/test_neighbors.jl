@@ -1,7 +1,8 @@
 using Test
 using HierarchicalGrids
 using HierarchicalGrids: face_neighbors, face_fine_neighbors,
-    build_neighbor_graph, ensure_neighbor_graph!
+    build_neighbor_graph, ensure_neighbor_graph!,
+    face_neighbors_with_bcs, FrameBoundaries, PERIODIC, OUTFLOW
 
 # ---------------------------------------------------------------------------
 # Brute-force reference: for each pair of leaves, decide adjacency by AABB
@@ -224,4 +225,98 @@ end
             end
         end
     end
+end
+
+@testset "face_neighbors_with_bcs cache: hit, invalidate, alloc-free" begin
+    # 2-level uniformly refined 2D mesh: 4 root children, then split each →
+    # 16 leaves arranged in a 4×4 grid on the unit square.
+    mesh = HierarchicalMesh{2}()
+    refine_cells!(mesh, [1])
+    refine_cells!(mesh,
+        [i for i in 1:n_cells(mesh) if HierarchicalGrids.is_leaf(mesh[i])])
+
+    bcs_xy = FrameBoundaries(((PERIODIC, PERIODIC), (PERIODIC, PERIODIC)))
+    bcs_x  = FrameBoundaries(((PERIODIC, PERIODIC), (OUTFLOW,  OUTFLOW)))
+
+    leaves = [i for i in 1:n_cells(mesh) if HierarchicalGrids.is_leaf(mesh[i])]
+
+    # First call builds + caches.
+    @test mesh._cached_bc_neighbor_table === nothing
+    nb1 = face_neighbors_with_bcs(mesh, leaves[1], bcs_xy)
+    @test mesh._cached_bc_neighbor_table !== nothing
+    cache_dict = mesh._cached_bc_neighbor_table
+    @test isa(cache_dict, Dict)
+    @test haskey(cache_dict, (true, true))
+    table_xy = cache_dict[(true, true)]
+    @test length(table_xy) == n_cells(mesh)
+
+    # Second call hits the cache: returns identical bytes and the table
+    # vector is the SAME object (===), confirming no rebuild.
+    nb2 = face_neighbors_with_bcs(mesh, leaves[1], bcs_xy)
+    @test nb1 === nb2
+    @test cache_dict[(true, true)] === table_xy
+
+    # Different mask → distinct cache entry, doesn't displace the (T,T) one.
+    face_neighbors_with_bcs(mesh, leaves[1], bcs_x)
+    @test haskey(cache_dict, (true, false))
+    @test cache_dict[(true, true)] === table_xy
+
+    # Doubly-periodic on a 4x4 mesh: the lo-x leaf at (0, 0) should wrap
+    # in -x to a hi-x leaf, and in -y to a hi-y leaf. Sanity-check the
+    # cache contents pointwise against the per-call function.
+    for i in leaves
+        @test face_neighbors_with_bcs(mesh, i, bcs_xy) === table_xy[Int(i)]
+    end
+
+    # Refinement invalidates: listener clears the cache slot.
+    refine_cells!(mesh, [leaves[1]])
+    @test mesh._cached_bc_neighbor_table === nothing
+
+    # Subsequent call rebuilds.
+    leaves2 = [i for i in 1:n_cells(mesh) if HierarchicalGrids.is_leaf(mesh[i])]
+    face_neighbors_with_bcs(mesh, leaves2[1], bcs_xy)
+    @test mesh._cached_bc_neighbor_table !== nothing
+    @test length(mesh._cached_bc_neighbor_table[(true, true)]) == n_cells(mesh)
+
+    # Allocation profile: warm-path call should not allocate (single
+    # table read + tuple return). Julia 1.10's narrower inference leaves
+    # a small residual; 1.11+ folds it away.
+    face_neighbors_with_bcs(mesh, leaves2[1], bcs_xy)  # warm
+    bytes = @allocated face_neighbors_with_bcs(mesh, leaves2[1], bcs_xy)
+    if VERSION >= v"1.11"
+        @test bytes == 0
+    else
+        @test bytes < 96
+    end
+end
+
+@testset "face_neighbors_with_bcs: result equality vs scratch build" begin
+    # Confirm the cache produces the same per-cell tuples as a fresh
+    # build over a few mesh shapes.
+    function fresh_build(mesh, mask)
+        # Direct call to the internal builder, bypassing the cache.
+        return HierarchicalGrids.Mesh._build_periodic_bc_table(mesh, mask)
+    end
+
+    # 2D 2-level uniform mesh, doubly periodic.
+    mesh = HierarchicalMesh{2}()
+    refine_cells!(mesh, [1])
+    refine_cells!(mesh,
+        [i for i in 1:n_cells(mesh) if HierarchicalGrids.is_leaf(mesh[i])])
+    bcs = FrameBoundaries(((PERIODIC, PERIODIC), (PERIODIC, PERIODIC)))
+    table_cached = HierarchicalGrids.Mesh._ensure_periodic_bc_table!(
+        mesh, (true, true))
+    table_fresh = fresh_build(mesh, (true, true))
+    @test table_cached == table_fresh
+
+    # Mixed BC: x-periodic only.
+    mesh2 = HierarchicalMesh{2}()
+    refine_cells!(mesh2, [1])
+    refine_cells!(mesh2,
+        [i for i in 1:n_cells(mesh2) if HierarchicalGrids.is_leaf(mesh2[i])])
+    table_x = HierarchicalGrids.Mesh._ensure_periodic_bc_table!(
+        mesh2, (true, false))
+    table_x_fresh = HierarchicalGrids.Mesh._build_periodic_bc_table(
+        mesh2, (true, false))
+    @test table_x == table_x_fresh
 end
