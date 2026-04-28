@@ -162,6 +162,10 @@ using HierarchicalGrids
         include("test_frame_face_cache.jl")
     end
 
+    @testset "Layer 4: Physical-AABB cache" begin
+        include("test_physical_box_cache.jl")
+    end
+
     @testset "Layer 4: Polynomial remap" begin
         include("test_polynomial_remap.jl")
     end

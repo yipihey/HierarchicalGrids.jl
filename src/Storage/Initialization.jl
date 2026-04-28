@@ -36,7 +36,7 @@ using ..Quadrature: QuadRule, n_quad_points,
 using ..Storage: PolynomialFieldSet, basis_of, n_elements, n_coeffs_per_element
 using ..Mesh: SimplicialMesh, n_simplices, simplex_vertex_positions
 import ..Mesh
-using ..Overlap: EulerianFrame, cell_physical_box
+using ..Overlap: EulerianFrame, cell_physical_box, ensure_physical_boxes!
 using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
                    default_backend, parallel_foreach
 
@@ -199,6 +199,7 @@ function init_field_from!(field::PolynomialFieldSet,
     # fanning out — the cache machinery is not thread-safe under
     # concurrent first-access, so we touch it serially first.
     Mesh.ensure_caches!(frame.mesh)
+    ensure_physical_boxes!(frame)
     # Per-task scratch: each task gets its own RHS vector + mass-matrix
     # working copy so the per-cell allocations happen once per task on
     # first touch, not once per cell.

@@ -50,6 +50,7 @@ using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_bo
                   GeometricOverlap, OverlapEntry,
                   moments_length, moment_multiindices,
                   FrameFaceCache, ensure_face_cache!,
+                  ensure_physical_boxes!,
                   AxisAlignedRef,
                   reference_to_physical_pullback, reference_mass_matrix
 using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
