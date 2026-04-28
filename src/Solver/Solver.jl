@@ -49,7 +49,9 @@ using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_bo
                   enumerate_leaves, compute_overlap, aabbs_overlap,
                   GeometricOverlap, OverlapEntry,
                   moments_length, moment_multiindices,
-                  FrameFaceCache, ensure_face_cache!
+                  FrameFaceCache, ensure_face_cache!,
+                  AxisAlignedRef,
+                  reference_to_physical_pullback, reference_mass_matrix
 using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
                     default_backend, parallel_foreach
 

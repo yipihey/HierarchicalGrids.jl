@@ -595,7 +595,34 @@ function for_each_patch!(kernel, fields_out::Vector,
 end
 
 # ----------------------------------------------------------------------------
-# Restrict and prolong (degree-0 only — first cut)
+# Restrict and prolong
+#
+# Degree-0 path: conservative volume-weighted average — bit-identical to
+# the original first-cut implementation (kept on a fast branch keyed on
+# `n_coeffs == 1`).
+#
+# Degree ≥ 1 path: full L²-projection through each fine cell's polynomial
+# reconstruction. For each (parent cell P, child cell C) overlap entry the
+# RHS contribution is
+#
+#     b_P[α] += Σ_γ U_P[α, γ] · Σ_δ (Σ_ρ c_C[ρ] T_C[ρ, δ]) · M_{γ+δ}
+#
+# where T_C is the child's reference→physical pullback, U_P is the parent's
+# reference→physical pullback, and M_{γ+δ} is the entry's moment of order
+# `γ + δ` in physical coordinates (provided by `compute_overlap` at
+# `moment_order ≥ 2P`). Solving `(|J_P| · M_ref) · c_P = b_P` per parent
+# cell gives the L²-projection of the union of fine reconstructions onto
+# the parent's polynomial basis.
+#
+# The cross mass matrix `M_{P, C}` is implicit in the per-entry moment
+# vector × pullback product; we never materialize it. Caching this
+# moment-times-pullback product per (fine_leaf, parent_leaf) pair is
+# DEFERRED — the comment in the plan flags this as a future optimization.
+#
+# BernsteinBasis fields: route through `change_basis(MonomialBasis,
+# BernsteinBasis, ...)` to monomial form, run the projection in monomial
+# space, then `change_basis(BernsteinBasis, MonomialBasis, ...)` back.
+# Mirrors the AdaptiveField Bernstein path (PR-4).
 # ----------------------------------------------------------------------------
 
 # Find, for each leaf in `dst_frame`, the leaf in `src_frame` whose
@@ -634,26 +661,358 @@ function _largest_overlap_source_leaf(src_frame::EulerianFrame{D, T},
     return out
 end
 
+# Pull (D, P) out of a polynomial basis. Supported here for the bases that
+# carry an explicit `(D, P)` parameter pair. Other bases hit the fallback
+# branch (degree-0 fast path or — for degree ≥ 1 — a clear error).
+@inline _patch_basis_dim_degree(::MonomialBasis{D, P}) where {D, P} = (D, P)
+@inline _patch_basis_dim_degree(::BernsteinBasis{D, P}) where {D, P} = (D, P)
+
+# Build a (n_coeffs, n_cells) coefficient matrix from a `PolynomialFieldView`.
+# Each column is the polynomial-coefficient vector of one cell. The matrix
+# uses `Float64` for accumulation (parent mass-matrix solves promote to
+# `Float64` regardless of the field's storage type, matching `AdaptiveField`'s
+# convention). For BernsteinBasis fields, columns hold MONOMIAL coefficients
+# (we apply `change_basis` per column on extraction).
+function _read_field_coeffs_monomial(field, basis, ::Val{D}, P::Int,
+                                       n_cells_total::Int) where {D}
+    nc = binomial(D + P, P)
+    out = zeros(Float64, nc, n_cells_total)
+    if basis isa MonomialBasis
+        @inbounds for i in 1:n_cells_total
+            pv = _coeffs_for_cell(field, i)
+            for k in 1:nc
+                out[k, i] = Float64(pv[k])
+            end
+        end
+        return out
+    elseif basis isa BernsteinBasis
+        mono_basis = MonomialBasis{D, P}()
+        bern_buf = Vector{Float64}(undef, nc)
+        @inbounds for i in 1:n_cells_total
+            pv = _coeffs_for_cell(field, i)
+            for k in 1:nc
+                bern_buf[k] = Float64(pv[k])
+            end
+            mono_vec = change_basis(mono_basis, basis, bern_buf)
+            for k in 1:nc
+                out[k, i] = mono_vec[k]
+            end
+        end
+        return out
+    end
+    error("_read_field_coeffs_monomial: unsupported basis $(typeof(basis))")
+end
+
+# Write monomial-form coefficients into one cell of a `PolynomialFieldView`.
+# For `BernsteinBasis` fields, converts back via `change_basis` first.
+@inline function _write_cell_coeffs_from_monomial!(field, basis, cell::Int,
+                                                     mono_coeffs)
+    pv = _coeffs_for_cell(field, cell)
+    nc = length(pv)
+    if basis isa MonomialBasis
+        @inbounds for k in 1:nc
+            pv[k] = mono_coeffs[k]
+        end
+        return
+    elseif basis isa BernsteinBasis
+        D, P = _patch_basis_dim_degree(basis)
+        mono_basis = MonomialBasis{D, P}()
+        bern_coeffs = change_basis(basis, mono_basis, mono_coeffs)
+        @inbounds for k in 1:nc
+            pv[k] = bern_coeffs[k]
+        end
+        return
+    end
+    error("_write_cell_coeffs_from_monomial!: unsupported basis $(typeof(basis))")
+end
+
+# Per-pair RHS accumulator for restrict/prolong. Adds to `rhs[α, j]` the
+# L²-projection contribution of every overlap entry, where source = i,
+# destination = j. Mirrors `_accumulate_polynomial_rhs_kernel!` in
+# `polynomial_remap.jl` but does NOT zero `rhs` first (so callers can
+# accumulate over multiple `(src_frame, dst_frame)` pairs).
+function _accumulate_restrict_prolong_rhs!(rhs::Matrix{Float64},
+                                            src_coeffs::Matrix{Float64},
+                                            src_pullbacks::Vector{Matrix{Float64}},
+                                            dst_pullbacks::Vector{Matrix{Float64}},
+                                            overlap::GeometricOverlap{D, Float64},
+                                            P_src::Int, P_dst::Int,
+                                            invert::Bool, ::Val{D}) where {D}
+    n_src = moments_length(D, P_src)
+    n_dst = moments_length(D, P_dst)
+    multi_src = moment_multiindices(D, P_src)
+    multi_dst = moment_multiindices(D, P_dst)
+    multi_phys = moment_multiindices(D, P_src + P_dst)
+    lookup = Matrix{Int}(undef, n_dst, n_src)
+    @inbounds for γi in 1:n_dst, δi in 1:n_src
+        # Per-axis sum of the multi-indices; convert to flat index in multi_phys.
+        target = ntuple(d -> multi_dst[γi][d] + multi_src[δi][d], D)
+        # Linear search in multi_phys.
+        idx = 0
+        for k in eachindex(multi_phys)
+            ok = true
+            for d in 1:D
+                if multi_phys[k][d] != target[d]
+                    ok = false; break
+                end
+            end
+            if ok
+                idx = k; break
+            end
+        end
+        lookup[γi, δi] = idx
+    end
+    Pi_buf = Vector{Float64}(undef, n_src)
+    @inbounds for entry in overlap.entries
+        i = invert ? Int(entry.eul_idx) : Int(entry.lag_idx)
+        j = invert ? Int(entry.lag_idx) : Int(entry.eul_idx)
+        src_pull = src_pullbacks[i]
+        for δ in 1:n_src
+            v = 0.0
+            for α in 1:n_src
+                v += src_coeffs[α, i] * src_pull[α, δ]
+            end
+            Pi_buf[δ] = v
+        end
+        dst_pull = dst_pullbacks[j]
+        for α in 1:n_dst
+            acc = 0.0
+            for γ in 1:n_dst
+                u = dst_pull[α, γ]
+                u == 0.0 && continue
+                inner = 0.0
+                for δ in 1:n_src
+                    inner += Pi_buf[δ] * Float64(entry.moments[lookup[γ, δ]])
+                end
+                acc += u * inner
+            end
+            rhs[α, j] += acc
+        end
+    end
+    return rhs
+end
+
+# Solve `(|J_dst| · M_ref) c = b` for every destination cell whose
+# `covered[j]` flag is true. Writes the resulting monomial coefficients into
+# `dst_field` at column `j`. For BernsteinBasis fields converts back.
+function _solve_and_write_dst!(dst_field, dst_basis,
+                                 dst_frames::Vector{AxisAlignedRef{D, Float64}},
+                                 rhs::Matrix{Float64},
+                                 covered::Vector{Bool},
+                                 P_dst::Int, ::Val{D}) where {D}
+    n_dst = moments_length(D, P_dst)
+    coeff_buf = Vector{Float64}(undef, n_dst)
+    @inbounds for j in eachindex(covered)
+        covered[j] || continue
+        M_ref = reference_mass_matrix(dst_frames[j], P_dst)
+        # |J_dst| = product of edge lengths for axis-aligned ref.
+        jac = 1.0
+        f = dst_frames[j]
+        for d in 1:D
+            jac *= (f.hi[d] - f.lo[d])
+        end
+        Mscaled = jac .* M_ref
+        b = rhs[:, j]
+        coeff_buf .= Mscaled \ b
+        _write_cell_coeffs_from_monomial!(dst_field, dst_basis, j, coeff_buf)
+    end
+    return nothing
+end
+
+# Build axis-aligned reference frames for every cell of an EulerianFrame.
+# Non-leaf cells get a placeholder zero-volume frame; their pullbacks /
+# mass matrices are never read (the `covered` mask gates writes, and only
+# leaves contribute overlap entries).
+function _build_axisaligned_refs(frame::EulerianFrame{D, Float64}) where {D}
+    Mesh.ensure_caches!(frame.mesh)
+    n = n_cells(frame.mesh)
+    refs = Vector{AxisAlignedRef{D, Float64}}(undef, n)
+    placeholder = AxisAlignedRef{D, Float64}(ntuple(_ -> 0.0, Val(D)),
+                                              ntuple(_ -> 1.0, Val(D)))
+    @inbounds for i in 1:n
+        if is_leaf(frame.mesh.cells[i])
+            lo, hi = cell_physical_box(frame, i)
+            refs[i] = AxisAlignedRef{D, Float64}(lo, hi)
+        else
+            refs[i] = placeholder
+        end
+    end
+    return refs
+end
+
+# Degree-0 fast path for restrict — bit-identical to the original implementation.
+function _restrict_to_parents_degree0!(fields_out_parent::Vector,
+                                         fields_in_fine::Vector,
+                                         parents::Vector{EulerianFrame{D, T}},
+                                         fines::Vector{EulerianFrame{D, T}},
+                                         fieldname::Symbol) where {D, T}
+    for (par_i, par_frame) in enumerate(parents)
+        Mesh.ensure_caches!(par_frame.mesh)
+        n_par = n_cells(par_frame.mesh)
+        sum_val = zeros(Float64, n_par)
+        sum_vol = zeros(Float64, n_par)
+
+        for (fine_i, fine_frame) in enumerate(fines)
+            _box_inside(fine_frame.lo, fine_frame.hi,
+                         par_frame.lo, par_frame.hi) || continue
+            ov = compute_overlap(fine_frame, par_frame; moment_order = 0,
+                                  parallel = false)
+            fine_pfs = fields_in_fine[fine_i]
+            fine_field = getfield(fine_pfs, fieldname)
+            @inbounds for entry in ov.entries
+                fl = Int(entry.lag_idx)
+                pl = Int(entry.eul_idx)
+                pv = _coeffs_for_cell(fine_field, fl)
+                c0 = Float64(pv[1])
+                v = Float64(entry.volume)
+                sum_val[pl] += c0 * v
+                sum_vol[pl] += v
+            end
+        end
+
+        par_pfs = fields_out_parent[par_i]
+        par_field = getfield(par_pfs, fieldname)
+        @inbounds for ci in 1:n_par
+            sum_vol[ci] > 0.0 || continue
+            mean_val = sum_val[ci] / sum_vol[ci]
+            pv = _coeffs_for_cell(par_field, ci)
+            nc = length(pv)
+            pv[1] = mean_val
+            for k in 2:nc
+                pv[k] = zero(typeof(pv[k]))
+            end
+        end
+    end
+    return nothing
+end
+
+# Higher-order (P ≥ 1) restrict for one parent patch. Accumulates the
+# L²-projection RHS over every fine patch contained in this parent, then
+# solves for every parent cell with positive coverage. Cells with no
+# coverage retain their pre-call values.
+function _restrict_higher_order_one_parent!(par_frame::EulerianFrame{D, Float64},
+                                              par_pfs_field, par_basis,
+                                              par_pullbacks::Vector{Matrix{Float64}},
+                                              par_refs::Vector{AxisAlignedRef{D, Float64}},
+                                              fines::Vector{EulerianFrame{D, Float64}},
+                                              fields_in_fine::Vector,
+                                              fieldname::Symbol,
+                                              ::Val{D}, P::Int) where {D}
+    n_par = n_cells(par_frame.mesh)
+    n_dst = moments_length(D, P)
+    rhs = zeros(Float64, n_dst, n_par)
+    covered = fill(false, n_par)
+    moment_ord = 2 * P
+
+    for (fine_i, fine_frame) in enumerate(fines)
+        _box_inside(fine_frame.lo, fine_frame.hi,
+                     par_frame.lo, par_frame.hi) || continue
+        ov = compute_overlap(fine_frame, par_frame;
+                              moment_order = moment_ord, parallel = false)
+        isempty(ov.entries) && continue
+
+        fine_pfs_view = fields_in_fine[fine_i]
+        fine_field = getfield(fine_pfs_view, fieldname)
+        # Resolve the underlying PolynomialFieldSet for basis access.
+        fine_basis = fine_field.pfs.basis
+        n_fine_total = n_cells(fine_frame.mesh)
+        fine_coeffs = _read_field_coeffs_monomial(fine_field, fine_basis,
+                                                    Val(D), P, n_fine_total)
+        fine_refs = _build_axisaligned_refs(fine_frame)
+        fine_pullbacks = [reference_to_physical_pullback(f, P) for f in fine_refs]
+
+        # Accumulate this fine patch's contribution to the parent RHS.
+        # `compute_overlap(fine_frame, par_frame)` yields entries with
+        # lag_idx = fine_leaf, eul_idx = parent_leaf, so invert = false.
+        _accumulate_restrict_prolong_rhs!(rhs, fine_coeffs,
+                                            fine_pullbacks, par_pullbacks,
+                                            ov, P, P, false, Val(D))
+        @inbounds for entry in ov.entries
+            covered[Int(entry.eul_idx)] = true
+        end
+    end
+
+    _solve_and_write_dst!(par_pfs_field, par_basis, par_refs, rhs,
+                            covered, P, Val(D))
+    return nothing
+end
+
+# Higher-order (P ≥ 1) prolong for one fine patch. Reads from the (already
+# selected) parent patch and writes every fine cell that overlaps it.
+function _prolong_higher_order_one_fine!(par_frame::EulerianFrame{D, Float64},
+                                           par_pfs_field, par_basis,
+                                           fine_frame::EulerianFrame{D, Float64},
+                                           fine_pfs_field, fine_basis,
+                                           ::Val{D}, P::Int) where {D}
+    moment_ord = 2 * P
+    # `compute_overlap(fine_frame, par_frame)` puts fine_leaf in lag_idx,
+    # parent_leaf in eul_idx. For prolong (parent → fine) we want the
+    # source = parent (eul_idx) and destination = fine (lag_idx), so we
+    # invoke the kernel with `invert = true`.
+    ov = compute_overlap(fine_frame, par_frame;
+                          moment_order = moment_ord, parallel = false)
+    isempty(ov.entries) && return nothing
+
+    n_fine = n_cells(fine_frame.mesh)
+    n_par = n_cells(par_frame.mesh)
+    n_dst = moments_length(D, P)
+
+    par_coeffs = _read_field_coeffs_monomial(par_pfs_field, par_basis,
+                                               Val(D), P, n_par)
+    par_refs = _build_axisaligned_refs(par_frame)
+    par_pullbacks = [reference_to_physical_pullback(f, P) for f in par_refs]
+    fine_refs = _build_axisaligned_refs(fine_frame)
+    fine_pullbacks = [reference_to_physical_pullback(f, P) for f in fine_refs]
+
+    rhs = zeros(Float64, n_dst, n_fine)
+    covered = fill(false, n_fine)
+    _accumulate_restrict_prolong_rhs!(rhs, par_coeffs, par_pullbacks,
+                                        fine_pullbacks, ov, P, P, true, Val(D))
+    @inbounds for entry in ov.entries
+        covered[Int(entry.lag_idx)] = true
+    end
+
+    _solve_and_write_dst!(fine_pfs_field, fine_basis, fine_refs, rhs,
+                            covered, P, Val(D))
+    return nothing
+end
+
 """
     restrict_to_parents!(fields_out_parent, fields_in_fine,
                           ph::PatchHierarchy{D, T}; level::Int,
                           fieldname::Symbol = :rho) where {D, T}
 
-Conservative degree-0 restriction: for every parent-level cell that is
-covered by one or more fine patches at `level`, set its constant
-coefficient to the volume-weighted average of the fine cells covering it.
+L²-projection restriction (fine → coarse): for every parent-level cell at
+`level - 1` that is covered by one or more fine patches at `level`,
+overwrite its polynomial coefficients with the L²-projection of the union
+of fine reconstructions onto the parent's polynomial basis. Parent cells
+with no fine-patch coverage are left unchanged.
 
 `fields_out_parent` is a `Vector{NamedTuple}` over patches at `level - 1`;
 each element holds the parent patch's writable fields. `fields_in_fine`
-is the same shape over patches at `level`. Parent cells with no fine-
-patch coverage are left unchanged.
+is the same shape over patches at `level`.
 
-Only the constant coefficient (index 1) is touched; higher-order
-coefficients on the parent side are zeroed within the touched cells. For
-a degree-0 source basis this is the conservative volume-weighted mean.
+# Polynomial degree
 
-Higher-degree restriction (P ≥ 1) is deferred — wire it through
-`polynomial_remap_l_to_e!` when needed.
+The polynomial degree `P` is auto-detected from the basis carried by the
+input fields. For degree-0 fields the implementation reduces to the
+conservative volume-weighted mean (bit-identical to the legacy first-cut
+behaviour). For `MonomialBasis{D, P}` and `BernsteinBasis{D, P}` with
+`P ≥ 1` the projection preserves all moments up to degree P exactly
+(modulo round-off): a polynomial reconstruction in the fine union projects
+onto the parent's polynomial space without information loss to that order.
+
+The cross mass matrix entries are read from the inter-frame `compute_overlap`
+output at `moment_order = 2P` (the projection requires moments up to
+degree P_src + P_dst). For BernsteinBasis fields the projection runs in
+monomial coordinates via `change_basis`, mirroring the AdaptiveField path.
+
+# Determinism
+
+The per-pair `compute_overlap` is invoked with `parallel = false` for
+deterministic accumulation. The mass-matrix solve is per-cell and depends
+only on that cell's own RHS, so the result is byte-equal across thread
+counts.
 """
 function restrict_to_parents!(fields_out_parent::Vector,
                                 fields_in_fine::Vector,
@@ -674,47 +1033,83 @@ function restrict_to_parents!(fields_out_parent::Vector,
                              "$(length(fields_in_fine)) entries, expected " *
                              "$(length(fines))"))
 
-    # For each parent patch, accumulate (sum_of_value_weighted_volume,
-    # sum_of_volume) per parent cell from every fine patch it parents.
+    # Detect the polynomial degree from the parent field. (All patches in
+    # the hierarchy must share the same basis; we pick the first parent's
+    # field as the reference.)
+    if isempty(parents) || isempty(fields_out_parent)
+        return nothing
+    end
+    par_field0 = getfield(fields_out_parent[1], fieldname)
+    par_basis = par_field0.pfs.basis
+    nc = n_coeffs(par_basis)
+
+    if nc == 1
+        # Degree-0 fast path: bit-identical to the original implementation.
+        return _restrict_to_parents_degree0!(fields_out_parent,
+                                              fields_in_fine,
+                                              parents, fines, fieldname)
+    end
+
+    # Higher-order path. Validate basis compatibility and that we know how
+    # to extract (D, P) from it.
+    if !(par_basis isa MonomialBasis) && !(par_basis isa BernsteinBasis)
+        throw(ArgumentError(
+            "restrict_to_parents!: basis $(typeof(par_basis)) at degree ≥ 1 " *
+            "is not supported. Use MonomialBasis or BernsteinBasis, or " *
+            "convert via change_basis first."))
+    end
+    Db, P = _patch_basis_dim_degree(par_basis)
+    Db == D ||
+        throw(ArgumentError("restrict_to_parents!: basis dimension $Db ≠ " *
+                             "PatchHierarchy dimension $D"))
+    P >= 1 || error("restrict_to_parents!: degree-0 fast path missed (n_coeffs=$nc)")
+
+    # Float64 promotion is enforced by the underlying Overlap / pullback
+    # machinery (compute_overlap is Float64-only at the EulerianFrame
+    # signature). Reject non-Float64 patch hierarchies cleanly.
+    T === Float64 ||
+        throw(ArgumentError(
+            "restrict_to_parents!: degree-≥1 path requires Float64 " *
+            "patch hierarchies (got T=$T). Use Float64 frames or stay at degree 0."))
+
     for (par_i, par_frame) in enumerate(parents)
-        Mesh.ensure_caches!(par_frame.mesh)
-        n_par = n_cells(par_frame.mesh)
-        sum_val = zeros(Float64, n_par)
-        sum_vol = zeros(Float64, n_par)
+        par_pfs_view = fields_out_parent[par_i]
+        par_field = getfield(par_pfs_view, fieldname)
+        par_refs = _build_axisaligned_refs(par_frame)
+        par_pullbacks = [reference_to_physical_pullback(f, P) for f in par_refs]
+        _restrict_higher_order_one_parent!(par_frame, par_field, par_basis,
+                                            par_pullbacks, par_refs,
+                                            fines, fields_in_fine, fieldname,
+                                            Val(D), P)
+    end
+    return nothing
+end
 
-        for (fine_i, fine_frame) in enumerate(fines)
-            # Only descendants of this parent contribute.
-            _box_inside(fine_frame.lo, fine_frame.hi,
-                         par_frame.lo, par_frame.hi) || continue
-            # Compute the inter-frame overlap; the GeometricOverlap entries
-            # are keyed (lag_idx = fine_leaf, eul_idx = parent_leaf).
-            ov = compute_overlap(fine_frame, par_frame; moment_order = 0,
-                                  parallel = false)
-            fine_pfs = fields_in_fine[fine_i]
-            fine_field = getfield(fine_pfs, fieldname)
-            @inbounds for entry in ov.entries
-                fl = Int(entry.lag_idx)
-                pl = Int(entry.eul_idx)
-                # Read the constant coefficient of the fine cell.
-                pv = _coeffs_for_cell(fine_field, fl)
-                c0 = Float64(pv[1])
-                v = Float64(entry.volume)
-                sum_val[pl] += c0 * v
-                sum_vol[pl] += v
-            end
-        end
-
-        # Write parent constant coefficients for every covered cell.
-        par_pfs = fields_out_parent[par_i]
+# Degree-0 fast path for prolong — bit-identical to the original implementation.
+function _prolong_from_parents_degree0!(fields_out_fine::Vector,
+                                          fields_in_parent::Vector,
+                                          parents::Vector{EulerianFrame{D, T}},
+                                          fines::Vector{EulerianFrame{D, T}},
+                                          fieldname::Symbol) where {D, T}
+    for (fine_i, fine_frame) in enumerate(fines)
+        ppi = _find_parent_patch(parents, fine_frame)
+        ppi == 0 && continue
+        par_frame = parents[ppi]
+        mapping = _largest_overlap_source_leaf(par_frame, fine_frame)
+        par_pfs = fields_in_parent[ppi]
         par_field = getfield(par_pfs, fieldname)
-        @inbounds for ci in 1:n_par
-            sum_vol[ci] > 0.0 || continue
-            mean_val = sum_val[ci] / sum_vol[ci]
-            pv = _coeffs_for_cell(par_field, ci)
-            nc = length(pv)
-            pv[1] = mean_val
+        fine_pfs = fields_out_fine[fine_i]
+        fine_field = getfield(fine_pfs, fieldname)
+        @inbounds for ci in 1:length(mapping)
+            par_leaf = mapping[ci]
+            par_leaf == 0 && continue
+            par_pv = _coeffs_for_cell(par_field, par_leaf)
+            c0 = par_pv[1]
+            fine_pv = _coeffs_for_cell(fine_field, ci)
+            nc = length(fine_pv)
+            fine_pv[1] = c0
             for k in 2:nc
-                pv[k] = zero(typeof(pv[k]))
+                fine_pv[k] = zero(typeof(fine_pv[k]))
             end
         end
     end
@@ -726,12 +1121,19 @@ end
                            ph::PatchHierarchy{D, T}; level::Int,
                            fieldname::Symbol = :rho) where {D, T}
 
-Constant prolongation: every fine cell at `level` inherits its parent
-cell's constant coefficient (the parent cell with the largest overlap).
-Higher-order coefficients on the fine side are zeroed.
+L²-projection prolongation (coarse → fine): every fine cell at `level`
+receives the L²-projection of the polynomial reconstruction in its
+covering parent cell, restricted to the fine cell's geometry.
 
-Higher-degree prolongation is deferred — wire through
-`polynomial_remap_e_to_l!` when needed.
+For degree-0 fields the implementation reduces to the legacy "fine cell
+inherits the parent cell's constant coefficient (largest-overlap parent)"
+path — bit-identical. For `MonomialBasis{D, P}` and `BernsteinBasis{D, P}`
+with `P ≥ 1` the prolongation preserves the parent's polynomial
+reconstruction within each fine cell exactly (modulo round-off).
+
+Higher-order coefficients on the fine side are zeroed for cells with no
+parent overlap (mirrors the degree-0 behaviour); cells with overlap get
+their full coefficient vector overwritten by the projection result.
 """
 function prolong_from_parents!(fields_out_fine::Vector,
                                  fields_in_parent::Vector,
@@ -752,28 +1154,45 @@ function prolong_from_parents!(fields_out_fine::Vector,
                              "$(length(fields_in_parent)) entries, expected " *
                              "$(length(parents))"))
 
+    if isempty(fines) || isempty(fields_out_fine)
+        return nothing
+    end
+    fine_field0 = getfield(fields_out_fine[1], fieldname)
+    fine_basis = fine_field0.pfs.basis
+    nc = n_coeffs(fine_basis)
+
+    if nc == 1
+        return _prolong_from_parents_degree0!(fields_out_fine,
+                                                fields_in_parent,
+                                                parents, fines, fieldname)
+    end
+
+    if !(fine_basis isa MonomialBasis) && !(fine_basis isa BernsteinBasis)
+        throw(ArgumentError(
+            "prolong_from_parents!: basis $(typeof(fine_basis)) at degree ≥ 1 " *
+            "is not supported. Use MonomialBasis or BernsteinBasis, or " *
+            "convert via change_basis first."))
+    end
+    Db, P = _patch_basis_dim_degree(fine_basis)
+    Db == D ||
+        throw(ArgumentError("prolong_from_parents!: basis dimension $Db ≠ " *
+                             "PatchHierarchy dimension $D"))
+    P >= 1 || error("prolong_from_parents!: degree-0 fast path missed (n_coeffs=$nc)")
+    T === Float64 ||
+        throw(ArgumentError(
+            "prolong_from_parents!: degree-≥1 path requires Float64 " *
+            "patch hierarchies (got T=$T). Use Float64 frames or stay at degree 0."))
+
     for (fine_i, fine_frame) in enumerate(fines)
         ppi = _find_parent_patch(parents, fine_frame)
         ppi == 0 && continue
         par_frame = parents[ppi]
-        # Map every fine leaf to the parent leaf with the largest overlap.
-        mapping = _largest_overlap_source_leaf(par_frame, fine_frame)
-        par_pfs = fields_in_parent[ppi]
-        par_field = getfield(par_pfs, fieldname)
-        fine_pfs = fields_out_fine[fine_i]
-        fine_field = getfield(fine_pfs, fieldname)
-        @inbounds for ci in 1:length(mapping)
-            par_leaf = mapping[ci]
-            par_leaf == 0 && continue
-            par_pv = _coeffs_for_cell(par_field, par_leaf)
-            c0 = par_pv[1]
-            fine_pv = _coeffs_for_cell(fine_field, ci)
-            nc = length(fine_pv)
-            fine_pv[1] = c0
-            for k in 2:nc
-                fine_pv[k] = zero(typeof(fine_pv[k]))
-            end
-        end
+        par_field = getfield(fields_in_parent[ppi], fieldname)
+        par_basis = par_field.pfs.basis
+        fine_field = getfield(fields_out_fine[fine_i], fieldname)
+        _prolong_higher_order_one_fine!(par_frame, par_field, par_basis,
+                                         fine_frame, fine_field, fine_basis,
+                                         Val(D), P)
     end
     return nothing
 end

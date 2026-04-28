@@ -3,7 +3,8 @@ using HierarchicalGrids
 using HierarchicalGrids: HierarchicalMesh, refine_cells!, n_cells,
     EulerianFrame, FrameBoundaries, enumerate_leaves,
     BCKind, PERIODIC, REFLECTING,
-    MonomialBasis, n_coeffs, allocate_polynomial_fields, SoA,
+    MonomialBasis, BernsteinBasis, n_coeffs, allocate_polynomial_fields, SoA,
+    change_basis,
     Sequential, OhMyThreadsBackend,
     PatchHierarchy, PatchBoundaryBC, PatchView, PatchHaloView,
     add_patches!, for_each_patch!,
@@ -584,4 +585,443 @@ end
     # to round-off.
     @test isapprox(mass_after, mass_before; atol = 1e-12,
                     rtol = 1e-12)
+end
+
+# ============================================================================
+# 8. Higher-order restrict / prolong (PR-5)
+# ============================================================================
+
+# Set a Monomial-basis polynomial field to the cell-local reference-frame
+# coefficients of a global polynomial f(x_1, ..., x_D). For a cell with
+# reference→physical map x = lo + ξ ∘ (hi - lo), the reference coefficients
+# come from substituting `x_d = lo_d + ξ_d · h_d` and re-collecting in ξ.
+# We do this by sampling the polynomial at the basis-evaluation points the
+# `change_basis(MonomialBasis, MonomialBasis, ...)` would produce — but
+# since both source and target have the same basis, we go through the
+# physical→reference pullback applied to the global coefficient vector.
+#
+# Helper specialised for D=2, degree 1: f(x, y) = a + b*x + c*y.
+function _set_linear_2d!(pfs, frame, a::Float64, b::Float64, c::Float64;
+                            fieldname::Symbol = :rho)
+    field = getproperty(pfs, fieldname)
+    nc = n_coeffs(pfs.basis)
+    @assert nc == 3 "2D linear basis must have 3 coefficients"
+    for i in 1:length(field)
+        is_leaf(frame.mesh.cells[i]) || (field[i] = ntuple(_ -> 0.0, nc); continue)
+        lo, hi = cell_physical_box(frame, i)
+        h_x = hi[1] - lo[1]; h_y = hi[2] - lo[2]
+        # Reference coefficients for the linear field a + b*x + c*y in the
+        # cell's [0,1]² reference frame:
+        c0_ref = a + b * lo[1] + c * lo[2]
+        c1_ref = b * h_x   # ξ_1 coefficient
+        c2_ref = c * h_y   # ξ_2 coefficient
+        # graded-lex order: (0,0), (1,0), (0,1)
+        field[i] = (c0_ref, c1_ref, c2_ref)
+    end
+    return pfs
+end
+
+# Same for D=2, degree 2: f(x,y) = a + b*x + c*y + d*x^2 + e*x*y + g*y^2.
+function _set_quadratic_2d!(pfs, frame,
+                              a::Float64, b::Float64, c::Float64,
+                              d::Float64, e::Float64, g::Float64;
+                              fieldname::Symbol = :rho)
+    field = getproperty(pfs, fieldname)
+    nc = n_coeffs(pfs.basis)
+    @assert nc == 6 "2D quadratic basis must have 6 coefficients"
+    for i in 1:length(field)
+        is_leaf(frame.mesh.cells[i]) || (field[i] = ntuple(_ -> 0.0, nc); continue)
+        lo, hi = cell_physical_box(frame, i)
+        h_x = hi[1] - lo[1]; h_y = hi[2] - lo[2]
+        x0 = lo[1]; y0 = lo[2]
+        # Substitute x = x0 + ξ*h_x, y = y0 + η*h_y. Expand and collect.
+        # graded-lex order: (0,0),(1,0),(0,1),(2,0),(1,1),(0,2)
+        c00 = a + b*x0 + c*y0 + d*x0^2 + e*x0*y0 + g*y0^2
+        c10 = (b + 2*d*x0 + e*y0) * h_x
+        c01 = (c + e*x0 + 2*g*y0) * h_y
+        c20 = d * h_x^2
+        c11 = e * h_x * h_y
+        c02 = g * h_y^2
+        field[i] = (c00, c10, c01, c20, c11, c02)
+    end
+    return pfs
+end
+
+# Evaluate the polynomial reconstruction at a global physical point. Walks
+# over leaves, finds the cell containing the point, and evaluates the
+# Monomial-basis polynomial in the cell's reference frame.
+function _eval_field_at_point(pfs, frame, point::NTuple{2, Float64};
+                                 fieldname::Symbol = :rho)
+    field = getproperty(pfs, fieldname)
+    basis = pfs.basis
+    for i in 1:n_cells(frame.mesh)
+        is_leaf(frame.mesh.cells[i]) || continue
+        lo, hi = cell_physical_box(frame, i)
+        if lo[1] <= point[1] <= hi[1] && lo[2] <= point[2] <= hi[2]
+            ξ = ntuple(d -> (point[d] - lo[d]) / (hi[d] - lo[d]), 2)
+            pv = field[i]
+            coeffs = ntuple(k -> pv[k], n_coeffs(basis))
+            if basis isa MonomialBasis
+                return HierarchicalGrids.Bases.evaluate(basis, coeffs, ξ)
+            elseif basis isa BernsteinBasis
+                return HierarchicalGrids.Bases.evaluate(basis, coeffs, ξ)
+            end
+        end
+    end
+    error("point $point not in any leaf")
+end
+
+# Compute the integrated total of a field over all leaves: Σ_cell ∫ p dx.
+# For MonomialBasis, the reference-frame integral is Σ_α coeff[α] / ∏(α_d+1),
+# scaled by the cell's physical volume.
+function _integrate_field(pfs, frame; fieldname::Symbol = :rho)
+    field = getproperty(pfs, fieldname)
+    basis = pfs.basis
+    s = 0.0
+    if basis isa MonomialBasis
+        D, P = 2, 0  # placeholders; resolved below
+        # Pull (D, P) from the type
+        Dv, Pv = (typeof(basis).parameters[1], typeof(basis).parameters[2])
+        multi = HierarchicalGrids.Overlap.moment_multiindices(Dv, Pv)
+        nc = length(multi)
+        for i in 1:n_cells(frame.mesh)
+            is_leaf(frame.mesh.cells[i]) || continue
+            lo, hi = cell_physical_box(frame, i)
+            jac = (hi[1] - lo[1]) * (hi[2] - lo[2])
+            pv = field[i]
+            cell_int = 0.0
+            for k in 1:nc
+                m = multi[k]
+                cell_int += Float64(pv[k]) / Float64((m[1] + 1) * (m[2] + 1))
+            end
+            s += jac * cell_int
+        end
+    elseif basis isa BernsteinBasis
+        # Convert to monomial first.
+        Dv, Pv = (typeof(basis).parameters[1], typeof(basis).parameters[2])
+        mono = MonomialBasis{Dv, Pv}()
+        multi = HierarchicalGrids.Overlap.moment_multiindices(Dv, Pv)
+        nc = length(multi)
+        for i in 1:n_cells(frame.mesh)
+            is_leaf(frame.mesh.cells[i]) || continue
+            lo, hi = cell_physical_box(frame, i)
+            jac = (hi[1] - lo[1]) * (hi[2] - lo[2])
+            pv = field[i]
+            bern_vec = [Float64(pv[k]) for k in 1:nc]
+            mono_vec = change_basis(mono, basis, bern_vec)
+            cell_int = 0.0
+            for k in 1:nc
+                m = multi[k]
+                cell_int += mono_vec[k] / Float64((m[1] + 1) * (m[2] + 1))
+            end
+            s += jac * cell_int
+        end
+    end
+    return s
+end
+
+@testset "PR-5 restrict_to_parents!: linear field round-trip (P=1, Monomial)" begin
+    base_frame = _make_uniform_2d_frame(1, (0.0, 0.0), (1.0, 1.0))   # 2x2
+    fine_frame = _make_uniform_2d_frame(2, (0.0, 0.0), (1.0, 1.0))   # 4x4 fine
+
+    basis = MonomialBasis{2, 1}()
+    base_pfs = _make_field(base_frame; basis = basis)
+    fine_pfs = _make_field(fine_frame; basis = basis)
+
+    a, b, c = 0.7, -1.3, 2.1
+    _set_linear_2d!(fine_pfs, fine_frame, a, b, c)
+    # Initialize base with garbage to verify it gets overwritten.
+    _fill_constant!(base_pfs, -777.0)
+
+    ph = PatchHierarchy(base_frame)
+    add_patches!(ph, 2, [fine_frame])
+
+    restrict_to_parents!([_views(base_pfs)], [_views(fine_pfs)],
+                          ph; level = 2, fieldname = :rho)
+
+    # The base should now hold the same linear function exactly. Sample a
+    # few points and check.
+    for pt in [(0.1, 0.1), (0.4, 0.7), (0.85, 0.3), (0.5, 0.5)]
+        expected = a + b * pt[1] + c * pt[2]
+        got = _eval_field_at_point(base_pfs, base_frame, pt)
+        @test isapprox(got, expected; atol = 1e-11, rtol = 1e-11)
+    end
+
+    # Now prolong back into a zeroed fine and check round-trip.
+    _fill_constant!(fine_pfs, 0.0)
+    prolong_from_parents!([_views(fine_pfs)], [_views(base_pfs)],
+                           ph; level = 2, fieldname = :rho)
+
+    for pt in [(0.1, 0.1), (0.4, 0.7), (0.85, 0.3), (0.5, 0.5)]
+        expected = a + b * pt[1] + c * pt[2]
+        got = _eval_field_at_point(fine_pfs, fine_frame, pt)
+        @test isapprox(got, expected; atol = 1e-11, rtol = 1e-11)
+    end
+end
+
+@testset "PR-5 restrict_to_parents!: quadratic field round-trip (P=2, Monomial)" begin
+    base_frame = _make_uniform_2d_frame(1, (0.0, 0.0), (1.0, 1.0))
+    fine_frame = _make_uniform_2d_frame(2, (0.0, 0.0), (1.0, 1.0))
+
+    basis = MonomialBasis{2, 2}()
+    base_pfs = _make_field(base_frame; basis = basis)
+    fine_pfs = _make_field(fine_frame; basis = basis)
+
+    a, b, c, d, e, g = 0.5, -0.7, 1.1, 0.3, -0.2, 0.4
+    _set_quadratic_2d!(fine_pfs, fine_frame, a, b, c, d, e, g)
+    _fill_constant!(base_pfs, -999.0)
+
+    ph = PatchHierarchy(base_frame)
+    add_patches!(ph, 2, [fine_frame])
+
+    restrict_to_parents!([_views(base_pfs)], [_views(fine_pfs)],
+                          ph; level = 2, fieldname = :rho)
+
+    for pt in [(0.1, 0.1), (0.4, 0.7), (0.85, 0.3), (0.5, 0.5)]
+        expected = a + b*pt[1] + c*pt[2] + d*pt[1]^2 + e*pt[1]*pt[2] + g*pt[2]^2
+        got = _eval_field_at_point(base_pfs, base_frame, pt)
+        @test isapprox(got, expected; atol = 1e-10, rtol = 1e-10)
+    end
+
+    _fill_constant!(fine_pfs, 0.0)
+    prolong_from_parents!([_views(fine_pfs)], [_views(base_pfs)],
+                           ph; level = 2, fieldname = :rho)
+    for pt in [(0.1, 0.1), (0.4, 0.7), (0.85, 0.3), (0.5, 0.5)]
+        expected = a + b*pt[1] + c*pt[2] + d*pt[1]^2 + e*pt[1]*pt[2] + g*pt[2]^2
+        got = _eval_field_at_point(fine_pfs, fine_frame, pt)
+        @test isapprox(got, expected; atol = 1e-10, rtol = 1e-10)
+    end
+end
+
+@testset "PR-5: mass conservation under restrict for P ∈ {0, 1, 2}" begin
+    for P in 0:2
+        base_frame = _make_uniform_2d_frame(1, (0.0, 0.0), (1.0, 1.0))
+        # A fine patch covering the lower-left quarter exactly (cell-aligned).
+        fine_frame = _make_uniform_2d_frame(1, (0.0, 0.0), (0.5, 0.5))
+
+        basis = MonomialBasis{2, P}()
+        base_pfs = _make_field(base_frame; basis = basis)
+        fine_pfs = _make_field(fine_frame; basis = basis)
+
+        # Initialise both base and fine to the SAME linear function on the
+        # patch — so the restrict is a "no-op in measure" on the covered cells.
+        if P == 0
+            _fill_constant!(base_pfs, 1.5)
+            _fill_constant!(fine_pfs, 1.5)
+        elseif P == 1
+            _set_linear_2d!(base_pfs, base_frame, 1.5, 0.7, -0.3)
+            _set_linear_2d!(fine_pfs, fine_frame, 1.5, 0.7, -0.3)
+        else
+            _set_quadratic_2d!(base_pfs, base_frame, 1.5, 0.7, -0.3, 0.2, -0.1, 0.4)
+            _set_quadratic_2d!(fine_pfs, fine_frame, 1.5, 0.7, -0.3, 0.2, -0.1, 0.4)
+        end
+
+        mass_before = _integrate_field(base_pfs, base_frame)
+
+        ph = PatchHierarchy(base_frame)
+        add_patches!(ph, 2, [fine_frame])
+
+        restrict_to_parents!([_views(base_pfs)], [_views(fine_pfs)],
+                              ph; level = 2, fieldname = :rho)
+
+        mass_after = _integrate_field(base_pfs, base_frame)
+        @test isapprox(mass_after, mass_before; atol = 1e-11, rtol = 1e-11)
+    end
+end
+
+@testset "PR-5 BernsteinBasis: linear field round-trip (P=1)" begin
+    base_frame = _make_uniform_2d_frame(1, (0.0, 0.0), (1.0, 1.0))
+    fine_frame = _make_uniform_2d_frame(2, (0.0, 0.0), (1.0, 1.0))
+
+    bern_basis = BernsteinBasis{2, 1}()
+    mono_basis = MonomialBasis{2, 1}()
+
+    base_pfs = _make_field(base_frame; basis = bern_basis)
+    fine_pfs = _make_field(fine_frame; basis = bern_basis)
+
+    # We seed the fine field by setting the underlying monomial form first
+    # then converting per cell into Bernstein coefficients.
+    a, b, c = 0.4, 0.9, -0.6
+    fine_field = getproperty(fine_pfs, :rho)
+    nc = n_coeffs(bern_basis)
+    for i in 1:n_cells(fine_frame.mesh)
+        is_leaf(fine_frame.mesh.cells[i]) || (fine_field[i] = ntuple(_ -> 0.0, nc); continue)
+        lo, hi = cell_physical_box(fine_frame, i)
+        h_x = hi[1] - lo[1]; h_y = hi[2] - lo[2]
+        c0 = a + b * lo[1] + c * lo[2]
+        c1 = b * h_x
+        c2 = c * h_y
+        mono_vec = [c0, c1, c2]
+        bern_vec = change_basis(bern_basis, mono_basis, mono_vec)
+        fine_field[i] = ntuple(k -> Float64(bern_vec[k]), nc)
+    end
+    _fill_constant!(base_pfs, -999.0)
+
+    ph = PatchHierarchy(base_frame)
+    add_patches!(ph, 2, [fine_frame])
+
+    restrict_to_parents!([_views(base_pfs)], [_views(fine_pfs)],
+                          ph; level = 2, fieldname = :rho)
+
+    # Sample evaluation: convert each base cell's coefficients back to
+    # monomial form before evaluating.
+    for pt in [(0.1, 0.1), (0.4, 0.7), (0.85, 0.3), (0.5, 0.5)]
+        expected = a + b * pt[1] + c * pt[2]
+        got = _eval_field_at_point(base_pfs, base_frame, pt)
+        @test isapprox(got, expected; atol = 1e-11, rtol = 1e-11)
+    end
+
+    # Round-trip via prolong.
+    _fill_constant!(fine_pfs, 0.0)
+    prolong_from_parents!([_views(fine_pfs)], [_views(base_pfs)],
+                           ph; level = 2, fieldname = :rho)
+
+    for pt in [(0.1, 0.1), (0.4, 0.7), (0.85, 0.3), (0.5, 0.5)]
+        expected = a + b * pt[1] + c * pt[2]
+        got = _eval_field_at_point(fine_pfs, fine_frame, pt)
+        @test isapprox(got, expected; atol = 1e-11, rtol = 1e-11)
+    end
+end
+
+@testset "PR-5 BernsteinBasis: quadratic field round-trip (P=2)" begin
+    base_frame = _make_uniform_2d_frame(1, (0.0, 0.0), (1.0, 1.0))
+    fine_frame = _make_uniform_2d_frame(2, (0.0, 0.0), (1.0, 1.0))
+
+    bern_basis = BernsteinBasis{2, 2}()
+    mono_basis = MonomialBasis{2, 2}()
+
+    base_pfs = _make_field(base_frame; basis = bern_basis)
+    fine_pfs = _make_field(fine_frame; basis = bern_basis)
+
+    a, b, c, d, e, g = 0.5, -0.7, 1.1, 0.3, -0.2, 0.4
+    fine_field = getproperty(fine_pfs, :rho)
+    nc = n_coeffs(bern_basis)
+    for i in 1:n_cells(fine_frame.mesh)
+        is_leaf(fine_frame.mesh.cells[i]) || (fine_field[i] = ntuple(_ -> 0.0, nc); continue)
+        lo, hi = cell_physical_box(fine_frame, i)
+        h_x = hi[1] - lo[1]; h_y = hi[2] - lo[2]
+        x0 = lo[1]; y0 = lo[2]
+        c00 = a + b*x0 + c*y0 + d*x0^2 + e*x0*y0 + g*y0^2
+        c10 = (b + 2*d*x0 + e*y0) * h_x
+        c01 = (c + e*x0 + 2*g*y0) * h_y
+        c20 = d * h_x^2
+        c11 = e * h_x * h_y
+        c02 = g * h_y^2
+        mono_vec = [c00, c10, c01, c20, c11, c02]
+        bern_vec = change_basis(bern_basis, mono_basis, mono_vec)
+        fine_field[i] = ntuple(k -> Float64(bern_vec[k]), nc)
+    end
+    _fill_constant!(base_pfs, -999.0)
+
+    ph = PatchHierarchy(base_frame)
+    add_patches!(ph, 2, [fine_frame])
+
+    restrict_to_parents!([_views(base_pfs)], [_views(fine_pfs)],
+                          ph; level = 2, fieldname = :rho)
+
+    for pt in [(0.1, 0.1), (0.4, 0.7), (0.85, 0.3), (0.5, 0.5)]
+        expected = a + b*pt[1] + c*pt[2] + d*pt[1]^2 + e*pt[1]*pt[2] + g*pt[2]^2
+        got = _eval_field_at_point(base_pfs, base_frame, pt)
+        @test isapprox(got, expected; atol = 1e-10, rtol = 1e-10)
+    end
+
+    _fill_constant!(fine_pfs, 0.0)
+    prolong_from_parents!([_views(fine_pfs)], [_views(base_pfs)],
+                           ph; level = 2, fieldname = :rho)
+    for pt in [(0.1, 0.1), (0.4, 0.7), (0.85, 0.3), (0.5, 0.5)]
+        expected = a + b*pt[1] + c*pt[2] + d*pt[1]^2 + e*pt[1]*pt[2] + g*pt[2]^2
+        got = _eval_field_at_point(fine_pfs, fine_frame, pt)
+        @test isapprox(got, expected; atol = 1e-10, rtol = 1e-10)
+    end
+end
+
+@testset "PR-5: thread-count determinism (Monomial P=2)" begin
+    # The higher-order path must be byte-equal across thread counts.
+    # Build a 2x2 base + 4x4 fine, set a quadratic field, restrict, and
+    # snapshot every coefficient. Repeat with a different scheduler call
+    # to ensure the result is cross-thread stable.
+    base_frame = _make_uniform_2d_frame(1, (0.0, 0.0), (1.0, 1.0))
+    fine_frame = _make_uniform_2d_frame(2, (0.0, 0.0), (1.0, 1.0))
+
+    basis = MonomialBasis{2, 2}()
+
+    function _run_once()
+        base_pfs = _make_field(base_frame; basis = basis)
+        fine_pfs = _make_field(fine_frame; basis = basis)
+        _set_quadratic_2d!(fine_pfs, fine_frame, 0.5, -0.7, 1.1, 0.3, -0.2, 0.4)
+        ph = PatchHierarchy(base_frame)
+        add_patches!(ph, 2, [fine_frame])
+        restrict_to_parents!([_views(base_pfs)], [_views(fine_pfs)],
+                              ph; level = 2, fieldname = :rho)
+        # Snapshot all base coefficients.
+        out = Float64[]
+        for i in 1:n_cells(base_frame.mesh)
+            is_leaf(base_frame.mesh.cells[i]) || continue
+            pv = base_pfs.rho[i]
+            for k in 1:n_coeffs(basis)
+                push!(out, Float64(pv[k]))
+            end
+        end
+        return out
+    end
+
+    a = _run_once()
+    b = _run_once()
+    @test a == b   # byte-equal repeat run
+end
+
+@testset "PR-5: uncovered parent cells preserved across restrict (P=1)" begin
+    # 4x4 base, fine = single cell at lower-left covering one base leaf.
+    # Restrict should write only that one base cell; others retain pre-call
+    # coefficients.
+    base_frame = _make_uniform_2d_frame(2, (0.0, 0.0), (1.0, 1.0))   # 4x4
+    fine_frame = _make_uniform_2d_frame(0, (0.0, 0.0), (0.25, 0.25)) # 1 leaf
+
+    basis = MonomialBasis{2, 1}()
+    base_pfs = _make_field(base_frame; basis = basis)
+    fine_pfs = _make_field(fine_frame; basis = basis)
+
+    # Distinct per-cell linear functions in the base:
+    nc = n_coeffs(basis)
+    base_field = getproperty(base_pfs, :rho)
+    pre_coeffs = Vector{NTuple{nc, Float64}}(undef, n_cells(base_frame.mesh))
+    for i in 1:n_cells(base_frame.mesh)
+        is_leaf(base_frame.mesh.cells[i]) || (pre_coeffs[i] = ntuple(_ -> 0.0, nc); base_field[i] = pre_coeffs[i]; continue)
+        c = ntuple(k -> 100.0 * i + k, nc)
+        base_field[i] = c
+        pre_coeffs[i] = c
+    end
+
+    _set_linear_2d!(fine_pfs, fine_frame, 5.0, 0.0, 0.0)  # constant 5
+
+    ph = PatchHierarchy(base_frame)
+    add_patches!(ph, 2, [fine_frame])
+    restrict_to_parents!([_views(base_pfs)], [_views(fine_pfs)],
+                          ph; level = 2, fieldname = :rho)
+
+    # Find the covered base cell (the one with positive overlap with [0,0.25]^2).
+    covered_idx = 0
+    for i in 1:n_cells(base_frame.mesh)
+        is_leaf(base_frame.mesh.cells[i]) || continue
+        lo, hi = cell_physical_box(base_frame, i)
+        ovx = max(0.0, min(hi[1], 0.25) - max(lo[1], 0.0))
+        ovy = max(0.0, min(hi[2], 0.25) - max(lo[2], 0.0))
+        if ovx > 0.0 && ovy > 0.0
+            covered_idx = i; break
+        end
+    end
+    @test covered_idx != 0
+
+    # Non-covered cells must retain their pre-call coefficients.
+    for i in 1:n_cells(base_frame.mesh)
+        is_leaf(base_frame.mesh.cells[i]) || continue
+        i == covered_idx && continue
+        for k in 1:nc
+            @test base_pfs.rho[i][k] == pre_coeffs[i][k]
+        end
+    end
+
+    # The covered cell should evaluate to 5.0 anywhere inside [0, 0.25]^2.
+    got = _eval_field_at_point(base_pfs, base_frame, (0.1, 0.1))
+    @test isapprox(got, 5.0; atol = 1e-11)
 end
