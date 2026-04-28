@@ -555,7 +555,8 @@ Convert a 1D polynomial from monomial to Bernstein form on [0,1].
 Given a polynomial p(x) = sum c_k x^k, the equivalent Bernstein form
 p(x) = sum b_i B_{i,P}(x) has coefficients b_i = sum_{k=0}^i (i choose k)/(P choose k) c_k.
 """
-function change_basis(::BernsteinBasis{1, P}, ::MonomialBasis{1, P}, src_coeffs) where P
+function change_basis(::BernsteinBasis{1, P}, ::MonomialBasis{1, P},
+                      src_coeffs::AbstractVector) where P
     length(src_coeffs) == P + 1 || throw(DimensionMismatch("src coeffs length doesn't match"))
     T = float(eltype(src_coeffs))
     bern = zeros(T, P + 1)
@@ -575,7 +576,8 @@ Convert a 1D polynomial from Bernstein to monomial form on [0,1].
 Given Bernstein coefficients b_i, the equivalent monomial coefficients are
 c_k = (P choose k) sum_{i=0}^k (-1)^{k-i} (k choose i) b_i.
 """
-function change_basis(::MonomialBasis{1, P}, ::BernsteinBasis{1, P}, src_coeffs) where P
+function change_basis(::MonomialBasis{1, P}, ::BernsteinBasis{1, P},
+                      src_coeffs::AbstractVector) where P
     length(src_coeffs) == P + 1 || throw(DimensionMismatch("src coeffs length doesn't match"))
     T = float(eltype(src_coeffs))
     mono = zeros(T, P + 1)
@@ -587,6 +589,204 @@ function change_basis(::MonomialBasis{1, P}, ::BernsteinBasis{1, P}, src_coeffs)
         mono[k+1] = T(binomial(P, k)) * s
     end
     return mono
+end
+
+# ============================================================================
+# Change of basis: D-dim simplex Bernstein ↔ Monomial
+# ============================================================================
+#
+# For the D-simplex with barycentric coordinates λ = (λ_0, ..., λ_D), the
+# Bernstein basis functions are
+#
+#     B_α(λ) = (P! / α!) · λ_0^{α_0} λ_1^{α_1} ... λ_D^{α_D}
+#
+# where α is a barycentric multi-index of length D+1 with |α| = P. In
+# Cartesian reference coordinates (x_1, ..., x_D), λ_0 = 1 - Σ x_d and
+# λ_i = x_i for i ≥ 1, so
+#
+#     B_α(x) = (P! / α!) · (1 - Σ x_d)^{α_0} · ∏_{d=1..D} x_d^{α_d}.
+#
+# Expanding (1 - Σ x_d)^{α_0} via the multinomial theorem yields a finite
+# sum of monomials x^β. Each Bernstein function B_α therefore has a closed
+# expression as a Σ_β c_{α,β} x^β with β = α_{1:D} + γ, |γ| ≤ α_0:
+#
+#     c_{α,β} = (P! / (α_1!...α_D!)) · (-1)^{|γ|} / (γ_1!...γ_D! · (α_0 - |γ|)!)
+#
+# The MonomialBasis on the simplex still indexes total-degree monomials
+# x^β with |β| ≤ P. Both bases have n = binomial(D + P, P) functions, so
+# the change-of-basis matrix is square; its inverse exists and is the
+# reverse map.
+#
+# We cache the matrices once per (D, P) under a thread-safe lock; build is
+# O(n_coeffs * binomial(P + D, D)) and trivial for the typical D ≤ 3, P ≤ 4
+# regime that AdaptiveField uses.
+
+const _BERN_TO_MONO_CACHE = Dict{Tuple{Int, Int}, Matrix{Float64}}()
+const _MONO_TO_BERN_CACHE = Dict{Tuple{Int, Int}, Matrix{Float64}}()
+const _CHANGE_BASIS_CACHE_LOCK = ReentrantLock()
+
+# Enumerate barycentric multi-indices α of length D+1 with |α| = P, in the
+# canonical order produced by `_push_tuples_summing_to!`. (Same as
+# `bernstein_multiindices(D, P)`, but returns Vector{Vector{Int}} for
+# uniform handling alongside `_enumerate_mono_multiindices_simplex`.)
+function _enumerate_bern_multiindices(D::Int, P::Int)
+    return _cached_bernstein_multiindices(D, P)
+end
+
+# Enumerate Cartesian multi-indices β of length D with |β| ≤ P, in HG's
+# graded-lex order matching `monomial_exponents(D, P)`.
+function _enumerate_mono_multiindices_simplex(D::Int, P::Int)
+    return _cached_monomial_exponents(D, P)
+end
+
+# Add to row indexed by β=α[2..D+1]+γ in `M[:, j]` the coefficient
+# (P! / (α_1!...α_D!)) · (-1)^|γ| / (γ_1!...γ_D! · (α_0-|γ|)!).
+#
+# We pre-compute the lookup `mono_idx_lookup` from β-tuple → row index of
+# the monomial in the graded-lex layout once per (D, P) build; the inner
+# loop just performs index arithmetic.
+function _expand_bernstein_into_monomials!(M::Matrix{Float64}, j::Int,
+                                            α::NTuple{Np1, Int},
+                                            mono_idx_lookup::Dict{NTuple{Dl, Int}, Int},
+                                            P::Int) where {Np1, Dl}
+    α0 = α[1]
+    # Pre-divide P! by α_1!...α_Dl! once per Bernstein function.
+    αrest_fact = one(Float64)
+    for d in 1:Dl
+        αrest_fact *= Float64(factorial(α[d + 1]))
+    end
+    Pfac = Float64(factorial(P))
+    base_coef = Pfac / αrest_fact
+
+    # Enumerate γ ∈ ℤ_{≥0}^Dl with |γ| ≤ α0 (small; α0 ≤ P).
+    γ = zeros(Int, Dl)
+    _expand_bern_recursive!(M, j, α, γ, 1, α0, base_coef, mono_idx_lookup)
+    return
+end
+
+# Recursively walk γ. At each level d we pick γ[d] ∈ 0..(α0 - sum_so_far);
+# at the leaf (d > Dl) we have a complete γ and emit the monomial term.
+function _expand_bern_recursive!(M::Matrix{Float64}, j::Int,
+                                  α::NTuple{Np1, Int}, γ::Vector{Int},
+                                  d::Int, remaining::Int, base_coef::Float64,
+                                  mono_idx_lookup::Dict{NTuple{Dl, Int}, Int}
+                                  ) where {Np1, Dl}
+    if d > Dl
+        # Leaf: γ complete, |γ| = sum(γ), tail = α0 - |γ| = remaining.
+        γabs = 0
+        γfact = one(Float64)
+        for k in 1:Dl
+            γabs += γ[k]
+            γfact *= Float64(factorial(γ[k]))
+        end
+        tail = remaining  # α0 - |γ|
+        sign = isodd(γabs) ? -1.0 : 1.0
+        coef = base_coef * sign / (γfact * Float64(factorial(tail)))
+        # β_d = α[d+1] + γ[d] for d=1..Dl
+        β = ntuple(k -> α[k + 1] + γ[k], Val(Dl))
+        row = mono_idx_lookup[β]::Int
+        @inbounds M[row, j] += coef
+        return
+    end
+    @inbounds for v in 0:remaining
+        γ[d] = v
+        _expand_bern_recursive!(M, j, α, γ, d + 1, remaining - v, base_coef,
+                                mono_idx_lookup)
+    end
+    @inbounds γ[d] = 0
+    return
+end
+
+# Build the Bernstein → Monomial matrix for the D-simplex at degree P. Column
+# j is the monomial coefficient vector of B_{α_j} in the canonical layout.
+function _build_bern_to_mono_matrix(D::Int, P::Int)
+    bern_idx = _enumerate_bern_multiindices(D, P)
+    mono_idx = _enumerate_mono_multiindices_simplex(D, P)
+    n = length(bern_idx)
+    @assert length(mono_idx) == n "Bernstein and monomial counts must match"
+    # Fast row-lookup: β-tuple → graded-lex row index.
+    lookup = Dict{NTuple{D, Int}, Int}()
+    sizehint!(lookup, n)
+    @inbounds for (k, β) in enumerate(mono_idx)
+        lookup[β] = k
+    end
+    M = zeros(Float64, n, n)
+    @inbounds for j in 1:n
+        α = bern_idx[j]    # NTuple{D+1, Int}
+        _expand_bernstein_into_monomials!(M, j, α, lookup, P)
+    end
+    return M
+end
+
+# Thread-safe cached fetch of the Bernstein → Monomial matrix.
+function _bernstein_to_monomial_matrix(::Val{D}, ::Val{P}) where {D, P}
+    key = (D, P)
+    M = lock(_CHANGE_BASIS_CACHE_LOCK) do
+        get(_BERN_TO_MONO_CACHE, key, nothing)
+    end
+    M === nothing || return M
+    # Build outside the lock to avoid blocking other (D, P) lookups.
+    M_built = _build_bern_to_mono_matrix(D, P)
+    return lock(_CHANGE_BASIS_CACHE_LOCK) do
+        get!(_BERN_TO_MONO_CACHE, key, M_built)
+    end
+end
+
+# Thread-safe cached fetch of the Monomial → Bernstein matrix (matrix inverse).
+function _monomial_to_bernstein_matrix(::Val{D}, ::Val{P}) where {D, P}
+    key = (D, P)
+    M = lock(_CHANGE_BASIS_CACHE_LOCK) do
+        get(_MONO_TO_BERN_CACHE, key, nothing)
+    end
+    M === nothing || return M
+    Mfwd = _bernstein_to_monomial_matrix(Val(D), Val(P))
+    Minv_built = inv(Mfwd)
+    return lock(_CHANGE_BASIS_CACHE_LOCK) do
+        get!(_MONO_TO_BERN_CACHE, key, Minv_built)
+    end
+end
+
+"""
+    change_basis(target::MonomialBasis{D, P}, source::BernsteinBasis{D, P}, bern_coeffs)
+
+Convert a polynomial on the D-simplex from Bernstein form to total-degree
+monomial form. The reference simplex is parameterized by Cartesian
+coordinates (x_1, ..., x_D) with `λ_0 = 1 - Σ x_d`. The conversion matrix
+is built once per `(D, P)` pair and cached (thread-safe).
+"""
+function change_basis(::MonomialBasis{D, P}, ::BernsteinBasis{D, P},
+                      bern_coeffs::AbstractVector) where {D, P}
+    n = binomial(D + P, P)
+    length(bern_coeffs) == n ||
+        throw(DimensionMismatch("Bernstein coeffs length $(length(bern_coeffs)) ≠ $n"))
+    M = _bernstein_to_monomial_matrix(Val(D), Val(P))
+    T = float(eltype(bern_coeffs))
+    if T === Float64
+        return M * bern_coeffs
+    else
+        return convert(Vector{T}, M * bern_coeffs)
+    end
+end
+
+"""
+    change_basis(target::BernsteinBasis{D, P}, source::MonomialBasis{D, P}, mono_coeffs)
+
+Convert a polynomial on the D-simplex from total-degree monomial form to
+Bernstein form. Inverse of the Bernstein → Monomial map; the matrix is
+cached per `(D, P)` pair.
+"""
+function change_basis(::BernsteinBasis{D, P}, ::MonomialBasis{D, P},
+                      mono_coeffs::AbstractVector) where {D, P}
+    n = binomial(D + P, P)
+    length(mono_coeffs) == n ||
+        throw(DimensionMismatch("Monomial coeffs length $(length(mono_coeffs)) ≠ $n"))
+    Minv = _monomial_to_bernstein_matrix(Val(D), Val(P))
+    T = float(eltype(mono_coeffs))
+    if T === Float64
+        return Minv * mono_coeffs
+    else
+        return convert(Vector{T}, Minv * mono_coeffs)
+    end
 end
 
 # ============================================================================

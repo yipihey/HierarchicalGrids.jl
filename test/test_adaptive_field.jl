@@ -1,4 +1,5 @@
 using Test
+using Logging
 using Random
 using HierarchicalGrids
 using HierarchicalGrids: MonomialBasis, BernsteinBasis, allocate_polynomial_fields, SoA,
@@ -116,9 +117,10 @@ using HierarchicalGrids: MonomialBasis, BernsteinBasis, allocate_polynomial_fiel
         @test af.disposed == true
     end
 
-    @testset "Higher-degree coarsening — non-Monomial fallback warns" begin
-        # BernsteinBasis is not yet supported by the L²-projection path;
-        # AdaptiveField falls back to constant-moment-only and warns once.
+    @testset "Higher-degree coarsening — BernsteinBasis takes L²-projection path" begin
+        # BernsteinBasis is now routed through change_basis + the
+        # MonomialBasis L²-projection path. The deferred-fallback warning
+        # must NOT fire for degree ≥ 1 BernsteinBasis fields.
         mesh = HierarchicalMesh{2}()
         basis = BernsteinBasis{2, 2}()  # degree 2 in 2D
         nc = n_coeffs(basis)
@@ -133,12 +135,16 @@ using HierarchicalGrids: MonomialBasis, BernsteinBasis, allocate_polynomial_fiel
             af.field.rho[i] = ntuple(k -> k == 1 ? 1.0 : Float64(i + k), nc)
         end
 
-        @test_logs (:warn, r"AdaptiveField") coarsen_cells!(mesh, [1])
+        # Capture all log messages and assert none of them contains the
+        # deferred-fallback marker. Using `min_level=Logging.Warn` ensures
+        # we observe @warn calls.
+        msgs = @test_logs min_level=Logging.Warn coarsen_cells!(mesh, [1])
         @test af.field.n == 1
-
+        # The L²-projection path produces non-trivial coefficients (the
+        # higher Bernstein coefficients should not all be zero, as they
+        # would under the constant-moment-only fallback).
         coeffs_after = collect(af.field.rho[1])
-        @test coeffs_after[1] == 1.0          # constant moment averaged
-        @test all(c == 0.0 for c in coeffs_after[2:end])  # rest zeroed
+        @test any(!iszero, coeffs_after[2:end])
 
         dispose!(af)
     end
@@ -460,6 +466,166 @@ using HierarchicalGrids: MonomialBasis, BernsteinBasis, allocate_polynomial_fiel
         @test af.field.n == 1
         @test af.field.rho[1][1] == 2.5
         dispose!(af)
+    end
+
+    # ------------------------------------------------------------------
+    # BernsteinBasis L²-projection coarsening tests (PR-4)
+    # ------------------------------------------------------------------
+
+    @testset "Bernstein L²-projection — linear field bit-exact recovery (D=2)" begin
+        # Mirrors the MonomialBasis test. A degree-1 BernsteinBasis field
+        # set to a known linear function. After refine→re-init→coarsen,
+        # the parent's polynomial recovers the linear function to round-off.
+        mesh = HierarchicalMesh{2}()
+        basis = BernsteinBasis{2, 1}()
+        field = allocate_polynomial_fields(SoA(), basis, 1; rho=Float64)
+        frame = EulerianFrame(mesh, (0.0, 0.0), (1.0, 1.0))
+
+        a, b, c = 0.7, -1.3, 2.1
+        f = x -> a + b * x[1] + c * x[2]
+        init_field_from!(field, frame, f)
+        root_before = collect(field.rho[1])
+
+        af = AdaptiveField(field, mesh)
+        refine_cells!(mesh, [1])
+        init_field_from!(af.field, frame, f)
+        coarsen_cells!(mesh, [1])
+        @test af.field.n == 1
+        coeffs_after = collect(af.field.rho[1])
+        for k in eachindex(root_before)
+            @test isapprox(coeffs_after[k], root_before[k]; atol=1e-11, rtol=1e-11)
+        end
+
+        dispose!(af)
+    end
+
+    @testset "Bernstein L²-projection — mass conservation under random fuzz (D=2, P=2)" begin
+        # Random refine/coarsen sequences must preserve total mass to
+        # round-off for a degree-2 BernsteinBasis field. We compute the
+        # mass via Bernstein → Monomial conversion (the monomial form
+        # admits the closed-form integral on the unit cube reference).
+        rng = MersenneTwister(456)
+        mesh = HierarchicalMesh{2}()
+        basis = BernsteinBasis{2, 2}()
+        field = allocate_polynomial_fields(SoA(), basis, 1; rho=Float64)
+        frame = EulerianFrame(mesh, (0.0, 0.0), (1.0, 1.0))
+        f = x -> 1.5 + 0.3 * x[1] + 0.2 * x[2] + 0.1 * x[1]^2 - 0.05 * x[2]^2
+        init_field_from!(field, frame, f)
+        af = AdaptiveField(field, mesh)
+        mono_basis_local = MonomialBasis{2, 2}()
+
+        function total_mass_bern(af, frame, mono_basis_local)
+            m = 0.0
+            mesh = af.mesh
+            multi = moment_multiindices(2, 2)
+            for i in 1:n_cells(mesh)
+                if is_leaf(mesh.cells[i])
+                    lo, hi = cell_physical_box(frame, i)
+                    vol = (hi[1] - lo[1]) * (hi[2] - lo[2])
+                    bern_coeffs = collect(af.field.rho[i])
+                    mono_coeffs = HierarchicalGrids.change_basis(
+                        mono_basis_local, BernsteinBasis{2, 2}(), bern_coeffs)
+                    integ = 0.0
+                    for k in eachindex(multi)
+                        integ += mono_coeffs[k] /
+                                  ((multi[k][1] + 1) * (multi[k][2] + 1))
+                    end
+                    m += vol * integ
+                end
+            end
+            return m
+        end
+
+        m0 = total_mass_bern(af, frame, mono_basis_local)
+        max_drift = 0.0
+        for _ in 1:30
+            leaves = enumerate_leaves(af.mesh)
+            if rand(rng) < 0.6 && !isempty(leaves)
+                target = leaves[rand(rng, 1:length(leaves))]
+                refine_cells!(af.mesh, [target])
+            else
+                candidates = Int[]
+                for i in 1:n_cells(af.mesh)
+                    cell = af.mesh.cells[i]
+                    if !is_leaf(cell)
+                        kids = HierarchicalGrids.find_children(af.mesh, i)
+                        all_leaves = all(is_leaf(af.mesh.cells[k]) for k in kids)
+                        if all_leaves
+                            push!(candidates, i)
+                        end
+                    end
+                end
+                if !isempty(candidates)
+                    target = candidates[rand(rng, 1:length(candidates))]
+                    coarsen_cells!(af.mesh, [target])
+                end
+            end
+            m = total_mass_bern(af, frame, mono_basis_local)
+            drift = abs(m - m0)
+            if drift > max_drift
+                max_drift = drift
+            end
+        end
+        @test max_drift < 1e-10
+
+        dispose!(af)
+    end
+
+    @testset "Bernstein L²-projection — degree comparison" begin
+        # Same physical field initialized at degrees 0, 1, 2 in BernsteinBasis.
+        # After refine→coarsen, higher-degree fields reproduce the original
+        # parent better (smaller L² error against the analytic projection of
+        # the same function).
+        function abs_l2_error_bern(af, frame, f, basis_degree)
+            err2 = 0.0
+            mesh = af.mesh
+            for i in 1:n_cells(mesh)
+                is_leaf(mesh.cells[i]) || continue
+                lo, hi = cell_physical_box(frame, i)
+                Nq = 4
+                cell_err = 0.0
+                cell_vol = (hi[1] - lo[1]) * (hi[2] - lo[2])
+                coeffs = collect(af.field.rho[i])
+                for ix in 1:Nq, iy in 1:Nq
+                    ξ = ((ix - 0.5) / Nq, (iy - 0.5) / Nq)
+                    x = (lo[1] + ξ[1] * (hi[1] - lo[1]),
+                         lo[2] + ξ[2] * (hi[2] - lo[2]))
+                    p_val = evaluate(BernsteinBasis{2, basis_degree}(), coeffs, ξ)
+                    cell_err += (p_val - f(x))^2
+                end
+                err2 += cell_err / (Nq * Nq) * cell_vol
+            end
+            return sqrt(err2)
+        end
+
+        f = x -> sin(x[1]) * cos(x[2]) + 0.3 * x[1]^2 - 0.1 * x[2]^2
+
+        function setup_and_coarsen_bern(degree)
+            mesh = HierarchicalMesh{2}()
+            basis = BernsteinBasis{2, degree}()
+            field = allocate_polynomial_fields(SoA(), basis, 1; rho=Float64)
+            frame = EulerianFrame(mesh, (0.0, 0.0), (1.0, 1.0))
+            af = AdaptiveField(field, mesh)
+            refine_cells!(mesh, [1])
+            init_field_from!(af.field, frame, f)
+            coarsen_cells!(mesh, [1])
+            return af, frame
+        end
+
+        af0, fr0 = setup_and_coarsen_bern(0)
+        af1, fr1 = setup_and_coarsen_bern(1)
+        af2, fr2 = setup_and_coarsen_bern(2)
+
+        e0 = abs_l2_error_bern(af0, fr0, f, 0)
+        e1 = abs_l2_error_bern(af1, fr1, f, 1)
+        e2 = abs_l2_error_bern(af2, fr2, f, 2)
+
+        @test e1 < e0
+        @test e2 < e1
+
+        dispose!(af0)
+        dispose!(af1)
+        dispose!(af2)
     end
 
 end
