@@ -200,6 +200,7 @@ using .Overlap
 export EulerianFrame, root_box, cell_unit_box, cell_physical_box, enumerate_leaves,
        aabbs_overlap
 export FrameBoundaries, bc
+export FrameFaceCache, ensure_face_cache!
 export OverlapEntry, GeometricOverlap, OverlapBuilder
 export n_entries, entries_for_lag, entries_for_eul, total_overlap_volume
 export push_overlap!, merge_builder!, finalize_overlap

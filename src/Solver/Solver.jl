@@ -47,7 +47,8 @@ using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView,
 using ..Overlap: EulerianFrame, FrameBoundaries, cell_unit_box, cell_physical_box,
                   enumerate_leaves, compute_overlap, aabbs_overlap,
                   GeometricOverlap, OverlapEntry,
-                  moments_length, moment_multiindices
+                  moments_length, moment_multiindices,
+                  FrameFaceCache, ensure_face_cache!
 using ..Threading: AbstractParallelBackend, Sequential, OhMyThreadsBackend,
                     default_backend, parallel_foreach
 

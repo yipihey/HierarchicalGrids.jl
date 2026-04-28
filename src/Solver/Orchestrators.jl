@@ -225,29 +225,42 @@ function for_each_face!(flux_kernel, fluxes_out, fields_in,
     Mesh.ensure_caches!(mesh)
     ensure_neighbor_graph!(mesh)
 
-    # Build face lists deterministically (sequential pre-work).
-    interior = _enumerate_interior_faces(mesh)
-    boundary = _enumerate_boundary_faces(mesh)
+    # PR-2 face-list cache: build the (interior, boundary) enumeration
+    # once and reuse until the next refinement event invalidates it.
+    fc = ensure_face_cache!(frame, bcs)
+
+    interior_left  = fc.interior_left_idx
+    interior_right = fc.interior_right_idx
+    interior_axis  = fc.interior_axis
+    n_int = length(interior_left)
 
     # Dispatch interior faces in parallel. The CellView is constructed
     # with `fields_in` bound to both slots: the flux pass treats cells
     # as read-only and writes to `fluxes_out` instead.
     parallel_foreach(backend,
-                     face -> begin
-                         i, j, axis, _hanging = face
+                     k -> begin
+                         @inbounds i = Int(interior_left[k])
+                         @inbounds j = Int(interior_right[k])
+                         @inbounds axis = Int(interior_axis[k])
                          cv_left  = cell_view(fields_in, fields_in, frame, i)
                          cv_right = cell_view(fields_in, fields_in, frame, j)
                          normal = _axis_unit_vector(Val(D), axis)
                          flux_kernel(cv_left, cv_right, normal, ctx)
                          return nothing
                      end,
-                     interior)
+                     1:n_int)
 
     # Boundary faces are typically a small minority; dispatch sequentially
     # so the dispatch order is deterministic without coordination.
     if flux_kernel_boundary !== nothing
-        for face in boundary
-            i, axis, side = face
+        boundary_cell = fc.boundary_cell_idx
+        boundary_axis = fc.boundary_axis
+        boundary_side = fc.boundary_side
+        n_bnd = length(boundary_cell)
+        @inbounds for k in 1:n_bnd
+            i = Int(boundary_cell[k])
+            axis = Int(boundary_axis[k])
+            side = Int(boundary_side[k])
             cv = cell_view(fields_in, fields_in, frame, i)
             normal = _signed_axis_vector(Val(D), axis, side)
             flux_kernel_boundary(cv, axis, side, normal, bcs, ctx)
