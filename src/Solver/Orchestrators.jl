@@ -150,6 +150,8 @@ function for_each_cell!(kernel, fields_out, fields_in,
     # ensure the neighbor graph too, since even a depth-1 halo will walk
     # face_neighbors lazily otherwise.
     ensure_neighbor_graph!(mesh)
+    # Per-cell physical-AABB cache so `cell_view` reads are alloc-free.
+    ensure_physical_boxes!(frame)
 
     leaves = enumerate_leaves(mesh)
     # `HaloView` requires ghost_depth ≥ 1; clamp the constructor depth so
@@ -224,6 +226,8 @@ function for_each_face!(flux_kernel, fluxes_out, fields_in,
     # Pre-warm caches and the neighbor graph before any parallel fan-out.
     Mesh.ensure_caches!(mesh)
     ensure_neighbor_graph!(mesh)
+    # Per-cell physical-AABB cache so `cell_view` reads are alloc-free.
+    ensure_physical_boxes!(frame)
 
     # PR-2 face-list cache: build the (interior, boundary) enumeration
     # once and reuse until the next refinement event invalidates it.
@@ -314,6 +318,9 @@ function for_each_block!(kernel, fields_out, fields_in,
     # Pre-warm caches (PR-1 lesson) before going parallel.
     Mesh.ensure_caches!(mesh)
     ensure_neighbor_graph!(mesh)
+    # Per-cell physical-AABB cache so `block_view` / `cell_view` reads
+    # within the kernel don't fall back to the allocating chain walk.
+    ensure_physical_boxes!(frame)
 
     leaves = enumerate_leaves(mesh)
     halo_depth = max(1, ghost_depth)

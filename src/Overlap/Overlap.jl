@@ -87,6 +87,9 @@ export FrameBoundaries, bc
 # Face-list cache (PR-2)
 export FrameFaceCache, ensure_face_cache!
 
+# Physical-AABB cache (orchestrator pre-warm)
+export ensure_physical_boxes!
+
 export OverlapEntry, GeometricOverlap, OverlapBuilder
 export n_entries, moment_order, entries_for_lag, entries_for_eul, total_overlap_volume
 export push_overlap!, merge_builder!, finalize_overlap
