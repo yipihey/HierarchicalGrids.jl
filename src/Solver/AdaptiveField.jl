@@ -32,10 +32,15 @@ over each child's sub-box in the parent's reference frame. The result
 preserves all moments up to the basis degree — total mass, centroid×mass,
 second moments, etc. — exactly (modulo floating-point round-off).
 
-For non-`MonomialBasis` polynomial bases (`BernsteinBasis`, future
-`LagrangeBasis{D, P}` in D > 1), AdaptiveField falls back to
-constant-moment-only coarsening with a single warning. Convert via
-`change_basis` for full higher-order projection.
+For `BernsteinBasis{D, P}` fields, the same exact L²-projection is
+applied via `change_basis`: each child's Bernstein coefficients are
+converted to monomial form, the projection is performed in monomial
+space, and the resulting parent coefficients are converted back to
+Bernstein. The conversion matrices are cached per `(D, P)`.
+
+For other polynomial bases (e.g. future `LagrangeBasis{D, P}` in D > 1),
+AdaptiveField falls back to constant-moment-only coarsening with a
+single warning.
 
 # Field replacement
 
@@ -215,16 +220,20 @@ function _write_coeffs_average!(
     end
 
     # Degree ≥ 1: try the L²-projection path (exact recovery of all
-    # moments up to degree P). Falls back to the legacy constant-moment
-    # path with a warning if the basis is unsupported.
+    # moments up to degree P). MonomialBasis takes the path directly;
+    # BernsteinBasis brackets the projection with `change_basis` from/to
+    # monomial form (the conversion matrices are cached). Falls back to
+    # constant-moment only, with a warning, for any other basis.
     if pfs.basis isa MonomialBasis
         _write_coeffs_l2_projection!(pfs, snap, new_i, src_cols, parent_cell)
+        return nothing
+    elseif pfs.basis isa BernsteinBasis
+        _write_coeffs_l2_projection_bernstein!(pfs, snap, new_i, src_cols, parent_cell)
         return nothing
     end
 
     # Fallback: constant-moment only, with a once-per-AdaptiveField warning.
-    # Reached by `BernsteinBasis` and any future non-monomial bases at
-    # degree ≥ 1. Convert via `change_basis` to take the exact path.
+    # Reached by future non-monomial / non-Bernstein bases at degree ≥ 1.
     if !basis_degree_warned[]
         @warn "AdaptiveField: coarsening a degree>=1 field with " *
               "$(typeof(pfs.basis).name.name) uses the constant-moment-only " *
@@ -357,6 +366,56 @@ function _parent_reference_mass(::Type{T}, ::Val{D}, P::Int) where {T, D}
     return M
 end
 
+# Core L²-projection step: given a snapshot column-matrix `Mfield` of children
+# coefficients in monomial form, the children's source columns `src_cols`,
+# and the parent split mask, return the parent's monomial coefficients.
+# Falls back to constant-moment-only with a warning if the mass-matrix
+# solve fails (singular, extremely ill-conditioned, etc.).
+function _project_monomial_children_to_parent(
+    Mfield::AbstractMatrix{T}, src_cols, parent_mask::Unsigned,
+    ::Val{D}, P::Int, name::Symbol) where {T, D}
+    nc = moments_length(D, P)
+    n_children = length(src_cols)
+
+    Mp = _parent_reference_mass(T, Val(D), P)
+    rhs = zeros(T, nc)
+
+    # Iterate children in DFS order; sibling indices are 0..n-1 (refine_cells!
+    # emits children contiguously with the same split_mask as the parent).
+    ci_offset = 0
+    for c in src_cols
+        child_sib = ci_offset
+        a, b = _child_unit_subbox(child_sib, parent_mask, Val(D))
+        a_T = ntuple(d -> T(a[d]), Val(D))
+        b_T = ntuple(d -> T(b[d]), Val(D))
+        Mcross = _cross_mass_matrix(a_T, b_T, P)
+        for αi in 1:nc
+            acc = zero(T)
+            for βi in 1:nc
+                acc += Mcross[αi, βi] * Mfield[βi, c]
+            end
+            rhs[αi] += acc
+        end
+        ci_offset += 1
+    end
+
+    return try
+        Mp \ rhs
+    catch err
+        # Graceful degradation: constant moment only.
+        s_const = zero(T)
+        for col in src_cols
+            s_const += Mfield[1, col]
+        end
+        avg = s_const / T(n_children)
+        @warn "AdaptiveField: mass-matrix solve failed during coarsening " *
+              "(field $name); falling back to constant-moment average." err
+        fb = zeros(T, nc)
+        fb[1] = avg
+        fb
+    end
+end
+
 # L²-projection coarsening for one cell. Performs the per-event mass-matrix
 # solve and writes the result into element `new_i` of `pfs`. Falls back to
 # constant-moment averaging if the mass-matrix solve fails (e.g. singular,
@@ -369,67 +428,12 @@ function _write_coeffs_l2_projection!(
     D, P = _basis_dim_degree(basis)
     nc = n_coeffs(basis)
     @assert nc == moments_length(D, P) "MonomialBasis n_coeffs mismatch"
-    n_children = length(src_cols)
     parent_mask = parent_cell.split_mask
 
-    # Determine T from the storage. Each named field may technically have
-    # its own scalar type; we pick the field's type as we iterate.
-    @inbounds for (field_idx, name) in enumerate(Names)
+    @inbounds for name in Names
         Mfield = getfield(snap, name)
-        T = eltype(Mfield)
-
-        # Per-cell parent reference mass and accumulated RHS.
-        # Both depend only on D, P, T — could be cached across fields, but
-        # the cost is dominated by the mass-matrix build (one D×D-tuple of
-        # (P+1)×(P+1) tables per child) which already dominates per-axis
-        # cubic loops; reusing across fields would save little.
-        Mp = _parent_reference_mass(T, Val(D), P)
-        rhs = zeros(T, nc)
-        # Working buffer for per-child cross mass matrix.
-        Mcross_scratch = nothing
-
-        # Iterate children in DFS order; their sibling indices are 0..n-1
-        # (refine_cells! always emits children in that order with the same
-        # split_mask as the parent). Build each cross mass matrix once and
-        # apply to that child's coefficients.
-        ci_offset = 0
-        for c in src_cols
-            child_sib = ci_offset
-            a, b = _child_unit_subbox(child_sib, parent_mask, Val(D))
-            a_T = ntuple(d -> T(a[d]), Val(D))
-            b_T = ntuple(d -> T(b[d]), Val(D))
-            Mcross = _cross_mass_matrix(a_T, b_T, P)
-            # rhs += Mcross * c_child
-            for αi in 1:nc
-                acc = zero(T)
-                for βi in 1:nc
-                    acc += Mcross[αi, βi] * Mfield[βi, c]
-                end
-                rhs[αi] += acc
-            end
-            ci_offset += 1
-        end
-
-        # Solve M_P · c_P = rhs. The parent reference mass matrix is the
-        # *unit cube* mass matrix; both M_P and rhs are integrated over
-        # the parent reference cell, so the volume factors cancel.
-        # On singular failure (shouldn't happen for moderate P), fall back
-        # to constant-moment-only as a safety net.
-        coeffs = try
-            Mp \ rhs
-        catch err
-            # Graceful degradation: constant moment only.
-            s_const = zero(T)
-            for col in src_cols
-                s_const += Mfield[1, col]
-            end
-            avg = s_const / T(n_children)
-            @warn "AdaptiveField: mass-matrix solve failed during coarsening " *
-                  "(field $name); falling back to constant-moment average." err
-            fb = zeros(T, nc)
-            fb[1] = avg
-            fb
-        end
+        coeffs = _project_monomial_children_to_parent(
+            Mfield, src_cols, parent_mask, Val(D), P, name)
         for k in 1:nc
             _set_poly_coeff!(pfs, Val(name), new_i, k, coeffs[k])
         end
@@ -437,8 +441,51 @@ function _write_coeffs_l2_projection!(
     return nothing
 end
 
-# Tiny helper: pull (D, P) out of a MonomialBasis type.
+# L²-projection coarsening for `BernsteinBasis` cells. Brackets the
+# `_project_monomial_children_to_parent` step with `change_basis` calls:
+# children's Bernstein coefficients → monomial → projection → parent's
+# Bernstein. The `change_basis` matrices are cached per `(D, P)`.
+function _write_coeffs_l2_projection_bernstein!(
+    pfs::PolynomialFieldSet{L, B, Names, ST, S},
+    snap, new_i::Int, src_cols, parent_cell) where {L, B, Names, ST, S}
+    basis = pfs.basis::BernsteinBasis
+    D, P = _basis_dim_degree(basis)
+    nc = n_coeffs(basis)
+    parent_mask = parent_cell.split_mask
+    mono_basis = MonomialBasis{D, P}()
+
+    @inbounds for name in Names
+        Mbern = getfield(snap, name)
+        T = eltype(Mbern)
+
+        # Convert each child's Bernstein coefficients to monomial form.
+        # Build a per-field column-matrix in monomial space using the same
+        # column indices as the original snapshot — this lets us reuse
+        # `_project_monomial_children_to_parent` unchanged.
+        n_old_cols = size(Mbern, 2)
+        Mmono = Matrix{T}(undef, nc, n_old_cols)
+        for c in src_cols
+            bern_vec = @view Mbern[:, c]
+            mono_vec = change_basis(mono_basis, basis, bern_vec)
+            for k in 1:nc
+                Mmono[k, c] = T(mono_vec[k])
+            end
+        end
+
+        mono_parent = _project_monomial_children_to_parent(
+            Mmono, src_cols, parent_mask, Val(D), P, name)
+        bern_parent = change_basis(basis, mono_basis, mono_parent)
+
+        for k in 1:nc
+            _set_poly_coeff!(pfs, Val(name), new_i, k, T(bern_parent[k]))
+        end
+    end
+    return nothing
+end
+
+# Tiny helper: pull (D, P) out of a MonomialBasis or BernsteinBasis type.
 @inline _basis_dim_degree(::MonomialBasis{D, P}) where {D, P} = (D, P)
+@inline _basis_dim_degree(::BernsteinBasis{D, P}) where {D, P} = (D, P)
 
 # ----------------------------------------------------------------------------
 # Event handler

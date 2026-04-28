@@ -35,7 +35,8 @@ using ..Mesh: RefinementEvent, ListenerHandle,
               register_refinement_listener!, unregister_refinement_listener!
 using ..BoundaryConditions: BCKind, BoundarySpec, is_periodic_axis,
                             PERIODIC, INFLOW, OUTFLOW, REFLECTING, DIRICHLET
-using ..Bases: AbstractBasis, MonomialBasis, BernsteinBasis, n_coeffs, evaluate
+using ..Bases: AbstractBasis, MonomialBasis, BernsteinBasis, n_coeffs, evaluate,
+                change_basis
 using ..Storage
 using ..Storage: PolynomialFieldSet, PolynomialFieldView, PolynomialView,
                  PointSampleFieldSet, PointSampleFieldView, PointSampleView,

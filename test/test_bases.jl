@@ -1,8 +1,11 @@
 using Test
+using Random
 using HierarchicalGrids
 using HierarchicalGrids.Bases
 using HierarchicalGrids.Bases: monomial_exponents, bernstein_multiindices,
-                               multinomial_coefficient, is_positive_certificate
+                               multinomial_coefficient, is_positive_certificate,
+                               _bernstein_to_monomial_matrix,
+                               _monomial_to_bernstein_matrix
 
 @testset "Bases" begin
 
@@ -321,6 +324,97 @@ using HierarchicalGrids.Bases: monomial_exponents, bernstein_multiindices,
 
         b = MonomialBasis{1, 2}()
         @test_throws DimensionMismatch evaluate(b, [1.0, 2.0], (0.5,))  # wrong length
+    end
+
+    # --------------------------------------------------------------------
+    # D-dim simplex Bernstein ↔ Monomial change_basis (PR-4)
+    # --------------------------------------------------------------------
+
+    @testset "change_basis D-dim: round-trip identity" begin
+        rng = MersenneTwister(0xb157)
+        for D in 1:3, P in 1:3
+            n = binomial(D + P, P)
+            bern_coeffs = randn(rng, n)
+            bb = BernsteinBasis{D, P}()
+            bm = MonomialBasis{D, P}()
+            mono = change_basis(bm, bb, bern_coeffs)
+            bern_back = change_basis(bb, bm, mono)
+            @test bern_back ≈ bern_coeffs atol=1e-10 rtol=1e-10
+            # And the other direction
+            mono_coeffs = randn(rng, n)
+            bern2 = change_basis(bb, bm, mono_coeffs)
+            mono_back = change_basis(bm, bb, bern2)
+            @test mono_back ≈ mono_coeffs atol=1e-10 rtol=1e-10
+        end
+    end
+
+    @testset "change_basis D-dim: polynomial evaluation parity" begin
+        rng = MersenneTwister(0xc0ffee)
+        for D in 1:3, P in 1:3
+            n = binomial(D + P, P)
+            bern_coeffs = randn(rng, n)
+            bb = BernsteinBasis{D, P}()
+            bm = MonomialBasis{D, P}()
+            mono_coeffs = change_basis(bm, bb, bern_coeffs)
+            # Sample interior points of the reference D-simplex.
+            for _ in 1:8
+                # Generate a random point inside {x : x_d ≥ 0, Σ x_d ≤ 1}.
+                # Use a simple rejection / scaling approach: pick uniform
+                # x in [0, 1]^D, scale by α/Σx_d so that α ≤ 1.
+                pt_vec = rand(rng, D)
+                s = sum(pt_vec)
+                if s > 0.95
+                    pt_vec .*= 0.9 / s   # contract into the interior
+                end
+                pt = NTuple{D, Float64}(pt_vec)
+                v_bern = evaluate(bb, bern_coeffs, pt)
+                v_mono = evaluate(bm, mono_coeffs, pt)
+                @test isapprox(v_bern, v_mono; atol=1e-10, rtol=1e-10)
+            end
+        end
+    end
+
+    @testset "change_basis D-dim: matches existing 1D-specialized methods" begin
+        # The D-generic transform must reproduce the 1D-specialized result
+        # when D=1. We compare matrices directly to bypass any `dispatch`
+        # ambiguity (the 1D-specialized methods take priority via dispatch).
+        for P in 1:6
+            M_dgen = _bernstein_to_monomial_matrix(Val(1), Val(P))
+            # 1D-specialized formula: c_k = (P choose k) Σ_{i=0..k}
+            #     (-1)^{k-i} (k choose i) b_i, i.e.
+            # row k+1 has entries (P choose k)(-1)^{k-i}(k choose i) at i+1.
+            M_ref = zeros(P + 1, P + 1)
+            for k in 0:P, i in 0:k
+                M_ref[k + 1, i + 1] = binomial(P, k) * (-1)^(k - i) * binomial(k, i)
+            end
+            @test maximum(abs.(M_dgen .- M_ref)) < 1e-12
+
+            # Inverse direction
+            Minv_dgen = _monomial_to_bernstein_matrix(Val(1), Val(P))
+            Minv_ref = zeros(P + 1, P + 1)
+            for i in 0:P, k in 0:i
+                Minv_ref[i + 1, k + 1] = binomial(i, k) / binomial(P, k)
+            end
+            @test maximum(abs.(Minv_dgen .- Minv_ref)) < 1e-12
+        end
+    end
+
+    @testset "change_basis D-dim: cache hit returns same matrix" begin
+        # First call builds and caches; second call returns the cached
+        # matrix object (same `===` identity). This guards against an
+        # accidental rebuild on every call.
+        bb = BernsteinBasis{2, 3}()
+        bm = MonomialBasis{2, 3}()
+        c = randn(MersenneTwister(7), n_coeffs(bb))
+        # Prime the cache.
+        _ = change_basis(bm, bb, c)
+        M1 = _bernstein_to_monomial_matrix(Val(2), Val(3))
+        M2 = _bernstein_to_monomial_matrix(Val(2), Val(3))
+        @test M1 === M2  # same object identity ⇒ cached, not rebuilt
+
+        Minv1 = _monomial_to_bernstein_matrix(Val(2), Val(3))
+        Minv2 = _monomial_to_bernstein_matrix(Val(2), Val(3))
+        @test Minv1 === Minv2
     end
 
 end
