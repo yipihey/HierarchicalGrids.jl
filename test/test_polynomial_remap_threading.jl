@@ -17,7 +17,7 @@ using LinearAlgebra: det
 # order on every call.
 # ============================================================================
 
-const _BACKENDS = [
+const _PRT_BACKENDS = [
     ("Sequential",                    Sequential()),
     ("OhMyThreadsBackend(:dynamic)",  OhMyThreadsBackend(:dynamic)),
     ("OhMyThreadsBackend(:static)",   OhMyThreadsBackend(:static)),
@@ -132,7 +132,7 @@ end
                               setup.src_frames, setup.dst_frames, P, P;
                               backend = Sequential())
 
-    for (label, backend) in _BACKENDS
+    for (label, backend) in _PRT_BACKENDS
         dst = zeros(n_phys, n_eul)
         polynomial_remap_l_to_e!(dst, src, overlap,
                                   setup.src_frames, setup.dst_frames, P, P;
@@ -155,7 +155,7 @@ end
                               setup.src_frames, setup.dst_frames, P, P;
                               backend = Sequential())
 
-    for (label, backend) in _BACKENDS
+    for (label, backend) in _PRT_BACKENDS
         dst = zeros(n_phys, n_eul)
         polynomial_remap_l_to_e!(dst, src, overlap,
                                   setup.src_frames, setup.dst_frames, P, P;
@@ -182,7 +182,7 @@ end
                               setup.dst_frames, setup.src_frames, P, P;
                               backend = Sequential())
 
-    for (label, backend) in _BACKENDS
+    for (label, backend) in _PRT_BACKENDS
         dst = zeros(n_phys, n_lag)
         polynomial_remap_e_to_l!(dst, src, overlap,
                                   setup.dst_frames, setup.src_frames, P, P;
@@ -204,7 +204,7 @@ end
                               setup.dst_frames, setup.src_frames, P, P;
                               backend = Sequential())
 
-    for (label, backend) in _BACKENDS
+    for (label, backend) in _PRT_BACKENDS
         dst = zeros(n_phys, n_lag)
         polynomial_remap_e_to_l!(dst, src, overlap,
                                   setup.dst_frames, setup.src_frames, P, P;
@@ -268,7 +268,7 @@ end
                                 overlap, P_src, P_dst;
                                 invert = false, backend = Sequential())
 
-    for (label, backend) in _BACKENDS
+    for (label, backend) in _PRT_BACKENDS
         rhs = zeros(n_dst, n_eul)
         accumulate_polynomial_rhs!(rhs, src_coeffs, src_pullbacks, dst_pullbacks,
                                     overlap, P_src, P_dst;
@@ -282,7 +282,7 @@ end
     accumulate_polynomial_rhs!(rhs_ref_e, src_coeffs_e, dst_pullbacks, src_pullbacks,
                                 overlap, P_src, P_dst;
                                 invert = true, backend = Sequential())
-    for (label, backend) in _BACKENDS
+    for (label, backend) in _PRT_BACKENDS
         rhs = zeros(n_dst, n_lag)
         accumulate_polynomial_rhs!(rhs, src_coeffs_e, dst_pullbacks, src_pullbacks,
                                     overlap, P_src, P_dst;
@@ -305,7 +305,7 @@ end
                               setup.src_frames, setup.dst_frames, P, P;
                               backend = Sequential())
 
-    for (label, backend) in _BACKENDS
+    for (label, backend) in _PRT_BACKENDS
         dst = zeros(n_phys, n_eul)
         polynomial_remap_l_to_e!(dst, src, overlap,
                                   setup.src_frames, setup.dst_frames, P, P;

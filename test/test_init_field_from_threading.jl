@@ -13,7 +13,7 @@ using HierarchicalGrids.Initialization: init_field_from!
 # floating-point sums.
 # ============================================================================
 
-const _BACKENDS = [
+const _IFT_BACKENDS = [
     ("Sequential",                    Sequential()),
     ("OhMyThreadsBackend(:dynamic)",  OhMyThreadsBackend(:dynamic)),
     ("OhMyThreadsBackend(:static)",   OhMyThreadsBackend(:static)),
@@ -62,7 +62,7 @@ end
     init_field_from!(ref_field, frame, f; backend = Sequential())
     ref = _extract_all_coeffs(ref_field, n)
 
-    for (label, backend) in _BACKENDS
+    for (label, backend) in _IFT_BACKENDS
         fld = allocate_polynomial_fields(SoA(), basis, n; u = Float64)
         init_field_from!(fld, frame, f; backend = backend)
         coeffs = _extract_all_coeffs(fld, n)
@@ -124,7 +124,7 @@ end
     init_field_from!(ref_field, mesh, f; backend = Sequential())
     ref = _extract_all_coeffs(ref_field, ns)
 
-    for (label, backend) in _BACKENDS
+    for (label, backend) in _IFT_BACKENDS
         fld = allocate_polynomial_fields(SoA(), basis, ns; u = Float64)
         init_field_from!(fld, mesh, f; backend = backend)
         coeffs = _extract_all_coeffs(fld, ns)

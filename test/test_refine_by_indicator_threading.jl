@@ -40,7 +40,7 @@ end
 # `OhMyThreadsBackend(:serial)`) are kept distinct because they exercise
 # different code paths (the former dispatches on the trait and skips
 # OhMyThreads entirely; the latter routes through `tforeach`).
-const _ALL_BACKENDS = AbstractParallelBackend[
+const _RBI_BACKENDS = AbstractParallelBackend[
     Sequential(),
     OhMyThreadsBackend(:dynamic),
     OhMyThreadsBackend(:static),
@@ -92,7 +92,7 @@ end
     end
 
     results = []
-    for backend in _ALL_BACKENDS
+    for backend in _RBI_BACKENDS
         m = deepcopy(base)
         r = refine_by_indicator!(m, indicator(m);
                                   refine_threshold = 1.0,
