@@ -237,4 +237,8 @@ using HierarchicalGrids
     @testset "Phase 2 worked example: cell-based advection (PR-14)" begin
         include("test_cfd_cell_advection.jl")
     end
+
+    @testset "Phase 2 worked example: Sod-tube compressible (PR-3)" begin
+        include("test_cfd_compressible_sod.jl")
+    end
 end
