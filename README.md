@@ -1,5 +1,7 @@
 # HierarchicalGrids.jl
 
+[![CI](https://github.com/yipihey/HierarchicalGrids.jl/actions/workflows/test.yml/badge.svg)](https://github.com/yipihey/HierarchicalGrids.jl/actions/workflows/test.yml)
+
 A Julia framework for hierarchical adaptive grids in arbitrary dimensions, with
 integer-exact geometry, decoupled memory layouts, and an exact polyhedral
 overlap layer for Lagrangian↔Eulerian remap.
