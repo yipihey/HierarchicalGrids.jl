@@ -265,6 +265,13 @@ mutable struct HierarchicalMesh{D, M<:Unsigned}
     # dependency from Mesh on the NeighborGraph type. Reset to `nothing`
     # by a refinement listener registered when the graph is first built.
     _cached_neighbor_graph::Any
+
+    # Lazily-built per-leaf BC-resolved neighbor table, keyed by the
+    # periodic-axes mask. `Any` (concretely a small Dict) so we don't
+    # bake the dimension-specific tuple type into the struct. Reset to
+    # `nothing` by a refinement listener that fires alongside the
+    # neighbor-graph invalidator. See Neighbors.jl::face_neighbors_with_bcs.
+    _cached_bc_neighbor_table::Any
 end
 
 """
@@ -287,6 +294,7 @@ function HierarchicalMesh{D}(; balanced::Bool=false) where D
         UInt64(1),                   # next handle starts at 1
         balanced,                    # enforce 2:1 balance on refine?
         nothing,                     # no neighbor graph cached yet
+        nothing,                     # no BC-resolved neighbor table cached yet
     )
 end
 

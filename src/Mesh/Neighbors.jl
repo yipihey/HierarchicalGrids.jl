@@ -747,30 +747,83 @@ function face_neighbors_with_bcs(mesh::HierarchicalMesh{D, M}, i::Integer,
     g = ensure_neighbor_graph!(mesh)
     base = g.representatives[Int(i)]
 
-    # Identify which axes are periodic. Use the public is_periodic_axis
-    # method that BoundaryConditions and FrameBoundaries both export.
-    any_periodic = false
-    @inbounds for d in 1:D
-        if _bc_is_periodic_axis(frame_bcs, d)
-            any_periodic = true
-            break
-        end
-    end
-    any_periodic || return base
+    # Build the periodic-axes mask up-front; if no axis is periodic, the
+    # base graph already has the right answer.
+    mask = ntuple(d -> _bc_is_periodic_axis(frame_bcs, d), Val(D))
+    any(mask) || return base
 
-    # Get this leaf's unit-cube box. If it's not a leaf, we have nothing
-    # sensible to wire; return the (zero) entry.
+    # Non-leaf cells have no meaningful BC wiring; the base graph gives the
+    # right (zero) entry.
     is_leaf(mesh.cells[Int(i)]) || return base
 
-    (a_lo, a_hi) = _unit_box(mesh, Int(i))
+    table = _ensure_periodic_bc_table!(mesh, mask)
+    return table[Int(i)]
+end
 
-    # Collect leaves once; we need to scan opposite-wall leaves for matches.
-    # For typical mesh sizes the cost is O(N_leaves * D), in line with the
-    # rest of the neighbor-graph pipeline.
+"""
+    _ensure_periodic_bc_table!(mesh, mask::NTuple{D, Bool})
+        -> Vector{NTuple{2D, UInt32}}
+
+Lazily build (and cache) the per-leaf BC-resolved neighbor table for a
+given periodic-axes mask. Cache lives on `mesh._cached_bc_neighbor_table`
+as a `Dict{NTuple{D, Bool}, Vector{NTuple{2D, UInt32}}}` so multiple
+periodic configurations on the same mesh coexist (rare in practice; the
+common case keys to a single mask).
+
+The table is invalidated by a one-shot refinement listener registered on
+first build, mirroring the `_cached_neighbor_graph` pattern. Subsequent
+mesh refinements zero the slot, so the next call rebuilds from a fresh
+neighbor graph.
+
+This is the hot path for `face_neighbors_with_bcs` on periodic meshes:
+without the cache, every per-leaf call walks all leaves and allocates,
+making naive use O(N_leaves²) per step. With the cache, a per-call lookup
+is a single table read.
+"""
+function _ensure_periodic_bc_table!(mesh::HierarchicalMesh{D, M},
+                                       mask::NTuple{D, Bool}) where {D, M}
+    F = 2 * D
+    cache = mesh._cached_bc_neighbor_table
+    if cache === nothing
+        cache = Dict{NTuple{D, Bool}, Vector{NTuple{F, UInt32}}}()
+        mesh._cached_bc_neighbor_table = cache
+        # One-shot listener: clears the entire dict (all masks) on the
+        # next refinement. Mirrors `_cached_neighbor_graph`'s invalidator.
+        local_handle = Ref{ListenerHandle}(UInt64(0))
+        cb = function (_event::RefinementEvent)
+            mesh._cached_bc_neighbor_table = nothing
+            unregister_refinement_listener!(mesh, local_handle[])
+        end
+        local_handle[] = register_refinement_listener!(mesh, cb)
+    end
+    cache_typed = cache::Dict{NTuple{D, Bool}, Vector{NTuple{F, UInt32}}}
+    table = get(cache_typed, mask, nothing)
+    table === nothing || return table
+    table = _build_periodic_bc_table(mesh, mask)
+    cache_typed[mask] = table
+    return table
+end
+
+# Build the BC-resolved table by scanning leaves once: collect lo-wall and
+# hi-wall leaves per periodic axis, then assign each boundary leaf its
+# wrap-partner via a per-axis O(N_lo · N_hi) pass. For typical AMR meshes
+# only √N leaves touch any given wall, so this is much cheaper than the
+# O(N_leaves²) cost of the previous per-call walk.
+function _build_periodic_bc_table(mesh::HierarchicalMesh{D, M},
+                                    mask::NTuple{D, Bool}) where {D, M}
+    g = ensure_neighbor_graph!(mesh)
+    F = 2 * D
+    n = n_cells(mesh)
+    out = Vector{NTuple{F, UInt32}}(undef, n)
+    @inbounds for i in 1:n
+        out[i] = g.representatives[i]
+    end
+
+    # Snapshot leaves' unit-cube boxes once.
     leaves = UInt32[]
     leaf_lo = NTuple{D, Float64}[]
     leaf_hi = NTuple{D, Float64}[]
-    @inbounds for k in 1:n_cells(mesh)
+    @inbounds for k in 1:n
         if is_leaf(mesh.cells[k])
             (lo, hi) = _unit_box(mesh, k)
             push!(leaves, UInt32(k))
@@ -779,65 +832,83 @@ function face_neighbors_with_bcs(mesh::HierarchicalMesh{D, M}, i::Integer,
         end
     end
 
-    # Output tuple as a mutable array; we'll re-tuple at the end.
-    out = collect(base)
-
+    # For each periodic axis, partition leaves into wall groups so the
+    # match search is over the wall, not all leaves.
     @inbounds for d in 1:D
-        _bc_is_periodic_axis(frame_bcs, d) || continue
+        mask[d] || continue
         face_lo_idx = 2 * d - 1
         face_hi_idx = 2 * d
 
-        on_lo_boundary = a_lo[d] <= _NEIGHBOR_EPS
-        on_hi_boundary = a_hi[d] >= 1.0 - _NEIGHBOR_EPS
-
-        if on_lo_boundary && out[face_lo_idx] == 0
-            # Find the leaf on the hi-wall that overlaps in the other axes.
-            best = UInt32(0)
-            for k in eachindex(leaves)
-                # Candidate must touch the hi wall on axis d.
-                leaf_hi[k][d] >= 1.0 - _NEIGHBOR_EPS || continue
-                ok = true
-                for d2 in 1:D
-                    d2 == d && continue
-                    if !_open_overlap(a_lo[d2], a_hi[d2],
-                                       leaf_lo[k][d2], leaf_hi[k][d2])
-                        ok = false
-                        break
-                    end
-                end
-                ok || continue
-                idx = leaves[k]
-                if best == 0 || idx < best
-                    best = idx
-                end
+        wall_lo = Int[]   # indices into `leaves` whose box touches axis-d lo.
+        wall_hi = Int[]
+        for k in eachindex(leaves)
+            if leaf_lo[k][d] <= _NEIGHBOR_EPS
+                push!(wall_lo, k)
             end
-            best != 0 && (out[face_lo_idx] = best)
+            if leaf_hi[k][d] >= 1.0 - _NEIGHBOR_EPS
+                push!(wall_hi, k)
+            end
         end
 
-        if on_hi_boundary && out[face_hi_idx] == 0
+        # For every lo-wall leaf, find the smallest-index hi-wall leaf
+        # whose other-axes box overlaps. Same logic as the original; just
+        # restricted to the wall list.
+        for k in wall_lo
+            i = leaves[k]
+            tup = out[Int(i)]
+            tup[face_lo_idx] == 0 || continue
+            a_lo = leaf_lo[k]
+            a_hi = leaf_hi[k]
             best = UInt32(0)
-            for k in eachindex(leaves)
-                leaf_lo[k][d] <= _NEIGHBOR_EPS || continue
+            for k2 in wall_hi
                 ok = true
                 for d2 in 1:D
                     d2 == d && continue
                     if !_open_overlap(a_lo[d2], a_hi[d2],
-                                       leaf_lo[k][d2], leaf_hi[k][d2])
+                                       leaf_lo[k2][d2], leaf_hi[k2][d2])
                         ok = false
                         break
                     end
                 end
                 ok || continue
-                idx = leaves[k]
+                idx = leaves[k2]
                 if best == 0 || idx < best
                     best = idx
                 end
             end
-            best != 0 && (out[face_hi_idx] = best)
+            best == 0 && continue
+            out[Int(i)] = ntuple(f -> f == face_lo_idx ? best : tup[f], Val(F))
+        end
+
+        for k in wall_hi
+            i = leaves[k]
+            tup = out[Int(i)]
+            tup[face_hi_idx] == 0 || continue
+            a_lo = leaf_lo[k]
+            a_hi = leaf_hi[k]
+            best = UInt32(0)
+            for k2 in wall_lo
+                ok = true
+                for d2 in 1:D
+                    d2 == d && continue
+                    if !_open_overlap(a_lo[d2], a_hi[d2],
+                                       leaf_lo[k2][d2], leaf_hi[k2][d2])
+                        ok = false
+                        break
+                    end
+                end
+                ok || continue
+                idx = leaves[k2]
+                if best == 0 || idx < best
+                    best = idx
+                end
+            end
+            best == 0 && continue
+            out[Int(i)] = ntuple(f -> f == face_hi_idx ? best : tup[f], Val(F))
         end
     end
 
-    return ntuple(f -> out[f], Val(2*D))
+    return out
 end
 
 # Duck-typed dispatcher: works for both BoundarySpec tuples (via the
