@@ -4,6 +4,8 @@ version = "0.1.0"
 authors = ["Tom Abel <tabel@stanford.edu>"]
 
 [deps]
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+Krylov = "ba0b0d4f-ebba-5204-a429-3ac8c609bfb7"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 R3D = "6888587b-6711-4ff3-8558-83329515e735"
@@ -19,7 +21,9 @@ HierarchicalGridsHwlocExt = "Hwloc"
 HierarchicalGridsThreadPinningExt = "ThreadPinning"
 
 [compat]
+FFTW = "1"
 Hwloc = "3"
+Krylov = "0.9, 0.10"
 OhMyThreads = "0.8.5"
 R3D = "0.1.0"
 StaticArrays = "1"

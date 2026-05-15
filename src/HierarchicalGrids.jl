@@ -290,4 +290,21 @@ export add_patches!, for_each_patch!
 export restrict_to_parents!, prolong_from_parents!
 export step_patch_pipeline!
 
+# Layer 5 (elliptic solves): geometric multigrid Poisson solver on a
+# PatchHierarchy. Lives as a sub-module of the top-level package (NOT inside
+# Solver), so it can reach Solver, Mesh, BoundaryConditions, Bases, Storage,
+# Overlap, and Threading all through the same `using ..*` mechanism. The
+# `..Solver` reference inside the file binds to the sibling submodule.
+include("Solver/GeometricMultigrid.jl")
+using .GeometricMultigrid: MGWorkspace, MGOptions, MGResult,
+                           solve_poisson!, vcycle!,
+                           apply_laplacian!, compute_residual!, residual_l2,
+                           allocate_phi_rho, build_uniform_root_hierarchy,
+                           manufactured_rhs!, fill_field!
+export MGWorkspace, MGOptions, MGResult
+export solve_poisson!, vcycle!
+export apply_laplacian!, compute_residual!, residual_l2
+export allocate_phi_rho, build_uniform_root_hierarchy
+export manufactured_rhs!, fill_field!
+
 end # module HierarchicalGrids
