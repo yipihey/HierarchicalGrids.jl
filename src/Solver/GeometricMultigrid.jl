@@ -141,6 +141,27 @@ end
 # MGOptions / MGResult
 # ----------------------------------------------------------------------------
 
+# Per-axis BC summary used by `_read_phi` to resolve `nothing` ghost reads.
+struct AxisBCKinds{D}
+    kinds::NTuple{D, Symbol}   # :periodic | :dirichlet | :neumann
+end
+
+@inline function _axis_kinds_from_bcs(bcs::BoundarySpec{D}) where {D}
+    kinds = ntuple(D) do d
+        lo = bcs[d][1]; hi = bcs[d][2]
+        if lo == PERIODIC && hi == PERIODIC
+            :periodic
+        elseif lo == DIRICHLET && hi == DIRICHLET
+            :dirichlet
+        elseif lo == REFLECTING && hi == REFLECTING
+            :neumann
+        else
+            :neumann
+        end
+    end
+    return AxisBCKinds{D}(kinds)
+end
+
 Base.@kwdef struct MGOptions
     n_pre::Int            = 2
     n_post::Int           = 2
@@ -175,6 +196,18 @@ mutable struct MGWorkspace{D, T}
     patch_N::Vector{Vector{NTuple{D, Int}}}
     patch_dx::Vector{Vector{NTuple{D, T}}}
     patch_leaves::Vector{Vector{Vector{Int}}}
+
+    # Inverse of grid_idx: cart_to_cell[ℓ][pi][i, j[, k]] → cell index.
+    # Used by the fast direct-array smoother to read stencil neighbors
+    # without going through `for_each_patch!` (which allocates per cell).
+    cart_to_cell::Vector{Vector{Array{Int, D}}}
+
+    # Cached per-axis BC summary.
+    axis_kinds::AxisBCKinds{D}
+
+    # Cached per-level, per-patch rho_flat for the smoother (only sized to
+    # match each patch's n_cells; reused across V-cycles).
+    rho_flat::Vector{Vector{Vector{T}}}
 
     # Scratch fields, one per (level, patch).
     residual::Vector{Vector{NamedTuple}}
@@ -227,6 +260,26 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
     correction = allocate_phi_rho(ph)
     rhs_coarse = allocate_phi_rho(ph)
 
+    axis_kinds = _axis_kinds_from_bcs(bcs)
+    rho_flat = Vector{Vector{Vector{T}}}(undef, nL)
+    cart_to_cell = Vector{Vector{Array{Int, D}}}(undef, nL)
+    for ℓ in 1:nL
+        npatches = length(patches_at(ph, ℓ))
+        rho_flat[ℓ] = [Vector{T}(undef, n_cells(patches_at(ph, ℓ)[pi].mesh))
+                        for pi in 1:npatches]
+        c2c = Vector{Array{Int, D}}(undef, npatches)
+        for pi in 1:npatches
+            N = patch_N[ℓ][pi]
+            c2c_p = fill(0, N)
+            for c in patch_leaves[ℓ][pi]
+                gi = grid_idx[ℓ][pi][c]
+                c2c_p[gi...] = c
+            end
+            c2c[pi] = c2c_p
+        end
+        cart_to_cell[ℓ] = c2c
+    end
+
     # FFT bottom on level_range[1] (only if single-patch + tile-uniform).
     fft_ok = false
     fft_level = first(level_range)
@@ -277,6 +330,7 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
 
     ws = MGWorkspace{D, T}(ph, bcs, level_range, opts,
                             grid_idx, patch_N, patch_dx, patch_leaves,
+                            cart_to_cell, axis_kinds, rho_flat,
                             residual, correction, rhs_coarse,
                             fft_ok, fft_level, fft_N, fft_dx, fft_inv_eig,
                             fft_kind, fft_buf, fft_buf_complex,
@@ -385,27 +439,6 @@ end
     return T(v[1])
 end
 
-# Per-axis BC summary that the kernel uses to resolve `nothing` ghosts.
-struct AxisBCKinds{D}
-    kinds::NTuple{D, Symbol}   # :periodic | :dirichlet | :neumann
-end
-
-@inline function _axis_kinds_from_bcs(bcs::BoundarySpec{D}) where {D}
-    kinds = ntuple(D) do d
-        lo = bcs[d][1]; hi = bcs[d][2]
-        if lo == PERIODIC && hi == PERIODIC
-            :periodic
-        elseif lo == DIRICHLET && hi == DIRICHLET
-            :dirichlet
-        elseif lo == REFLECTING && hi == REFLECTING
-            :neumann
-        else
-            :neumann  # conservative fallback
-        end
-    end
-    return AxisBCKinds{D}(kinds)
-end
-
 # Laplacian kernel: writes L φ into pv[:phi].
 function _lapl_kernel(pv::PatchView, hv::PatchHaloView, ctx::AxisBCKinds{D}) where {D}
     p_lo, p_hi = cell_physical_box(hv.frame, pv.cv.index)
@@ -415,8 +448,8 @@ function _lapl_kernel(pv::PatchView, hv::PatchHaloView, ctx::AxisBCKinds{D}) whe
     @inbounds for d in 1:D
         h = p_hi[d] - p_lo[d]
         invh2 = one(T) / (h * h)
-        off_p = ntuple(j -> j == d ?  1 : 0, D)
-        off_m = ntuple(j -> j == d ? -1 : 0, D)
+        off_p = ntuple(j -> j == d ?  1 : 0, Val(D))
+        off_m = ntuple(j -> j == d ? -1 : 0, Val(D))
         phi_p = _read_phi(hv, off_p, phi_c, ctx.kinds)
         phi_m = _read_phi(hv, off_m, phi_c, ctx.kinds)
         acc += (phi_p - 2 * phi_c + phi_m) * invh2
@@ -436,14 +469,73 @@ function apply_laplacian!(Lphi::Vector{Vector{NamedTuple}},
                           ws::MGWorkspace{D, T};
                           level_range::UnitRange{Int} = ws.level_range,
                           backend = Sequential()) where {D, T}
-    ctx = _axis_kinds_from_bcs(ws.bcs)
+    ctx = ws.axis_kinds
     for ℓ in level_range
-        parent_in = ℓ >= 2 ? phi[ℓ - 1] : nothing
-        for_each_patch!(_lapl_kernel,
-                          Lphi[ℓ], phi[ℓ], ws.ph;
-                          level = ℓ, ghost_depth = 1,
-                          fields_in_parent = parent_in,
-                          ctx = ctx, backend = backend)
+        if ℓ == 1
+            apply_laplacian_root_fast!(Lphi, phi, ws)
+        else
+            parent_in = phi[ℓ - 1]
+            for_each_patch!(_lapl_kernel,
+                              Lphi[ℓ], phi[ℓ], ws.ph;
+                              level = ℓ, ghost_depth = 1,
+                              fields_in_parent = parent_in,
+                              ctx = ctx, backend = backend)
+        end
+    end
+    return Lphi
+end
+
+# Read phi at a wrapped/clamped axis-d neighbor of cell `c` at grid index I.
+# Returns the neighbor value, or the appropriate BC fall-back (`-phi_c` for
+# Dirichlet, `phi_c` for Neumann). Specialised per D via @generated for
+# allocation-free CartesianIndex arithmetic.
+@inline function _neighbor_phi(phi_f, c2c::Array{Int, D},
+                                I::CartesianIndex{D}, d::Int, sign::Int,
+                                N::NTuple{D, Int}, kinds::NTuple{D, Symbol},
+                                phi_c::T) where {D, T}
+    Nd = N[d]
+    i_new = I[d] + sign
+    if i_new < 1
+        kinds[d] === :periodic && (i_new = Nd)
+        kinds[d] === :neumann && (i_new = 1)
+        kinds[d] === :dirichlet && return -phi_c
+    elseif i_new > Nd
+        kinds[d] === :periodic && (i_new = 1)
+        kinds[d] === :neumann && (i_new = Nd)
+        kinds[d] === :dirichlet && return -phi_c
+    end
+    # Build new CartesianIndex by replacing axis d. Using `Base.setindex` on
+    # an NTuple{D, Int} is allocation-free for a small D.
+    new_tuple = Base.setindex(Tuple(I), i_new, d)
+    nb_I = CartesianIndex{D}(new_tuple)
+    nb_c = c2c[nb_I]
+    return T(phi_f[nb_c][1])
+end
+
+# Fast direct-array Laplacian for the root level (no parent halos).
+function apply_laplacian_root_fast!(Lphi::Vector{Vector{NamedTuple}},
+                                     phi::Vector{Vector{NamedTuple}},
+                                     ws::MGWorkspace{D, T}) where {D, T}
+    pi = 1; ℓ = 1
+    N = ws.patch_N[ℓ][pi]
+    dx = ws.patch_dx[ℓ][pi]
+    c2c = ws.cart_to_cell[ℓ][pi]
+    phi_f = phi[ℓ][pi].phi
+    Lphi_f = Lphi[ℓ][pi].phi
+    kinds = ws.axis_kinds.kinds
+    invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
+
+    @inbounds for I in CartesianIndices(N)
+        c = c2c[I]
+        c == 0 && continue
+        phi_c = T(phi_f[c][1])
+        acc = zero(T)
+        for d in 1:D
+            phi_p = _neighbor_phi(phi_f, c2c, I, d, +1, N, kinds, phi_c)
+            phi_m = _neighbor_phi(phi_f, c2c, I, d, -1, N, kinds, phi_c)
+            acc += (phi_p - 2 * phi_c + phi_m) * invh2[d]
+        end
+        Lphi_f[c] = (acc,)
     end
     return Lphi
 end
@@ -515,8 +607,8 @@ function _gs_colour_kernel(pv::PatchView, hv::PatchHaloView, ctx::GSCtx{D, T}) w
     @inbounds for d in 1:D
         h = p_hi[d] - p_lo[d]
         invh2 = one(T) / (h * h)
-        off_p = ntuple(j -> j == d ?  1 : 0, D)
-        off_m = ntuple(j -> j == d ? -1 : 0, D)
+        off_p = ntuple(j -> j == d ?  1 : 0, Val(D))
+        off_m = ntuple(j -> j == d ? -1 : 0, Val(D))
         phi_p = _read_phi(hv, off_p, phi_c, ctx.axis_kinds)
         phi_m = _read_phi(hv, off_m, phi_c, ctx.axis_kinds)
         nbr_acc += (phi_p + phi_m) * invh2
@@ -527,15 +619,18 @@ function _gs_colour_kernel(pv::PatchView, hv::PatchHaloView, ctx::GSCtx{D, T}) w
     return nothing
 end
 
-# Flatten rho[c] (a polynomial-field cell tuple) into a plain Vector{T}.
-function _flatten_rho(rho_view::NamedTuple, ::Type{T}) where {T}
-    rf = rho_view.rho
-    n  = length(rf)
-    out = Vector{T}(undef, n)
-    @inbounds for i in 1:n
-        out[i] = T(rf[i][1])
+# Fill ws.rho_flat[ℓ][pi] in place from rho[ℓ][pi].rho.
+@inline function _refresh_rho_flat!(ws::MGWorkspace{D, T},
+                                     rho::Vector{Vector{NamedTuple}},
+                                     ℓ::Int) where {D, T}
+    @inbounds for pi in 1:length(rho[ℓ])
+        rf = rho[ℓ][pi].rho
+        out = ws.rho_flat[ℓ][pi]
+        for i in 1:length(rf)
+            out[i] = T(rf[i][1])
+        end
     end
-    return out
+    return nothing
 end
 
 # One full RB-GS sweep over a level (both colours). Single-patch-per-level.
@@ -543,15 +638,73 @@ function gs_sweep!(phi::Vector{Vector{NamedTuple}},
                    rho::Vector{Vector{NamedTuple}},
                    ws::MGWorkspace{D, T}, ℓ::Int;
                    n_sweeps::Int = 1, backend = Sequential()) where {D, T}
+    _refresh_rho_flat!(ws, rho, ℓ)
+    if ℓ == 1
+        # Root level: no parent halos to worry about. Fast direct-array path.
+        gs_sweep_root_fast!(phi, ws, ℓ; n_sweeps = n_sweeps)
+    else
+        # Fine level: parent halos via PatchHaloView. Slow but correct.
+        gs_sweep_via_orchestrator!(phi, ws, ℓ; n_sweeps = n_sweeps,
+                                    backend = backend)
+    end
+    return phi
+end
+
+# Fast direct-array RB-GS for the ROOT level (no parent halos).
+# Reads stencil neighbors via `cart_to_cell` with explicit periodic /
+# Dirichlet / Neumann handling on the outer faces. Bypasses
+# `for_each_patch!` entirely — one allocation-free pass per sweep.
+function gs_sweep_root_fast!(phi::Vector{Vector{NamedTuple}},
+                              ws::MGWorkspace{D, T}, ℓ::Int;
+                              n_sweeps::Int = 1) where {D, T}
+    @assert ℓ == 1
+    pi = 1
+    N = ws.patch_N[ℓ][pi]
+    dx = ws.patch_dx[ℓ][pi]
+    c2c = ws.cart_to_cell[ℓ][pi]
+    phi_f = phi[ℓ][pi].phi
+    rho_flat = ws.rho_flat[ℓ][pi]
+    kinds = ws.axis_kinds.kinds
+    invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
+    diag = sum(d -> 2 * invh2[d], 1:D)
+
+    for _ in 1:n_sweeps
+        for colour in 0:1
+            @inbounds for I in CartesianIndices(N)
+                # parity test
+                s = 0
+                for d in 1:D; s += I[d]; end
+                (s & 1) == colour || continue
+                c = c2c[I]
+                c == 0 && continue
+                phi_c = T(phi_f[c][1])
+                nbr_acc = zero(T)
+                for d in 1:D
+                    phi_p = _neighbor_phi(phi_f, c2c, I, d, +1, N, kinds, phi_c)
+                    phi_m = _neighbor_phi(phi_f, c2c, I, d, -1, N, kinds, phi_c)
+                    nbr_acc += (phi_p + phi_m) * invh2[d]
+                end
+                rho_c = rho_flat[c]
+                phi_f[c] = ((nbr_acc - rho_c) / diag,)
+            end
+        end
+    end
+    return phi
+end
+
+# Fall-back smoother for non-root levels: uses `for_each_patch!` so that
+# parent halos at the fine-patch boundary resolve correctly through
+# PatchBoundaryBC.
+function gs_sweep_via_orchestrator!(phi::Vector{Vector{NamedTuple}},
+                                     ws::MGWorkspace{D, T}, ℓ::Int;
+                                     n_sweeps::Int = 1,
+                                     backend = Sequential()) where {D, T}
     parent_in = ℓ >= 2 ? phi[ℓ - 1] : nothing
-    npatches = length(phi[ℓ])
-    rho_flats = [_flatten_rho(rho[ℓ][pi], T) for pi in 1:npatches]
-    axis_kinds = _axis_kinds_from_bcs(ws.bcs).kinds
+    axis_kinds = ws.axis_kinds.kinds
     for _ in 1:n_sweeps
         for colour in (0, 1)
-            # Single-patch-per-level: ctx references patch 1. Multi-patch
-            # support is a v2 item; see plan §G "Root uniformity".
-            ctx = GSCtx{D, T}(colour, ws.grid_idx[ℓ][1], rho_flats[1], axis_kinds)
+            ctx = GSCtx{D, T}(colour, ws.grid_idx[ℓ][1], ws.rho_flat[ℓ][1],
+                              axis_kinds)
             for_each_patch!(_gs_colour_kernel,
                               phi[ℓ], phi[ℓ], ws.ph;
                               level = ℓ, ghost_depth = 1,
