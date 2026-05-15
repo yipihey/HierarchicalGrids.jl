@@ -226,6 +226,10 @@ using HierarchicalGrids
         include("test_patch_hierarchy.jl")
     end
 
+    @testset "Phase 2 (Solver): GeometricMultigrid Poisson solver" begin
+        include("test_geometric_multigrid.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end

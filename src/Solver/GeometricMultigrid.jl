@@ -243,7 +243,14 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
         N  = patch_N[fft_level][1]
         dx = patch_dx[fft_level][1]
         nleaves = count(c -> is_leaf(frame.mesh.cells[c]), 1:n_cells(frame.mesh))
-        if prod(N) == nleaves
+        # FFT bottom requires the patch to cover the full domain box (so
+        # the physical_bcs are the boundary condition seen by every face).
+        # For non-root patches the outer faces are Dirichlet-from-parent
+        # and the periodic / DST / DCT eigenvalues don't apply.
+        root_frame = patches_at(ph, 1)[1]
+        covers_domain = all(d -> frame.lo[d] == root_frame.lo[d] &&
+                                  frame.hi[d] == root_frame.hi[d], 1:D)
+        if prod(N) == nleaves && covers_domain
             kinds = Symbol[]
             ok = true
             for d in 1:D
@@ -350,16 +357,58 @@ end
 # ----------------------------------------------------------------------------
 
 @inline function _read_phi(hv::PatchHaloView{Names, Tin, D, T, GD, BC, NT, PBC},
-                            off::NTuple{D, Int}, default::T
+                            off::NTuple{D, Int}, phi_c::T,
+                            axis_kinds::NTuple{D, Symbol}
                             ) where {Names, Tin, D, T, GD, BC, NT, PBC}
     v = hv[:phi, off]
-    return v === nothing ? default : T(v[1])
+    if v === nothing
+        # `nothing` means the halo lookup hit a wall and no parent / periodic
+        # value was found. The correct ghost depends on the BC of the axis
+        # this offset is moving along:
+        #   :dirichlet → φ_ghost = −φ_c   (cell-centered, value=0 at face)
+        #   :neumann   → φ_ghost = +φ_c   (mirror)
+        #   :periodic  → unreachable (HaloView would have wrapped)
+        # The PatchHaloView already returns +φ_c for REFLECTING walls, so
+        # the `nothing` branch is essentially the Dirichlet/Inflow case.
+        d_active = 0
+        @inbounds for d in 1:D
+            if off[d] != 0
+                d_active = d; break
+            end
+        end
+        if d_active == 0 || axis_kinds[d_active] === :dirichlet
+            return -phi_c
+        else
+            return phi_c
+        end
+    end
+    return T(v[1])
+end
+
+# Per-axis BC summary that the kernel uses to resolve `nothing` ghosts.
+struct AxisBCKinds{D}
+    kinds::NTuple{D, Symbol}   # :periodic | :dirichlet | :neumann
+end
+
+@inline function _axis_kinds_from_bcs(bcs::BoundarySpec{D}) where {D}
+    kinds = ntuple(D) do d
+        lo = bcs[d][1]; hi = bcs[d][2]
+        if lo == PERIODIC && hi == PERIODIC
+            :periodic
+        elseif lo == DIRICHLET && hi == DIRICHLET
+            :dirichlet
+        elseif lo == REFLECTING && hi == REFLECTING
+            :neumann
+        else
+            :neumann  # conservative fallback
+        end
+    end
+    return AxisBCKinds{D}(kinds)
 end
 
 # Laplacian kernel: writes L φ into pv[:phi].
-function _lapl_kernel(pv::PatchView, hv::PatchHaloView, ::Nothing)
+function _lapl_kernel(pv::PatchView, hv::PatchHaloView, ctx::AxisBCKinds{D}) where {D}
     p_lo, p_hi = cell_physical_box(hv.frame, pv.cv.index)
-    D = length(p_lo)
     T = eltype(p_lo)
     phi_c = T(pv[:phi][1])
     acc = zero(T)
@@ -368,8 +417,8 @@ function _lapl_kernel(pv::PatchView, hv::PatchHaloView, ::Nothing)
         invh2 = one(T) / (h * h)
         off_p = ntuple(j -> j == d ?  1 : 0, D)
         off_m = ntuple(j -> j == d ? -1 : 0, D)
-        phi_p = _read_phi(hv, off_p, phi_c)
-        phi_m = _read_phi(hv, off_m, phi_c)
+        phi_p = _read_phi(hv, off_p, phi_c, ctx.kinds)
+        phi_m = _read_phi(hv, off_m, phi_c, ctx.kinds)
         acc += (phi_p - 2 * phi_c + phi_m) * invh2
     end
     pv[:phi] = (acc,)
@@ -387,13 +436,14 @@ function apply_laplacian!(Lphi::Vector{Vector{NamedTuple}},
                           ws::MGWorkspace{D, T};
                           level_range::UnitRange{Int} = ws.level_range,
                           backend = Sequential()) where {D, T}
+    ctx = _axis_kinds_from_bcs(ws.bcs)
     for ℓ in level_range
         parent_in = ℓ >= 2 ? phi[ℓ - 1] : nothing
         for_each_patch!(_lapl_kernel,
                           Lphi[ℓ], phi[ℓ], ws.ph;
                           level = ℓ, ghost_depth = 1,
                           fields_in_parent = parent_in,
-                          ctx = nothing, backend = backend)
+                          ctx = ctx, backend = backend)
     end
     return Lphi
 end
@@ -446,6 +496,7 @@ struct GSCtx{D, T}
     target_colour::Int
     grid_idx::Vector{NTuple{D, Int}}
     rho_flat::Vector{T}
+    axis_kinds::NTuple{D, Symbol}
 end
 
 function _gs_colour_kernel(pv::PatchView, hv::PatchHaloView, ctx::GSCtx{D, T}) where {D, T}
@@ -466,8 +517,8 @@ function _gs_colour_kernel(pv::PatchView, hv::PatchHaloView, ctx::GSCtx{D, T}) w
         invh2 = one(T) / (h * h)
         off_p = ntuple(j -> j == d ?  1 : 0, D)
         off_m = ntuple(j -> j == d ? -1 : 0, D)
-        phi_p = _read_phi(hv, off_p, phi_c)
-        phi_m = _read_phi(hv, off_m, phi_c)
+        phi_p = _read_phi(hv, off_p, phi_c, ctx.axis_kinds)
+        phi_m = _read_phi(hv, off_m, phi_c, ctx.axis_kinds)
         nbr_acc += (phi_p + phi_m) * invh2
         diag    += 2 * invh2
     end
@@ -495,12 +546,12 @@ function gs_sweep!(phi::Vector{Vector{NamedTuple}},
     parent_in = ℓ >= 2 ? phi[ℓ - 1] : nothing
     npatches = length(phi[ℓ])
     rho_flats = [_flatten_rho(rho[ℓ][pi], T) for pi in 1:npatches]
+    axis_kinds = _axis_kinds_from_bcs(ws.bcs).kinds
     for _ in 1:n_sweeps
         for colour in (0, 1)
-            # We exploit the single-patch-per-level invariant by building a
-            # ctx that references patch 1. (Multi-patch support is a v2 item;
-            # see plan §G "Root uniformity".)
-            ctx = GSCtx{D, T}(colour, ws.grid_idx[ℓ][1], rho_flats[1])
+            # Single-patch-per-level: ctx references patch 1. Multi-patch
+            # support is a v2 item; see plan §G "Root uniformity".
+            ctx = GSCtx{D, T}(colour, ws.grid_idx[ℓ][1], rho_flats[1], axis_kinds)
             for_each_patch!(_gs_colour_kernel,
                               phi[ℓ], phi[ℓ], ws.ph;
                               level = ℓ, ghost_depth = 1,
@@ -647,45 +698,69 @@ end
 """
     vcycle!(phi, rho, ws; level_range = ws.level_range)
 
-One geometric V-cycle on `level_range`.
+One FAC-style geometric V-cycle on `level_range`. Updates phi at every
+active level. At each level the smoother is RB-GS; the coarsest level is
+solved by the FFT bottom solver if it was configured, otherwise by many
+GS sweeps.
 """
 function vcycle!(phi::Vector{Vector{NamedTuple}},
                  rho::Vector{Vector{NamedTuple}},
                  ws::MGWorkspace{D, T};
                  level_range::UnitRange{Int} = ws.level_range,
                  backend = Sequential()) where {D, T}
-    if length(level_range) == 1
-        ℓ = first(level_range)
-        if ws.fft_ok && ℓ == ws.fft_level
-            fft_bottom_solve!(ws, phi[ℓ][1], rho[ℓ][1])
+    ℓ_hi = last(level_range)
+    ℓ_lo = first(level_range)
+
+    if ℓ_hi == ℓ_lo
+        # Coarsest level of this V-cycle: direct solve via FFT (preferred)
+        # or many GS sweeps. The phi at this level is the correction we
+        # solve for; rho is the (restricted) residual.
+        if ws.fft_ok && ℓ_hi == ws.fft_level
+            fft_bottom_solve!(ws, phi[ℓ_hi][1], rho[ℓ_hi][1])
         else
-            gs_sweep!(phi, rho, ws, ℓ;
+            gs_sweep!(phi, rho, ws, ℓ_hi;
                        n_sweeps = ws.opts.bottom_smooth_iters, backend = backend)
         end
         return phi
     end
 
-    ℓ_hi = last(level_range)
-    ℓ_lo = first(level_range)
-
-    # Pre-smooth on fine level
+    # Pre-smooth fine level (level ℓ_hi).
     gs_sweep!(phi, rho, ws, ℓ_hi; n_sweeps = ws.opts.n_pre, backend = backend)
 
-    # Residual on ℓ_hi  (ws.residual)
-    apply_laplacian!(ws.residual, phi, ws; level_range = ℓ_hi:ℓ_hi, backend = backend)
-    @inbounds for pi in 1:length(ws.residual[ℓ_hi])
-        rf = ws.residual[ℓ_hi][pi].phi
-        rh = rho[ℓ_hi][pi].rho
-        for c in ws.patch_leaves[ℓ_hi][pi]
-            _set_val!(rf, c, _get_val(rh, c) - _get_val(rf, c))
+    # Compute residuals on level ℓ_hi AND ℓ_hi-1.
+    apply_laplacian!(ws.residual, phi, ws;
+                      level_range = (ℓ_hi - 1):ℓ_hi, backend = backend)
+    @inbounds for ℓ in (ℓ_hi - 1):ℓ_hi
+        for pi in 1:length(ws.residual[ℓ])
+            rf = ws.residual[ℓ][pi].phi
+            rh = rho[ℓ][pi].rho
+            for c in ws.patch_leaves[ℓ][pi]
+                _set_val!(rf, c, _get_val(rh, c) - _get_val(rf, c))
+            end
         end
     end
 
-    # Restrict residual onto rhs_coarse[ℓ_hi-1].phi (volume-weighted average).
+    # Build the right-hand side for the coarser recursive call:
+    # rhs_coarse[ℓ_hi-1] = residual[ℓ_hi-1] everywhere, with COVERED coarse
+    # cells overwritten by the volume-weighted average of residual[ℓ_hi].
+    @inbounds for pi in 1:length(ws.rhs_coarse[ℓ_hi - 1])
+        src = ws.residual[ℓ_hi - 1][pi].phi
+        dst = ws.rhs_coarse[ℓ_hi - 1][pi].rho
+        # Also stash a copy into rhs_coarse.phi for restrict_to_parents! to overwrite.
+        dst_phi = ws.rhs_coarse[ℓ_hi - 1][pi].phi
+        for c in ws.patch_leaves[ℓ_hi - 1][pi]
+            v = _get_val(src, c)
+            _set_val!(dst, c, v)
+            _set_val!(dst_phi, c, v)
+        end
+    end
+    # Restrict fine residual onto rhs_coarse[:phi]; the covered cells get
+    # overwritten with the volume average. (Uncovered cells are left alone
+    # by restrict_to_parents! — they retain their level-(ℓ_hi-1) residual.)
     restrict_to_parents!(ws.rhs_coarse[ℓ_hi - 1],
                           ws.residual[ℓ_hi],
                           ws.ph; level = ℓ_hi, fieldname = :phi)
-    # Move phi → rho on the coarse rhs (so recursive call sees rhs as :rho).
+    # Copy :phi → :rho for the recursive call's "rho" slot.
     @inbounds for pi in 1:length(ws.rhs_coarse[ℓ_hi - 1])
         src = ws.rhs_coarse[ℓ_hi - 1][pi].phi
         dst = ws.rhs_coarse[ℓ_hi - 1][pi].rho
@@ -694,7 +769,7 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
         end
     end
 
-    # Zero correction on all coarser levels (correction-form V-cycle).
+    # Zero correction[lo..hi-1].phi (correction-form recursive call).
     @inbounds for ℓ in ℓ_lo:(ℓ_hi - 1)
         for pi in 1:length(ws.correction[ℓ])
             f = ws.correction[ℓ][pi].phi
@@ -704,11 +779,20 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
         end
     end
 
-    # Recurse on coarser range
+    # Recurse to compute correction[lo..hi-1] from rhs_coarse[lo..hi-1].
+    # NB: the recursive call sees phi=correction, rho=rhs_coarse, so the
+    # rhs_coarse.rho field carries the restricted residual.
     vcycle!(ws.correction, ws.rhs_coarse, ws;
              level_range = ℓ_lo:(ℓ_hi - 1), backend = backend)
 
-    # Prolong correction[ℓ_hi - 1] onto phi[ℓ_hi] (multilinear, additive)
+    # Apply correction: φ[ℓ_hi-1] += correction[ℓ_hi-1]; φ[ℓ_hi] += P(correction).
+    @inbounds for pi in 1:length(phi[ℓ_hi - 1])
+        pf = phi[ℓ_hi - 1][pi].phi
+        cf = ws.correction[ℓ_hi - 1][pi].phi
+        for c in ws.patch_leaves[ℓ_hi - 1][pi]
+            _set_val!(pf, c, _get_val(pf, c) + _get_val(cf, c))
+        end
+    end
     @inbounds for pi in 1:length(phi[ℓ_hi])
         prolong_correction_add!(phi[ℓ_hi][pi],
                                   patches_at(ws.ph, ℓ_hi)[pi],
@@ -724,7 +808,7 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
                                   ws.patch_leaves[ℓ_hi - 1][1])
     end
 
-    # Post-smooth
+    # Post-smooth on the fine level.
     gs_sweep!(phi, rho, ws, ℓ_hi; n_sweeps = ws.opts.n_post, backend = backend)
     return phi
 end
