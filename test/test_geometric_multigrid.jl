@@ -248,6 +248,44 @@ end
     @test errs[2] < 5e-2
 end
 
+@testset "GeometricMultigrid: Schur bottom solver (opt-in)" begin
+    rho_fun(x) = -8π^2 * sin(2π * x[1]) * sin(2π * x[2])
+    phi_fun(x) = sin(2π * x[1]) * sin(2π * x[2])
+    bcs_spec = ((PERIODIC, PERIODIC), (PERIODIC, PERIODIC))
+    bcs = FrameBoundaries(bcs_spec)
+    ph = build_uniform_root_hierarchy(Val(2), 5, (0.0, 0.0), (1.0, 1.0);
+                                       physical_bcs = bcs)
+    fine_mesh = HierarchicalMesh{2}()
+    for _ in 1:4
+        refine_cells!(fine_mesh, enumerate_leaves(fine_mesh))
+    end
+    add_patches!(ph, 2, [EulerianFrame(fine_mesh, (0.375, 0.375), (0.625, 0.625))])
+
+    fields = allocate_phi_rho(ph)
+    fill_field!(fields, ph, :rho, rho_fun)
+    fill_field!(fields, ph, :phi, phi_fun)
+    Random.seed!(7)
+    for c in 1:length(fields[2][1].phi)
+        fields[2][1].phi[c] = (fields[2][1].phi[c][1] + 0.1 * randn(),)
+    end
+
+    ws = MGWorkspace(ph, bcs_spec;
+                      level_range = 2:2,
+                      opts = MGOptions(tol = 1e-9, maxiter = 5,
+                                        bottom_solver = :schur))
+    result = solve_poisson!(fields, fields, ws; level_range = 2:2)
+
+    # Schur is a direct solver — should converge in 1 V-cycle to machine
+    # residual on the discrete operator with Dirichlet-from-parent.
+    @test result.converged
+    @test result.iters == 1
+    @test result.res_final < 1e-9 * result.res_init
+
+    # L2 error matches the AMR static-refinement test (same operator).
+    errs = l2_error(fields, ph, ws, phi_fun)
+    @test errs[2] < 1e-2
+end
+
 # ----------------------------------------------------------------------------
 # Test 7: apply_laplacian! recovers the analytic Laplacian to 2nd order
 # ----------------------------------------------------------------------------

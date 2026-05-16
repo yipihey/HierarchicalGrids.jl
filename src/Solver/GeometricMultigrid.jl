@@ -40,7 +40,8 @@ using ..Solver: PatchHierarchy, PatchView, PatchHaloView,
                 patches_at, add_patches!
 
 using FFTW
-using LinearAlgebra: norm, mul!
+using LinearAlgebra: norm, mul!, lu!, ldiv!, lu, cholesky
+using SparseArrays: SparseMatrixCSC, sparse, spzeros, nnz
 
 export MGWorkspace, MGOptions, MGResult,
        solve_poisson!, vcycle!,
@@ -284,6 +285,11 @@ mutable struct MGWorkspace{D, T}
     fft_plan_fwd::Any
     fft_plan_inv::Any
 
+    # Schur factor cache, per level (lazy-built on first :schur bottom call).
+    # Only the levels with a corresponding parent benefit. Invalidated by
+    # the refinement listener.
+    schur_factors::Dict{Int, Any}
+
     listener::Union{Nothing, ListenerHandle}
 end
 
@@ -499,11 +505,14 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
                             residual, correction, rhs_coarse,
                             fft_ok, fft_level, fft_N, fft_dx, fft_inv_eig,
                             fft_kind, fft_buf, fft_buf_complex,
-                            fft_plan_fwd, fft_plan_inv, nothing)
+                            fft_plan_fwd, fft_plan_inv,
+                            Dict{Int, Any}(),
+                            nothing)
 
-    # Refinement listener: blow away FFT state on AMR.
+    # Refinement listener: blow away FFT and Schur state on AMR.
     handle = register_refinement_listener!(patches_at(ph, 1)[1].mesh, _ -> begin
         ws.fft_ok = false
+        empty!(ws.schur_factors)
     end)
     ws.listener = handle
     return ws
@@ -1394,6 +1403,256 @@ function cg_bottom_solve!(phi::Vector{Vector{NamedTuple}},
 end
 
 # ----------------------------------------------------------------------------
+# Schur bottom solver — direct dense Schur-complement elimination on a
+# fine patch with Dirichlet-from-parent boundary. Opt-in via
+# `MGOptions.bottom_solver = :schur`. Single fine-patch solves only.
+#
+# Block structure on the fine patch:
+#     [ A_II  A_IΓ ] [φ_I]   [ b_I ]
+#     [ A_ΓI  A_ΓΓ ] [φ_Γ] = [ b_Γ ]
+#
+# where I = cells fully interior to the fine patch (all stencil neighbors
+# in-patch) and Γ = cells with at least one off-patch stencil neighbor
+# (whose ghost reads the parent). We work with the SPD matrix
+# M = −L (positive definite for Dirichlet-from-parent), solve M φ = −ρ.
+#
+# Direct elimination:
+#   1. Compute z_I = A_II⁻¹ b_I (one Cholesky solve).
+#   2. b̃_Γ = b_Γ − A_ΓI z_I.
+#   3. S = A_ΓΓ − A_ΓI A_II⁻¹ A_IΓ (built explicitly, |Γ| Cholesky solves).
+#   4. Solve S φ_Γ = b̃_Γ (dense LU).
+#   5. φ_I = z_I − A_II⁻¹ A_IΓ φ_Γ.
+#
+# v1 uses degree-0 Dirichlet (φ_ghost = φ_parent at the patch wall);
+# Martin–Colella's linear ghost couples φ_ghost = (1/3) φ_cf + (2/3) φ_parent
+# back to φ_cf, which would modify A_ΓΓ's diagonal. Deferred to v2.
+# ----------------------------------------------------------------------------
+
+mutable struct SchurFactor{T}
+    # Cell partitioning
+    I_cells::Vector{Int}            # fine-patch cell index of each I row
+    Γ_cells::Vector{Int}            # fine-patch cell index of each Γ row
+    I_pos::Vector{Int}              # I_pos[c] = row in A_II if c ∈ I, else 0
+    Γ_pos::Vector{Int}              # Γ_pos[c] = row in A_ΓΓ if c ∈ Γ, else 0
+    # Operator blocks
+    A_II_chol::Any                  # cholesky of A_II
+    A_IΓ::SparseMatrixCSC{T, Int}
+    A_ΓI::SparseMatrixCSC{T, Int}
+    A_ΓΓ::SparseMatrixCSC{T, Int}
+    S_lu::Any                       # LU factor of dense Schur complement
+    # Parent-side contributions to the RHS at each Γ cell (Dirichlet flux).
+    # Built fresh each solve from phi_parent — but the pattern (which Γ
+    # cell touches which parent cell on which face, with what coefficient)
+    # is cached.
+    ghost_links::Vector{NTuple{3, Int}}   # (Γ_pos, parent_cell, face_idx)
+    invh2::NTuple{1, T}             # 1/h² along each axis (we cache only
+                                    # one entry for D=2/3 — see usage)
+end
+
+# Default constructor placeholder so MGWorkspace can hold one slot per
+# fine patch. The actual factor is built on-demand by `_build_schur_factor`.
+SchurFactor{T}() where {T} =
+    SchurFactor{T}(Int[], Int[], Int[], Int[],
+                    nothing, spzeros(T, 0, 0), spzeros(T, 0, 0),
+                    spzeros(T, 0, 0), nothing,
+                    NTuple{3, Int}[], (zero(T),))
+
+# Build the Schur factorisation for a single fine patch (single-patch-per-
+# level assumption). Reuses workspace `cart_to_cell`, `parent_cell`, and
+# `axis_kinds`. O(N_fine + |Γ| × A_II_solve) up-front cost — amortised
+# across many solves with the same operator.
+function _build_schur_factor(ws::MGWorkspace{D, T}, ℓ::Int) where {D, T}
+    pi = 1
+    N = ws.patch_N[ℓ][pi]
+    dx = ws.patch_dx[ℓ][pi]
+    c2c = ws.cart_to_cell[ℓ][pi]
+    pcell = ws.parent_cell[ℓ][pi]
+    leaves = ws.patch_leaves[ℓ][pi]
+    n = length(leaves)
+    # Uniform spacing assumed.
+    invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
+    diag_M = sum(d -> 2 * invh2[d], 1:D)   # diagonal of M = -L
+
+    # Partition: a cell is in I iff every face has a same-patch neighbor.
+    # Otherwise Γ. Sized to the maximum fine-cell index so we can index by
+    # the (sparse, DFS-order) cell id directly.
+    max_cell = maximum(leaves)
+    I_pos = zeros(Int, max_cell)
+    Γ_pos = zeros(Int, max_cell)
+    I_cells = Int[]
+    Γ_cells = Int[]
+    @inbounds for c in leaves
+        is_boundary = false
+        for k in 1:(2 * D)
+            if pcell[c, k] != 0
+                is_boundary = true; break
+            end
+        end
+        if is_boundary
+            push!(Γ_cells, c)
+            Γ_pos[c] = length(Γ_cells)
+        else
+            push!(I_cells, c)
+            I_pos[c] = length(I_cells)
+        end
+    end
+
+    nI = length(I_cells); nΓ = length(Γ_cells)
+
+    # Build sparse A_II, A_IΓ, A_ΓΓ, A_ΓI, and ghost_links.
+    # Triplet-form builders. The diagonal of each cell ABSORBS its MC face
+    # contributions (each off-patch face with MC ghost adds +invh2/3 to
+    # the M-matrix diagonal, since MC ghost = (1/3) φ_cf + (2/3) φ_p
+    # injects (1/3) φ_cf back into the stencil).
+    II_I = Int[]; II_J = Int[]; II_V = T[]
+    IG_I = Int[]; IG_J = Int[]; IG_V = T[]
+    GI_I = Int[]; GI_J = Int[]; GI_V = T[]
+    GG_I = Int[]; GG_J = Int[]; GG_V = T[]
+    ghost_links = NTuple{3, Int}[]
+    one_third = T(1//3); two_thirds = T(2//3)
+
+    @inbounds for c in leaves
+        Ic = ws.grid_idx[ℓ][pi][c]
+        pos_c = I_pos[c]
+        in_I = pos_c != 0
+        row_c = in_I ? pos_c : Γ_pos[c]
+
+        # Walk faces to compute the diagonal and off-diagonal contributions.
+        diag = zero(T)
+        for d in 1:D, side in (-1, 1)
+            face_idx = 2 * (d - 1) + (side == 1 ? 2 : 1)
+            inew = Ic[d] + side
+            if 1 <= inew <= N[d]
+                # Same-patch neighbor: standard M-matrix off-diagonal.
+                nb_tuple = Base.setindex(Tuple(CartesianIndex(Ic)), inew, d)
+                nb_c = c2c[CartesianIndex{D}(nb_tuple)]
+                pos_nb_I = I_pos[nb_c]
+                pos_nb_Γ = Γ_pos[nb_c]
+                coeff = -invh2[d]
+                if in_I
+                    if pos_nb_I != 0
+                        push!(II_I, row_c); push!(II_J, pos_nb_I); push!(II_V, coeff)
+                    else
+                        push!(IG_I, row_c); push!(IG_J, pos_nb_Γ); push!(IG_V, coeff)
+                    end
+                else
+                    if pos_nb_I != 0
+                        push!(GI_I, row_c); push!(GI_J, pos_nb_I); push!(GI_V, coeff)
+                    else
+                        push!(GG_I, row_c); push!(GG_J, pos_nb_Γ); push!(GG_V, coeff)
+                    end
+                end
+                # Diagonal +invh2 from this face (standard).
+                diag += invh2[d]
+            else
+                # Off-patch face. MC ghost: φ_ghost = (1/3) φ_cf + (2/3) φ_p.
+                # In M = -L form, the diagonal contribution from this face
+                # is +invh2 (from cf cell self-coupling via -L) MINUS the
+                # (1/3) coupling back to φ_cf, i.e., effectively
+                #   diag += (1 - 1/3) * invh2 = (2/3) * invh2
+                # and the parent contributes (2/3) * invh2 * φ_p to the rhs.
+                par_c = pcell[c, face_idx]
+                if par_c != 0
+                    diag += two_thirds * invh2[d]
+                    push!(ghost_links, (row_c, par_c, d))
+                else
+                    # No parent: outer-wall BC. Defer to Dirichlet (-φ_c):
+                    # diag += 2 * invh2.
+                    diag += 2 * invh2[d]
+                end
+            end
+        end
+        if in_I
+            push!(II_I, row_c); push!(II_J, row_c); push!(II_V, diag)
+        else
+            push!(GG_I, row_c); push!(GG_J, row_c); push!(GG_V, diag)
+        end
+    end
+
+    A_II = sparse(II_I, II_J, II_V, nI, nI)
+    A_IΓ = sparse(IG_I, IG_J, IG_V, nI, nΓ)
+    A_ΓI = sparse(GI_I, GI_J, GI_V, nΓ, nI)
+    A_ΓΓ = sparse(GG_I, GG_J, GG_V, nΓ, nΓ)
+
+    # Factor A_II.
+    A_II_chol = cholesky(A_II)
+
+    # Build dense S = A_ΓΓ − A_ΓI A_II⁻¹ A_IΓ explicitly. For each column
+    # j of A_IΓ, solve A_II * x = A_IΓ[:, j], then S[:, j] = A_ΓΓ[:, j]
+    # − A_ΓI * x.
+    S_dense = Matrix{T}(A_ΓΓ)
+    A_IΓ_dense = Matrix{T}(A_IΓ)
+    for j in 1:nΓ
+        col = view(A_IΓ_dense, :, j)
+        x = A_II_chol \ Vector{T}(col)
+        # subtract A_ΓI * x from S[:, j]
+        ax = A_ΓI * x
+        S_dense[:, j] .-= ax
+    end
+
+    S_lu = lu!(S_dense)
+
+    return SchurFactor{T}(I_cells, Γ_cells, I_pos, Γ_pos,
+                           A_II_chol, A_IΓ, A_ΓI, A_ΓΓ, S_lu,
+                           ghost_links, (invh2[1],))
+end
+
+# Solve `M φ = −ρ` on the fine patch using the precomputed Schur factor.
+# Updates phi[ℓ][pi].phi in place.
+function schur_bottom_solve!(phi::Vector{Vector{NamedTuple}},
+                              rho::Vector{Vector{NamedTuple}},
+                              ws::MGWorkspace{D, T},
+                              ℓ::Int,
+                              factor::SchurFactor{T}) where {D, T}
+    pi = 1
+    phi_arr = phi[ℓ][pi].phi
+    rho_arr = rho[ℓ][pi].rho
+    parent_phi = phi[ℓ - 1][1].phi
+    dx = ws.patch_dx[ℓ][pi]
+    invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
+
+    nI = length(factor.I_cells)
+    nΓ = length(factor.Γ_cells)
+
+    # Build b_I and b_Γ. b = −ρ (sign flip for M = −L).
+    b_I = Vector{T}(undef, nI)
+    b_Γ = Vector{T}(undef, nΓ)
+    @inbounds for (i, c) in enumerate(factor.I_cells)
+        b_I[i] = -T(rho_arr[c][1])
+    end
+    @inbounds for (i, c) in enumerate(factor.Γ_cells)
+        b_Γ[i] = -T(rho_arr[c][1])
+    end
+    # Add ghost contributions to b_Γ. With MC ghost = (1/3) φ_cf + (2/3) φ_p,
+    # the parent term moves to the rhs as +(2/3) invh2 · φ_p (sign-flipped
+    # from L → M, with the (1/3) part absorbed into the matrix diagonal).
+    two_thirds = T(2//3)
+    @inbounds for (row, par_c, d) in factor.ghost_links
+        b_Γ[row] += two_thirds * invh2[d] * T(parent_phi[par_c][1])
+    end
+
+    # z_I = A_II⁻¹ b_I
+    z_I = factor.A_II_chol \ b_I
+    # b̃_Γ = b_Γ − A_ΓI z_I
+    bt_Γ = b_Γ - factor.A_ΓI * z_I
+    # φ_Γ = S⁻¹ b̃_Γ
+    φ_Γ = factor.S_lu \ bt_Γ
+    # φ_I = z_I − A_II⁻¹ (A_IΓ φ_Γ)
+    A_IΓ_φ_Γ = factor.A_IΓ * φ_Γ
+    correction = factor.A_II_chol \ A_IΓ_φ_Γ
+    φ_I = z_I - correction
+
+    # Write back into phi.
+    @inbounds for (i, c) in enumerate(factor.I_cells)
+        phi_arr[c] = (φ_I[i],)
+    end
+    @inbounds for (i, c) in enumerate(factor.Γ_cells)
+        phi_arr[c] = (φ_Γ[i],)
+    end
+    return phi
+end
+
+# ----------------------------------------------------------------------------
 # V-cycle
 # ----------------------------------------------------------------------------
 
@@ -1415,12 +1674,18 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
 
     if ℓ_hi == ℓ_lo
         # Coarsest level of this V-cycle: direct solve via FFT (preferred,
-        # exact for the discrete operator), Jacobi-PCG (fast for fine-patch
-        # subcycling), or raw GS sweeps (fallback / debugging). The phi at
-        # this level is the correction we solve for; rho is the (restricted)
-        # residual.
+        # exact for the discrete operator on root), Schur-complement direct
+        # solve (exact for the fine-patch discrete operator with Dirichlet-
+        # from-parent), Jacobi-PCG (matrix-free, no setup), or raw GS sweeps
+        # (fallback / debugging). The phi at this level is the correction
+        # we solve for; rho is the (restricted) residual.
         if ws.fft_ok && ℓ_hi == ws.fft_level
             fft_bottom_solve!(ws, phi[ℓ_hi][1], rho[ℓ_hi][1])
+        elseif ws.opts.bottom_solver === :schur && ℓ_hi >= 2
+            factor = get!(ws.schur_factors, ℓ_hi) do
+                _build_schur_factor(ws, ℓ_hi)
+            end
+            schur_bottom_solve!(phi, rho, ws, ℓ_hi, factor)
         elseif ws.opts.bottom_solver === :cg
             cg_bottom_solve!(phi, rho, ws, ℓ_hi;
                               tol = ws.opts.bottom_cg_tol,
