@@ -115,6 +115,7 @@ using ..Solver: PatchHierarchy, PatchView, PatchHaloView,
 using FFTW
 using LinearAlgebra: norm, mul!, lu!, ldiv!, lu, cholesky
 using SparseArrays: SparseMatrixCSC, sparse, spzeros, nnz
+using Base.Threads: @threads, nthreads
 
 export MGWorkspace, MGOptions, MGResult, PhiRhoFields,
        solve_poisson!, vcycle!,
@@ -976,10 +977,37 @@ function apply_laplacian_root_fast!(Lphi::Vector{Vector{NamedTuple}},
     fac_table = ws.fac_fine_at_coarse_face[ℓ][pi]
     has_fac = skip_cf && length(ws.ph.levels) > ℓ
 
-    @inbounds for I in CartesianIndices(N)
+    # Loop is alloc-free and writes one cell per iteration → safe to thread
+    # statically. Skip threading for tiny patches where overhead dominates.
+    cidx = CartesianIndices(N)
+    if length(cidx) >= 1024 && nthreads() > 1
+        @threads :static for I in cidx
+            _root_lapl_cell!(I, c2c, phi_raw, Lphi_raw, kinds, invh2, N,
+                              covered, fac_table, skip_covered, has_fac,
+                              Val(D))
+        end
+    else
+        @inbounds for I in cidx
+            _root_lapl_cell!(I, c2c, phi_raw, Lphi_raw, kinds, invh2, N,
+                              covered, fac_table, skip_covered, has_fac,
+                              Val(D))
+        end
+    end
+    return Lphi
+end
+
+@inline function _root_lapl_cell!(I::CartesianIndex{D}, c2c, phi_raw::Vector{T},
+                                    Lphi_raw::Vector{T},
+                                    kinds::NTuple{D, Symbol},
+                                    invh2::NTuple{D, T}, N::NTuple{D, Int},
+                                    covered::Vector{Bool},
+                                    fac_table::Matrix{Vector{Int}},
+                                    skip_covered::Bool, has_fac::Bool,
+                                    ::Val{D}) where {D, T}
+    @inbounds begin
         c = c2c[I]
-        c == 0 && continue
-        skip_covered && covered[c] && continue
+        c == 0 && return
+        skip_covered && covered[c] && return
         phi_c = phi_raw[c]
         acc = zero(T)
         for d in 1:D
@@ -996,7 +1024,7 @@ function apply_laplacian_root_fast!(Lphi::Vector{Vector{NamedTuple}},
         end
         Lphi_raw[c] = acc
     end
-    return Lphi
+    return nothing
 end
 
 """
@@ -1197,28 +1225,56 @@ function gs_sweep_root_fast!(phi::Vector{Vector{NamedTuple}},
     diag = sum(d -> 2 * invh2[d], 1:D)
     covered = ws.covered_by_finer[ℓ][pi]
 
+    cidx = CartesianIndices(N)
+    threaded = length(cidx) >= 1024 && nthreads() > 1
     for _ in 1:n_sweeps
         for colour in 0:1
-            @inbounds for I in CartesianIndices(N)
-                s = 0
-                for d in 1:D; s += I[d]; end
-                (s & 1) == colour || continue
-                c = c2c[I]
-                c == 0 && continue
-                skip_covered && covered[c] && continue
-                phi_c = phi_raw[c]
-                nbr_acc = zero(T)
-                for d in 1:D
-                    phi_p = _neighbor_phi(phi_raw, c2c, I, d, +1, N, kinds, phi_c)
-                    phi_m = _neighbor_phi(phi_raw, c2c, I, d, -1, N, kinds, phi_c)
-                    nbr_acc += (phi_p + phi_m) * invh2[d]
+            # Red/black: same-colour cells don't share stencil neighbors,
+            # so within each colour the iteration is embarrassingly parallel.
+            if threaded
+                @threads :static for I in cidx
+                    _root_gs_cell!(I, c2c, phi_raw, rho_flat, kinds, invh2,
+                                    diag, N, covered, skip_covered, colour,
+                                    Val(D))
                 end
-                rho_c = rho_flat[c]
-                phi_raw[c] = (nbr_acc - rho_c) / diag
+            else
+                @inbounds for I in cidx
+                    _root_gs_cell!(I, c2c, phi_raw, rho_flat, kinds, invh2,
+                                    diag, N, covered, skip_covered, colour,
+                                    Val(D))
+                end
             end
         end
     end
     return phi
+end
+
+@inline function _root_gs_cell!(I::CartesianIndex{D}, c2c, phi_raw::Vector{T},
+                                  rho_flat::Vector{T},
+                                  kinds::NTuple{D, Symbol},
+                                  invh2::NTuple{D, T}, diag::T,
+                                  N::NTuple{D, Int},
+                                  covered::Vector{Bool},
+                                  skip_covered::Bool, colour::Int,
+                                  ::Val{D}) where {D, T}
+    @inbounds begin
+        s = 0
+        for d in 1:D; s += I[d]; end
+        (s & 1) == colour || return
+        c = c2c[I]
+        c == 0 && return
+        skip_covered && covered[c] && return
+        phi_c = phi_raw[c]
+        nbr_acc = zero(T)
+        for d in 1:D
+            phi_p = _neighbor_phi(phi_raw, c2c, I, d, +1, N, kinds, phi_c)
+            phi_m = _neighbor_phi(phi_raw, c2c, I, d, -1, N, kinds, phi_c)
+            nbr_acc += (phi_p + phi_m) * invh2[d]
+        end
+        rho_c = rho_flat[c]
+        phi_raw[c] = (nbr_acc - rho_c) / diag
+    end
+    return nothing
 end
 
 # Fall-back smoother for non-root levels: uses `for_each_patch!` so that
