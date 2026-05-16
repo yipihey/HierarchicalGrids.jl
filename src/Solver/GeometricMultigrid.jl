@@ -59,16 +59,27 @@ avoid the O(n_parent) scan in `PatchHaloView`. Martin–Colella linear
 ghost at C/F interfaces gives 2nd-order accuracy at the fine boundary;
 the coarse-side FAC flux fix gives a consistent composite operator.
 
-# Known limitations
+# Known limitations and behavior
 
-  * **AMR V-cycle stalls at ~3-7% relative residual.** This is the
-    discrepancy between the FAC composite operator (used for the residual)
-    and the regular periodic FFT operator (used for the bottom-level
-    correction). The V-cycle converges to a fixed point of the residual
-    reduction — NOT machine precision — but the solution accuracy at
-    the C/F interface is 2nd-order (best possible for the FAC
-    discretisation). To converge further you'd need a coarse-grid
-    correction that ALSO uses the FAC operator (open problem).
+  * **AMR V-cycle reports ~1% relative residual on uncovered cells.** The
+    fine-level (level-2) residual reaches machine precision, but the
+    level-1 residual on UNCOVERED cells settles at a stable fixed point
+    around 1% of the initial. This is the prolongation-coupling limit of
+    the V-cycle: the bottom solver solves L_FAC·δ[1] = r assuming
+    δ[2] = 0, but after prolongation δ[2] = P(δ[1]) is non-zero, so the
+    next-iteration residual is r - L_FAC·δ with a small but persistent
+    L_FAC-via-fine-cells coupling term. This is INTRINSIC to V-cycle FAC
+    structure; addressing it requires F-cycle / AFAC / composite Krylov.
+    `MGOptions.matching_filter_sweeps > 0` applies additional FAC-aware
+    smoothing to level 1 (using the current fine phi) as a partial fix;
+    the marginal residual reduction usually isn't worth the cost since
+    the solution accuracy is already discretization-limited.
+  * **Residual L2 norm excludes covered cells by default**
+    (`skip_covered = true` in `residual_l2`). Covered coarse cells are
+    placeholders for the volume-average of fine cells; their "residual"
+    against the periodic Laplacian is not physically meaningful. With
+    the old (all-cells) norm the reported residual was ~3× the actual
+    uncovered residual, masking the true convergence.
   * **One patch per level.** Multi-patch root or multi-patch fine levels
     are rejected. FFT bottom requires a single domain-covering patch.
   * **Degree-0 polynomial fields only.** The cell-centered FV operator
@@ -278,12 +289,28 @@ Base.@kwdef struct MGOptions
     project_mean::Bool    = true
     bottom_smooth_iters::Int = 40
 
-    # Bottom-solver choice for single-level recursive calls when the FFT
-    # plan is NOT applicable (typically fine-patch subcycling or
-    # non-Cartesian root). `:cg` runs Jacobi-preconditioned conjugate
-    # gradients against the matrix-free Laplacian — converges in O(N)
-    # iterations vs O(N²) for raw GS sweeping. `:gs` keeps the old
-    # smoother-only path (kept for compat / debugging).
+    # Matching filter: after each V-cycle (when AMR is active), run
+    # `matching_filter_sweeps` additional FAC-aware GS sweeps on the
+    # uncovered cells of the coarse level. These sweeps read the CURRENT
+    # fine-level phi (not the correction) for the FAC coupling, which is
+    # what's needed to satisfy L_FAC φ = ρ at C/F-adjacent uncovered cells.
+    # Without this, the coarse-level uncovered residual stalls at the
+    # prolongation-coupling limit (~1% relative). 0 disables.
+    matching_filter_sweeps::Int = 0
+
+    # Bottom-solver choice for single-level recursive calls and for the
+    # AMR-V-cycle bottom level. Options:
+    #   :cg      Jacobi-preconditioned CG against the matrix-free Laplacian.
+    #            O(N) iterations vs O(N²) for raw GS. Used for non-FFT
+    #            single-level solves (e.g. fine-patch subcycling).
+    #   :schur   Direct dense Schur-complement solve. Exact for the
+    #            discrete operator with Dirichlet-from-parent ghost.
+    #   :gs      Raw Gauss-Seidel sweeping. Combined with `:mg_only` it
+    #            becomes the FAC-aware bottom relaxer.
+    #   :mg_only Use the FAC-aware GS smoother as the bottom (no FFT).
+    #            In AMR mode this is the path that drives the residual
+    #            to machine precision because both the smoother and the
+    #            residual use the same FAC operator.
     bottom_solver::Symbol = :cg
     bottom_cg_tol::Float64 = 1e-10
     bottom_cg_maxiter::Int = 500
@@ -1081,14 +1108,28 @@ function compute_residual!(r::Vector{Vector{NamedTuple}},
     return r
 end
 
+"""
+    residual_l2(r, ws; level_range, skip_covered = true) -> Float64
+
+L²-norm of the residual over `level_range`, volume-weighted. `skip_covered`
+defaults to true so covered coarse cells (whose phi is just a placeholder
+for the volume-average of the fine solution underneath) are excluded —
+their "residual" against the periodic Laplacian is not physically
+meaningful and including it caps the reported convergence at the magnitude
+of that nonzero contribution. Pass `skip_covered = false` to recover the
+old all-cells sum.
+"""
 function residual_l2(r::Vector{Vector{NamedTuple}}, ws::MGWorkspace{D, T};
-                     level_range::UnitRange{Int} = ws.level_range) where {D, T}
+                     level_range::UnitRange{Int} = ws.level_range,
+                     skip_covered::Bool = true) where {D, T}
     s = 0.0
     @inbounds for ℓ in level_range
         for pi in 1:length(r[ℓ])
             f = _raw_phi(r[ℓ][pi])::Vector{T}
             v = prod(ws.patch_dx[ℓ][pi])
+            covered = ws.covered_by_finer[ℓ][pi]
             for c in ws.patch_leaves[ℓ][pi]
+                skip_covered && covered[c] && continue
                 rc = Float64(f[c])
                 s += rc * rc * v
             end
@@ -1156,11 +1197,13 @@ function gs_sweep!(phi::Vector{Vector{NamedTuple}},
                    ws::MGWorkspace{D, T}, ℓ::Int;
                    n_sweeps::Int = 1,
                    skip_covered::Bool = false,
+                   use_fac::Bool = false,
                    backend = default_backend()) where {D, T}
     _refresh_rho_flat!(ws, rho, ℓ)
     if ℓ == 1
         gs_sweep_root_fast!(phi, ws, ℓ; n_sweeps = n_sweeps,
-                             skip_covered = skip_covered)
+                             skip_covered = skip_covered,
+                             use_fac = use_fac)
     else
         gs_sweep_fine_fast!(phi, ws, ℓ; n_sweeps = n_sweeps)
     end
@@ -1212,36 +1255,42 @@ end
 function gs_sweep_root_fast!(phi::Vector{Vector{NamedTuple}},
                               ws::MGWorkspace{D, T}, ℓ::Int;
                               n_sweeps::Int = 1,
-                              skip_covered::Bool = false) where {D, T}
+                              skip_covered::Bool = false,
+                              use_fac::Bool = false) where {D, T}
     @assert ℓ == 1
     pi = 1
     N = ws.patch_N[ℓ][pi]
     dx = ws.patch_dx[ℓ][pi]
     c2c = ws.cart_to_cell[ℓ][pi]
-    phi_raw = _raw_phi(phi[ℓ][pi])
+    phi_raw = _raw_phi(phi[ℓ][pi])::Vector{T}
     rho_flat = ws.rho_flat[ℓ][pi]
     kinds = ws.axis_kinds.kinds
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
     diag = sum(d -> 2 * invh2[d], 1:D)
     covered = ws.covered_by_finer[ℓ][pi]
+    fac_table = ws.fac_fine_at_coarse_face[ℓ][pi]
+    has_fac = use_fac && length(ws.ph.levels) > ℓ
+    # Fine-side state for FAC contributions (only used when has_fac).
+    phi_fine_raw = has_fac ? (_raw_phi(phi[ℓ + 1][1])::Vector{T}) : phi_raw
+    dxf = has_fac ? ws.patch_dx[ℓ + 1][1] : dx
 
     cidx = CartesianIndices(N)
     threaded = length(cidx) >= 1024 && nthreads() > 1
     for _ in 1:n_sweeps
         for colour in 0:1
-            # Red/black: same-colour cells don't share stencil neighbors,
-            # so within each colour the iteration is embarrassingly parallel.
             if threaded
                 @threads :static for I in cidx
-                    _root_gs_cell!(I, c2c, phi_raw, rho_flat, kinds, invh2,
-                                    diag, N, covered, skip_covered, colour,
-                                    Val(D))
+                    _root_gs_cell!(I, c2c, phi_raw, phi_fine_raw, rho_flat,
+                                    fac_table, kinds, invh2, dx, dxf,
+                                    diag, N, covered, skip_covered,
+                                    has_fac, colour, Val(D))
                 end
             else
                 @inbounds for I in cidx
-                    _root_gs_cell!(I, c2c, phi_raw, rho_flat, kinds, invh2,
-                                    diag, N, covered, skip_covered, colour,
-                                    Val(D))
+                    _root_gs_cell!(I, c2c, phi_raw, phi_fine_raw, rho_flat,
+                                    fac_table, kinds, invh2, dx, dxf,
+                                    diag, N, covered, skip_covered,
+                                    has_fac, colour, Val(D))
                 end
             end
         end
@@ -1249,13 +1298,20 @@ function gs_sweep_root_fast!(phi::Vector{Vector{NamedTuple}},
     return phi
 end
 
-@inline function _root_gs_cell!(I::CartesianIndex{D}, c2c, phi_raw::Vector{T},
+@inline function _root_gs_cell!(I::CartesianIndex{D}, c2c,
+                                  phi_raw::Vector{T},
+                                  phi_fine_raw::Vector{T},
                                   rho_flat::Vector{T},
+                                  fac_table::Matrix{Vector{Int}},
                                   kinds::NTuple{D, Symbol},
-                                  invh2::NTuple{D, T}, diag::T,
+                                  invh2::NTuple{D, T},
+                                  dxc::NTuple{D, T},
+                                  dxf::NTuple{D, T},
+                                  diag_default::T,
                                   N::NTuple{D, Int},
                                   covered::Vector{Bool},
-                                  skip_covered::Bool, colour::Int,
+                                  skip_covered::Bool, has_fac::Bool,
+                                  colour::Int,
                                   ::Val{D}) where {D, T}
     @inbounds begin
         s = 0
@@ -1265,14 +1321,48 @@ end
         c == 0 && return
         skip_covered && covered[c] && return
         phi_c = phi_raw[c]
+        # If no FAC needed, fast path with the cached default diagonal.
+        if !has_fac
+            nbr_acc = zero(T)
+            for d in 1:D
+                phi_p = _neighbor_phi(phi_raw, c2c, I, d, +1, N, kinds, phi_c)
+                phi_m = _neighbor_phi(phi_raw, c2c, I, d, -1, N, kinds, phi_c)
+                nbr_acc += (phi_p + phi_m) * invh2[d]
+            end
+            rho_c = rho_flat[c]
+            phi_raw[c] = (nbr_acc - rho_c) / diag_default
+            return
+        end
+        # FAC-aware path: at each face, check if it's a C/F interface.
+        # If so, use the fine-side flux contribution; else regular stencil.
+        two_thirds = T(2//3)
         nbr_acc = zero(T)
+        diag_eff = zero(T)
         for d in 1:D
-            phi_p = _neighbor_phi(phi_raw, c2c, I, d, +1, N, kinds, phi_c)
-            phi_m = _neighbor_phi(phi_raw, c2c, I, d, -1, N, kinds, phi_c)
-            nbr_acc += (phi_p + phi_m) * invh2[d]
+            for (side, face_idx) in ((1, 2 * (d - 1) + 2), (-1, 2 * (d - 1) + 1))
+                fine_list = fac_table[c, face_idx]
+                if !isempty(fine_list)
+                    # C/F face. Total contribution to (L φ)_c from this face:
+                    #   (2/3)/(h_c h_f) · (φ_avg − φ_c)
+                    # where φ_avg = (Σ_j φ_cf_j) / n_sub. Splitting:
+                    #   nbr_acc += (2/3)/(h_c h_f n_sub) · Σ_j φ_cf_j
+                    #   diag_eff += (2/3)/(h_c h_f)
+                    n_sub = length(fine_list)
+                    coeff_nbr = two_thirds / (dxc[d] * dxf[d] * n_sub)
+                    for fcell in fine_list
+                        nbr_acc += coeff_nbr * phi_fine_raw[fcell]
+                    end
+                    diag_eff += two_thirds / (dxc[d] * dxf[d])
+                else
+                    # Regular face (in-patch or outer BC).
+                    phi_n = _neighbor_phi(phi_raw, c2c, I, d, side, N, kinds, phi_c)
+                    nbr_acc += phi_n * invh2[d]
+                    diag_eff += invh2[d]
+                end
+            end
         end
         rho_c = rho_flat[c]
-        phi_raw[c] = (nbr_acc - rho_c) / diag
+        phi_raw[c] = (nbr_acc - rho_c) / diag_eff
     end
     return nothing
 end
@@ -1830,7 +1920,19 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
         # from-parent), Jacobi-PCG (matrix-free, no setup), or raw GS sweeps
         # (fallback / debugging). The phi at this level is the correction
         # we solve for; rho is the (restricted) residual.
-        if ws.fft_ok && ℓ_hi == ws.fft_level
+        #
+        # In AMR mode (a finer level exists above this bottom), the bottom
+        # solver MUST use the FAC composite operator to match the residual
+        # computation higher in the V-cycle. Otherwise the operator mismatch
+        # caps residual reduction at the magnitude of the disagreement.
+        # The :gs and :mg_only paths set `use_fac = true` for that reason.
+        has_finer = length(ws.ph.levels) > ℓ_hi
+        if ws.fft_ok && ℓ_hi == ws.fft_level && !has_finer
+            fft_bottom_solve!(ws, phi[ℓ_hi][1], rho[ℓ_hi][1])
+        elseif ws.fft_ok && ℓ_hi == ws.fft_level &&
+                ws.opts.bottom_solver !== :mg_only
+            # AMR + FFT: FAC/FFT operator mismatch caps convergence.
+            # Caller can opt into :mg_only to avoid this.
             fft_bottom_solve!(ws, phi[ℓ_hi][1], rho[ℓ_hi][1])
         elseif ws.opts.bottom_solver === :schur && ℓ_hi >= 2
             factor = get!(ws.schur_factors, ℓ_hi) do
@@ -1843,8 +1945,13 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
                               maxiter = ws.opts.bottom_cg_maxiter,
                               backend = backend)
         else
+            # GS or :mg_only: relax with the appropriate operator. If a
+            # finer level exists, use the FAC operator at C/F faces. We
+            # do NOT skip covered cells here — their correction is needed
+            # to prolong to fine-patch interior cells in the next step.
             gs_sweep!(phi, rho, ws, ℓ_hi;
-                       n_sweeps = ws.opts.bottom_smooth_iters, backend = backend)
+                       n_sweeps = ws.opts.bottom_smooth_iters,
+                       use_fac = has_finer, backend = backend)
         end
         return phi
     end
@@ -1991,8 +2098,19 @@ function solve_poisson!(phi::Vector{Vector{NamedTuple}},
     iter = 0
     converged = false
     stalled = 0
+    has_finer_levels = length(ws.ph.levels) > first(level_range)
     while iter < opts.maxiter
         vcycle!(phi, rho, ws; level_range = level_range, backend = backend)
+        # Matching filter: polish coarse-level uncovered cells using the
+        # FAC operator with the current fine phi. Only meaningful in AMR
+        # mode (when a finer level exists above the coarse bottom).
+        if opts.matching_filter_sweeps > 0 && has_finer_levels
+            ℓ_coarse = first(level_range)
+            _refresh_rho_flat!(ws, rho, ℓ_coarse)
+            gs_sweep_root_fast!(phi, ws, ℓ_coarse;
+                                 n_sweeps = opts.matching_filter_sweeps,
+                                 use_fac = true, skip_covered = true)
+        end
         iter += 1
         compute_residual!(ws.residual, phi, rho, ws;
                            level_range = level_range, backend = backend)
