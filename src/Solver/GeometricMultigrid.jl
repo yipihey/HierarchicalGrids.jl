@@ -219,6 +219,15 @@ mutable struct MGWorkspace{D, T}
     # match each patch's n_cells; reused across V-cycles).
     rho_flat::Vector{Vector{Vector{T}}}
 
+    # `covered_by_finer[ℓ][pi][c]` is `true` if coarse cell `c` at level ℓ
+    # is covered by a patch at level ℓ+1 (i.e., a finer patch sits on top
+    # of it). During AMR V-cycles, the residual on covered coarse cells is
+    # overwritten by the volume-averaged fine residual via
+    # `restrict_to_parents!` — so computing the coarse Laplacian on those
+    # cells is wasted work. The Laplacian / GS kernels skip covered cells
+    # when this mask is consulted. Top-level value is `false` everywhere.
+    covered_by_finer::Vector{Vector{Vector{Bool}}}
+
     # Scratch fields, one per (level, patch).
     residual::Vector{Vector{NamedTuple}}
     correction::Vector{Vector{NamedTuple}}
@@ -273,11 +282,13 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
     axis_kinds = _axis_kinds_from_bcs(bcs)
     rho_flat = Vector{Vector{Vector{T}}}(undef, nL)
     cart_to_cell = Vector{Vector{Array{Int, D}}}(undef, nL)
+    covered_by_finer = Vector{Vector{Vector{Bool}}}(undef, nL)
     for ℓ in 1:nL
         npatches = length(patches_at(ph, ℓ))
         rho_flat[ℓ] = [Vector{T}(undef, n_cells(patches_at(ph, ℓ)[pi].mesh))
                         for pi in 1:npatches]
         c2c = Vector{Array{Int, D}}(undef, npatches)
+        covered = Vector{Vector{Bool}}(undef, npatches)
         for pi in 1:npatches
             N = patch_N[ℓ][pi]
             c2c_p = fill(0, N)
@@ -286,8 +297,38 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
                 c2c_p[gi...] = c
             end
             c2c[pi] = c2c_p
+            covered[pi] = fill(false, n_cells(patches_at(ph, ℓ)[pi].mesh))
         end
         cart_to_cell[ℓ] = c2c
+        covered_by_finer[ℓ] = covered
+    end
+    # Mark coarse cells covered by any finer-level patch. A coarse cell is
+    # covered if its physical cell box is contained inside the union of
+    # finer patch boxes. Cheap O(n_coarse * n_fine_patches) build.
+    for ℓ in 1:(nL - 1)
+        finer_patches = patches_at(ph, ℓ + 1)
+        isempty(finer_patches) && continue
+        for pi in 1:length(patches_at(ph, ℓ))
+            frame = patches_at(ph, ℓ)[pi]
+            mask = covered_by_finer[ℓ][pi]
+            for c in patch_leaves[ℓ][pi]
+                c_lo, c_hi = cell_physical_box(frame, c)
+                inside_any = false
+                for fp in finer_patches
+                    fp_lo, fp_hi = fp.lo, fp.hi
+                    ok = true
+                    @inbounds for d in 1:D
+                        if c_lo[d] < fp_lo[d] || c_hi[d] > fp_hi[d]
+                            ok = false; break
+                        end
+                    end
+                    if ok
+                        inside_any = true; break
+                    end
+                end
+                mask[c] = inside_any
+            end
+        end
     end
 
     # FFT bottom on level_range[1] (only if single-patch + tile-uniform).
@@ -341,6 +382,7 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
     ws = MGWorkspace{D, T}(ph, bcs, level_range, opts,
                             grid_idx, patch_N, patch_dx, patch_leaves,
                             cart_to_cell, axis_kinds, rho_flat,
+                            covered_by_finer,
                             residual, correction, rhs_coarse,
                             fft_ok, fft_level, fft_N, fft_dx, fft_inv_eig,
                             fft_kind, fft_buf, fft_buf_complex,
@@ -514,11 +556,12 @@ function apply_laplacian!(Lphi::Vector{Vector{NamedTuple}},
                           phi::Vector{Vector{NamedTuple}},
                           ws::MGWorkspace{D, T};
                           level_range::UnitRange{Int} = ws.level_range,
+                          skip_covered::Bool = false,
                           backend = default_backend()) where {D, T}
     ctx = ws.axis_kinds
     for ℓ in level_range
         if ℓ == 1
-            apply_laplacian_root_fast!(Lphi, phi, ws)
+            apply_laplacian_root_fast!(Lphi, phi, ws; skip_covered = skip_covered)
         else
             parent_in = phi[ℓ - 1]
             for_each_patch!(_lapl_kernel,
@@ -559,9 +602,13 @@ end
 end
 
 # Fast direct-array Laplacian for the root level (no parent halos).
+# `skip_covered = true` skips coarse cells covered by a finer-level patch
+# — the result on those cells is discarded by `restrict_to_parents!`
+# during AMR V-cycles, so computing it is wasted work.
 function apply_laplacian_root_fast!(Lphi::Vector{Vector{NamedTuple}},
                                      phi::Vector{Vector{NamedTuple}},
-                                     ws::MGWorkspace{D, T}) where {D, T}
+                                     ws::MGWorkspace{D, T};
+                                     skip_covered::Bool = false) where {D, T}
     pi = 1; ℓ = 1
     N = ws.patch_N[ℓ][pi]
     dx = ws.patch_dx[ℓ][pi]
@@ -570,10 +617,12 @@ function apply_laplacian_root_fast!(Lphi::Vector{Vector{NamedTuple}},
     Lphi_f = Lphi[ℓ][pi].phi
     kinds = ws.axis_kinds.kinds
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
+    covered = ws.covered_by_finer[ℓ][pi]
 
     @inbounds for I in CartesianIndices(N)
         c = c2c[I]
         c == 0 && continue
+        skip_covered && covered[c] && continue
         phi_c = T(phi_f[c][1])
         acc = zero(T)
         for d in 1:D
@@ -683,13 +732,14 @@ end
 function gs_sweep!(phi::Vector{Vector{NamedTuple}},
                    rho::Vector{Vector{NamedTuple}},
                    ws::MGWorkspace{D, T}, ℓ::Int;
-                   n_sweeps::Int = 1, backend = default_backend()) where {D, T}
+                   n_sweeps::Int = 1,
+                   skip_covered::Bool = false,
+                   backend = default_backend()) where {D, T}
     _refresh_rho_flat!(ws, rho, ℓ)
     if ℓ == 1
-        # Root level: no parent halos to worry about. Fast direct-array path.
-        gs_sweep_root_fast!(phi, ws, ℓ; n_sweeps = n_sweeps)
+        gs_sweep_root_fast!(phi, ws, ℓ; n_sweeps = n_sweeps,
+                             skip_covered = skip_covered)
     else
-        # Fine level: parent halos via PatchHaloView. Slow but correct.
         gs_sweep_via_orchestrator!(phi, ws, ℓ; n_sweeps = n_sweeps,
                                     backend = backend)
     end
@@ -702,7 +752,8 @@ end
 # `for_each_patch!` entirely — one allocation-free pass per sweep.
 function gs_sweep_root_fast!(phi::Vector{Vector{NamedTuple}},
                               ws::MGWorkspace{D, T}, ℓ::Int;
-                              n_sweeps::Int = 1) where {D, T}
+                              n_sweeps::Int = 1,
+                              skip_covered::Bool = false) where {D, T}
     @assert ℓ == 1
     pi = 1
     N = ws.patch_N[ℓ][pi]
@@ -713,6 +764,7 @@ function gs_sweep_root_fast!(phi::Vector{Vector{NamedTuple}},
     kinds = ws.axis_kinds.kinds
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
     diag = sum(d -> 2 * invh2[d], 1:D)
+    covered = ws.covered_by_finer[ℓ][pi]
 
     for _ in 1:n_sweeps
         for colour in 0:1
@@ -723,6 +775,7 @@ function gs_sweep_root_fast!(phi::Vector{Vector{NamedTuple}},
                 (s & 1) == colour || continue
                 c = c2c[I]
                 c == 0 && continue
+                skip_covered && covered[c] && continue
                 phi_c = T(phi_f[c][1])
                 nbr_acc = zero(T)
                 for d in 1:D
@@ -1061,14 +1114,28 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
     # Pre-smooth fine level (level ℓ_hi).
     gs_sweep!(phi, rho, ws, ℓ_hi; n_sweeps = ws.opts.n_pre, backend = backend)
 
-    # Compute residuals on level ℓ_hi AND ℓ_hi-1.
+    # Compute residuals on level ℓ_hi AND ℓ_hi-1. On level ℓ_hi-1, skip
+    # coarse cells covered by a finer patch — the restrict_to_parents!
+    # call below overwrites them with the volume-averaged fine residual,
+    # so computing the Laplacian on them is wasted work.
     apply_laplacian!(ws.residual, phi, ws;
-                      level_range = (ℓ_hi - 1):ℓ_hi, backend = backend)
+                      level_range = ℓ_hi:ℓ_hi, backend = backend)
+    apply_laplacian!(ws.residual, phi, ws;
+                      level_range = (ℓ_hi - 1):(ℓ_hi - 1),
+                      skip_covered = true, backend = backend)
     @inbounds for ℓ in (ℓ_hi - 1):ℓ_hi
         for pi in 1:length(ws.residual[ℓ])
             rf = ws.residual[ℓ][pi].phi
             rh = rho[ℓ][pi].rho
+            covered = ws.covered_by_finer[ℓ][pi]
             for c in ws.patch_leaves[ℓ][pi]
+                # On level ℓ_hi-1, leave covered cells' residual as-is —
+                # restrict_to_parents! overwrites them. Without this skip
+                # we'd compute `rh[c] - L_skipped[c]` where L_skipped is
+                # uninitialised on covered cells.
+                if ℓ == ℓ_hi - 1 && covered[c]
+                    continue
+                end
                 _set_val!(rf, c, _get_val(rh, c) - _get_val(rf, c))
             end
         end
