@@ -545,19 +545,23 @@ function for_each_patch!(kernel, fields_out::Vector,
         f_in = _normalize_views(fields_in[pi])
         f_out = _normalize_views(fields_out[pi])
 
-        # Build per-patch PatchBoundaryBC.
-        if level == 1 || isempty(parents) || fields_in_parent === nothing
-            patch_bcs = PatchBoundaryBC{D, T}(nothing, nothing;
-                                                physical_bcs = ph.physical_bcs)
+        # Build per-patch PatchBoundaryBC. Hoist into a `let`-bound final
+        # value so the per-cell closure below captures the value (not the
+        # mutable binding) — without this, parallel backends reject the
+        # closure with "Attempted to capture and modify outer local
+        # variable: patch_bcs".
+        patch_bcs_final = if level == 1 || isempty(parents) || fields_in_parent === nothing
+            PatchBoundaryBC{D, T}(nothing, nothing;
+                                    physical_bcs = ph.physical_bcs)
         else
             ppi = _find_parent_patch(parents, patch)
             if ppi == 0
-                patch_bcs = PatchBoundaryBC{D, T}(nothing, nothing;
-                                                    physical_bcs = ph.physical_bcs)
+                PatchBoundaryBC{D, T}(nothing, nothing;
+                                        physical_bcs = ph.physical_bcs)
             else
-                patch_bcs = PatchBoundaryBC(parents[ppi],
-                                              fields_in_parent[ppi];
-                                              physical_bcs = ph.physical_bcs)
+                PatchBoundaryBC(parents[ppi],
+                                  fields_in_parent[ppi];
+                                  physical_bcs = ph.physical_bcs)
             end
         end
 
@@ -572,24 +576,26 @@ function for_each_patch!(kernel, fields_out::Vector,
         Tin = typeof(f_in)
         BC = typeof(underlying_bcs)
 
-        parallel_foreach(backend,
-                          i -> begin
-                              cv = cell_view(f_in, f_out, patch, Int(i))
-                              base_hv = halo_view_multi(f_in, mesh, Int(i),
-                                                        ghost_depth;
-                                                        bcs = underlying_bcs)
-                              hv = PatchHaloView{Names, Tin, D, T,
-                                                  ghost_depth, BC,
-                                                  typeof(patch_bcs.parent_fields),
-                                                  typeof(patch_bcs.physical_bcs)}(
-                                  f_in, Int(i), patch, patch_bcs, base_hv)
-                              pv = PatchView{Names, Tin, typeof(f_out), D, T}(cv,
-                                                                                pi,
-                                                                                level)
-                              kernel(pv, hv, ctx)
-                              return nothing
-                          end,
-                          leaves)
+        let patch_bcs = patch_bcs_final
+            parallel_foreach(backend,
+                              i -> begin
+                                  cv = cell_view(f_in, f_out, patch, Int(i))
+                                  base_hv = halo_view_multi(f_in, mesh, Int(i),
+                                                            ghost_depth;
+                                                            bcs = underlying_bcs)
+                                  hv = PatchHaloView{Names, Tin, D, T,
+                                                      ghost_depth, BC,
+                                                      typeof(patch_bcs.parent_fields),
+                                                      typeof(patch_bcs.physical_bcs)}(
+                                      f_in, Int(i), patch, patch_bcs, base_hv)
+                                  pv = PatchView{Names, Tin, typeof(f_out), D, T}(cv,
+                                                                                    pi,
+                                                                                    level)
+                                  kernel(pv, hv, ctx)
+                                  return nothing
+                              end,
+                              leaves)
+        end
     end
     return nothing
 end

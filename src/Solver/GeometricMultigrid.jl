@@ -172,6 +172,16 @@ Base.@kwdef struct MGOptions
     verbose::Bool         = false
     project_mean::Bool    = true
     bottom_smooth_iters::Int = 40
+
+    # Bottom-solver choice for single-level recursive calls when the FFT
+    # plan is NOT applicable (typically fine-patch subcycling or
+    # non-Cartesian root). `:cg` runs Jacobi-preconditioned conjugate
+    # gradients against the matrix-free Laplacian — converges in O(N)
+    # iterations vs O(N²) for raw GS sweeping. `:gs` keeps the old
+    # smoother-only path (kept for compat / debugging).
+    bottom_solver::Symbol = :cg
+    bottom_cg_tol::Float64 = 1e-10
+    bottom_cg_maxiter::Int = 500
 end
 
 struct MGResult
@@ -410,33 +420,69 @@ end
 # Composite Laplacian (matrix-free) and residual
 # ----------------------------------------------------------------------------
 
+# Read φ at a one-step stencil offset, handling three cases:
+#   1. Same-patch neighbor (detected via `face_neighbors` on the mesh) —
+#      read directly from the same-patch fields.
+#   2. Off-patch but covered by a parent (detected because case 1 failed
+#      AND the PatchHaloView returns a non-`nothing` value) — apply the
+#      Martin–Colella linear ghost: φ_ghost = (1/3) φ_c + (2/3) φ_parent.
+#      This restores 2nd-order accuracy at the C/F interface; the naive
+#      degree-0 ghost stalls the V-cycle at ~3–7% relative residual.
+#   3. Outer-domain wall with no parent — apply the BC ghost rule
+#      (Dirichlet → −φ_c; Neumann → +φ_c; periodic is wrapped by the
+#      HaloView at case 2 and treated as same-level data — DO NOT apply MC).
 @inline function _read_phi(hv::PatchHaloView{Names, Tin, D, T, GD, BC, NT, PBC},
                             off::NTuple{D, Int}, phi_c::T,
                             axis_kinds::NTuple{D, Symbol}
                             ) where {Names, Tin, D, T, GD, BC, NT, PBC}
-    v = hv[:phi, off]
-    if v === nothing
-        # `nothing` means the halo lookup hit a wall and no parent / periodic
-        # value was found. The correct ghost depends on the BC of the axis
-        # this offset is moving along:
-        #   :dirichlet → φ_ghost = −φ_c   (cell-centered, value=0 at face)
-        #   :neumann   → φ_ghost = +φ_c   (mirror)
-        #   :periodic  → unreachable (HaloView would have wrapped)
-        # The PatchHaloView already returns +φ_c for REFLECTING walls, so
-        # the `nothing` branch is essentially the Dirichlet/Inflow case.
-        d_active = 0
-        @inbounds for d in 1:D
-            if off[d] != 0
-                d_active = d; break
-            end
-        end
-        if d_active == 0 || axis_kinds[d_active] === :dirichlet
-            return -phi_c
-        else
-            return phi_c
+    base = getfield(hv, :physical_halo)
+    mesh = base.mesh
+    c = getfield(base, :cell_index)
+
+    # Determine the active axis and side of the offset (one-step axis-aligned).
+    d_active = 0
+    sgn = 0
+    @inbounds for d in 1:D
+        if off[d] != 0
+            d_active = d; sgn = off[d]
+            break
         end
     end
-    return T(v[1])
+    if d_active == 0
+        return phi_c
+    end
+
+    # Step 1: same-patch (BC-unaware) face lookup. Non-zero ⇒ in-patch.
+    face_idx = 2 * (d_active - 1) + (sgn == 1 ? 2 : 1)
+    nbr = @inbounds face_neighbors(mesh, c)[face_idx]
+    if nbr != 0
+        fields_in = getfield(base, :fields_in)
+        field = getfield(fields_in, :phi)
+        return T(@inbounds field[Int(nbr)][1])
+    end
+
+    # Step 2: parent lookup or BC fallback (delegated to PatchHaloView).
+    v = hv[:phi, off]
+    if v === nothing
+        # No parent and the BC reported `nothing` (DIRICHLET / INFLOW).
+        return axis_kinds[d_active] === :dirichlet ? -phi_c : phi_c
+    end
+
+    # Two sub-cases: parent (apply MC) or root-level BC-wrap (skip MC).
+    # We're in case 2 only if face_neighbors returned 0 (i.e., the cell is
+    # at a patch wall). On the root patch a wall with a PERIODIC axis hits
+    # the BC-resolved HaloView (not the parent). Test this by asking the
+    # patch_bcs whether a parent exists.
+    pbc = getfield(hv, :patch_bcs)
+    if pbc.parent_frame === nothing
+        # No parent in scope ⇒ this is a BC-wrapped read (e.g., periodic
+        # wrap on the root patch). The wrapped neighbor is at "same-level"
+        # distance, so DO NOT apply MC.
+        return T(v[1])
+    end
+    # Parent lookup succeeded ⇒ Martin–Colella linear ghost.
+    phi_p = T(v[1])
+    return T(1//3) * phi_c + T(2//3) * phi_p
 end
 
 # Laplacian kernel: writes L φ into pv[:phi].
@@ -468,7 +514,7 @@ function apply_laplacian!(Lphi::Vector{Vector{NamedTuple}},
                           phi::Vector{Vector{NamedTuple}},
                           ws::MGWorkspace{D, T};
                           level_range::UnitRange{Int} = ws.level_range,
-                          backend = Sequential()) where {D, T}
+                          backend = default_backend()) where {D, T}
     ctx = ws.axis_kinds
     for ℓ in level_range
         if ℓ == 1
@@ -550,7 +596,7 @@ function compute_residual!(r::Vector{Vector{NamedTuple}},
                             rho::Vector{Vector{NamedTuple}},
                             ws::MGWorkspace{D, T};
                             level_range::UnitRange{Int} = ws.level_range,
-                            backend = Sequential()) where {D, T}
+                            backend = default_backend()) where {D, T}
     apply_laplacian!(r, phi, ws; level_range = level_range, backend = backend)
     @inbounds for ℓ in level_range
         for pi in 1:length(r[ℓ])
@@ -637,7 +683,7 @@ end
 function gs_sweep!(phi::Vector{Vector{NamedTuple}},
                    rho::Vector{Vector{NamedTuple}},
                    ws::MGWorkspace{D, T}, ℓ::Int;
-                   n_sweeps::Int = 1, backend = Sequential()) where {D, T}
+                   n_sweeps::Int = 1, backend = default_backend()) where {D, T}
     _refresh_rho_flat!(ws, rho, ℓ)
     if ℓ == 1
         # Root level: no parent halos to worry about. Fast direct-array path.
@@ -698,7 +744,7 @@ end
 function gs_sweep_via_orchestrator!(phi::Vector{Vector{NamedTuple}},
                                      ws::MGWorkspace{D, T}, ℓ::Int;
                                      n_sweeps::Int = 1,
-                                     backend = Sequential()) where {D, T}
+                                     backend = default_backend()) where {D, T}
     parent_in = ℓ >= 2 ? phi[ℓ - 1] : nothing
     axis_kinds = ws.axis_kinds.kinds
     for _ in 1:n_sweeps
@@ -845,6 +891,134 @@ function fft_bottom_solve!(ws::MGWorkspace{D, T},
 end
 
 # ----------------------------------------------------------------------------
+# CG bottom solver — Jacobi-preconditioned conjugate gradients against the
+# matrix-free composite Laplacian. Operates on a SINGLE level (typically
+# used as the bottom of a vcycle restricted to that level). Converges in
+# O(N) iterations vs O(N²) for raw GS smoothing.
+# ----------------------------------------------------------------------------
+
+# Apply L to phi on a single level, writing result into Lphi.
+function _apply_lapl_single_level!(Lphi, phi, ws::MGWorkspace{D, T}, ℓ::Int;
+                                    backend = default_backend()) where {D, T}
+    if ℓ == 1
+        apply_laplacian_root_fast!(Lphi, phi, ws)
+    else
+        parent_in = phi[ℓ - 1]
+        ctx = ws.axis_kinds
+        for_each_patch!(_lapl_kernel,
+                          Lphi[ℓ], phi[ℓ], ws.ph;
+                          level = ℓ, ghost_depth = 1,
+                          fields_in_parent = parent_in,
+                          ctx = ctx, backend = backend)
+    end
+    return Lphi
+end
+
+# Diagonal of L (per cell) on a uniform patch is Σ 2/h_d². Same for every
+# cell. Returns a scalar.
+@inline function _lapl_diag(ws::MGWorkspace{D, T}, ℓ::Int, pi::Int) where {D, T}
+    dx = ws.patch_dx[ℓ][pi]
+    s = zero(T)
+    @inbounds for d in 1:D
+        s += 2 / (dx[d] * dx[d])
+    end
+    return s
+end
+
+# Jacobi-preconditioned CG bottom solver. Solves L φ = ρ on level ℓ with
+# levels < ℓ frozen (their phi[ℓ-1] used as the parent halo for the
+# Laplacian). Updates phi[ℓ][1] in place.
+function cg_bottom_solve!(phi::Vector{Vector{NamedTuple}},
+                          rho::Vector{Vector{NamedTuple}},
+                          ws::MGWorkspace{D, T}, ℓ::Int;
+                          tol::Float64 = 1e-10,
+                          maxiter::Int = 500,
+                          backend = default_backend()) where {D, T}
+    pi = 1
+    leaves = ws.patch_leaves[ℓ][pi]
+    n = length(leaves)
+    n == 0 && return phi
+
+    diag_L = _lapl_diag(ws, ℓ, pi)
+    # The discrete cell-center Laplacian L has eigenvalues ≤ 0 — i.e. L is
+    # NEGATIVE semidefinite. CG requires SPD, so we solve the equivalent
+    # system  M φ = b  with  M = −L,  b = −ρ.  Both sides are negated, so
+    # the unknown φ is unchanged. `diag_L` is negative; `inv_diag` is the
+    # corresponding Jacobi preconditioner entry for M.
+    inv_diag = one(T) / abs(diag_L)
+
+    phi_arr = phi[ℓ][pi].phi
+    rho_arr = rho[ℓ][pi].rho
+
+    # Scratch fields: we reuse residual / correction / rhs_coarse buffers
+    # for r, p, Mp respectively. (Mp = M p where M = −L.)
+    r_field  = ws.residual[ℓ][pi].phi
+    p_field  = ws.correction[ℓ][pi].phi
+    Mp_field = ws.rhs_coarse[ℓ][pi].phi
+
+    # r₀ = b − M φ = −ρ − (−L φ) = −ρ + L φ = −(ρ − L φ).
+    _apply_lapl_single_level!(ws.residual, phi, ws, ℓ; backend = backend)
+    @inbounds for c in leaves
+        # r_field currently holds L φ. We want r = L φ − ρ.
+        r_field[c] = (r_field[c][1] - rho_arr[c][1],)
+    end
+
+    # z₀ = M⁻¹ r₀ (Jacobi).  p₀ = z₀.  rs₀ = ⟨r₀, z₀⟩.
+    rs = zero(T)
+    r_norm2 = zero(T)
+    @inbounds for c in leaves
+        rc = r_field[c][1]
+        z = rc * inv_diag
+        p_field[c] = (z,)
+        rs += rc * z
+        r_norm2 += rc * rc
+    end
+    r_norm0 = sqrt(r_norm2)
+    r_norm0 == 0 && return phi
+
+    iter = 0
+    while iter < maxiter
+        # Mp = M p = −L p.
+        _apply_lapl_single_level!(ws.rhs_coarse, ws.correction, ws, ℓ; backend = backend)
+        @inbounds for c in leaves
+            Mp_field[c] = (-Mp_field[c][1],)
+        end
+
+        pMp = zero(T)
+        @inbounds for c in leaves
+            pMp += p_field[c][1] * Mp_field[c][1]
+        end
+        pMp == 0 && break
+        α = rs / pMp
+
+        # φ += α p ;  r -= α Mp.
+        new_r_norm2 = zero(T)
+        @inbounds for c in leaves
+            phi_arr[c] = (phi_arr[c][1] + α * p_field[c][1],)
+            r_field[c] = (r_field[c][1] - α * Mp_field[c][1],)
+            new_r_norm2 += r_field[c][1] * r_field[c][1]
+        end
+        iter += 1
+        if sqrt(new_r_norm2) <= tol * r_norm0
+            break
+        end
+
+        # β = ⟨r_new, z_new⟩ / rs ;  p ← z_new + β p.
+        rs_new = zero(T)
+        @inbounds for c in leaves
+            rs_new += r_field[c][1] * (r_field[c][1] * inv_diag)
+        end
+        β = rs_new / rs
+        @inbounds for c in leaves
+            z = r_field[c][1] * inv_diag
+            p_field[c] = (z + β * p_field[c][1],)
+        end
+        rs = rs_new
+    end
+    return phi
+end
+
+# ----------------------------------------------------------------------------
 # V-cycle
 # ----------------------------------------------------------------------------
 
@@ -865,11 +1039,18 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
     ℓ_lo = first(level_range)
 
     if ℓ_hi == ℓ_lo
-        # Coarsest level of this V-cycle: direct solve via FFT (preferred)
-        # or many GS sweeps. The phi at this level is the correction we
-        # solve for; rho is the (restricted) residual.
+        # Coarsest level of this V-cycle: direct solve via FFT (preferred,
+        # exact for the discrete operator), Jacobi-PCG (fast for fine-patch
+        # subcycling), or raw GS sweeps (fallback / debugging). The phi at
+        # this level is the correction we solve for; rho is the (restricted)
+        # residual.
         if ws.fft_ok && ℓ_hi == ws.fft_level
             fft_bottom_solve!(ws, phi[ℓ_hi][1], rho[ℓ_hi][1])
+        elseif ws.opts.bottom_solver === :cg
+            cg_bottom_solve!(phi, rho, ws, ℓ_hi;
+                              tol = ws.opts.bottom_cg_tol,
+                              maxiter = ws.opts.bottom_cg_maxiter,
+                              backend = backend)
         else
             gs_sweep!(phi, rho, ws, ℓ_hi;
                        n_sweeps = ws.opts.bottom_smooth_iters, backend = backend)
