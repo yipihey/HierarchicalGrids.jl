@@ -812,6 +812,53 @@ end
 # subcycling AMR; if a fine patch touches the domain wall, both `nb_c`
 # and `par_c` are 0 and we fall back to the BC ghost rule (Dirichlet =
 # −φ_c, periodic / Neumann = +φ_c).
+# Fine-level cell stencil: returns (nbr_acc, diag_eff) decomposition of
+# the FAC operator at cell c. The Laplacian and the GS update both consume
+# this:
+#   L φ_c    = nbr_acc − diag_eff · φ_c
+#   φ_c_new  = (nbr_acc − ρ_c) / diag_eff       (GS update)
+@inline function _fine_stencil_sums(I::CartesianIndex{D},
+                                      c::Int, c2c::Array{Int, D},
+                                      phi_raw::Vector{T},
+                                      parent_phi_raw::Vector{T},
+                                      pcell::Matrix{Int},
+                                      kinds::NTuple{D, Symbol},
+                                      invh2::NTuple{D, T},
+                                      N::NTuple{D, Int},
+                                      phi_c::T) where {D, T}
+    nbr_acc = zero(T)
+    diag_eff = zero(T)
+    two_thirds = T(2//3)
+    @inbounds for d in 1:D
+        for (side, face_idx) in ((1, 2 * (d - 1) + 2), (-1, 2 * (d - 1) + 1))
+            inew = I[d] + side
+            if 1 <= inew <= N[d]
+                # Same-patch neighbor
+                nb_c = c2c[I + side * _unit_offsets(Val(D))[d]]
+                nbr_acc += phi_raw[nb_c] * invh2[d]
+                diag_eff += invh2[d]
+            else
+                par_c = pcell[c, face_idx]
+                if par_c != 0
+                    # MC ghost: phi_n = (1/3) φ_c + (2/3) φ_p
+                    # Per-face contribution: (2/3) φ_p / h² to nbr_acc,
+                    # (2/3) / h² to diag_eff.
+                    nbr_acc += two_thirds * parent_phi_raw[par_c] * invh2[d]
+                    diag_eff += two_thirds * invh2[d]
+                else
+                    # Outer wall: Dirichlet (φ_ghost = -φ_c) contributes
+                    # 2/h² to diag_eff, 0 to nbr_acc. Neumann / periodic
+                    # without parent: nothing.
+                    if kinds[d] === :dirichlet
+                        diag_eff += 2 * invh2[d]
+                    end
+                end
+            end
+        end
+    end
+    return nbr_acc, diag_eff
+end
+
 function apply_laplacian_fine_fast!(Lphi::Vector{Vector{NamedTuple}},
                                      phi::Vector{Vector{NamedTuple}},
                                      ws::MGWorkspace{D, T}, ℓ::Int) where {D, T}
@@ -825,32 +872,15 @@ function apply_laplacian_fine_fast!(Lphi::Vector{Vector{NamedTuple}},
     kinds = ws.axis_kinds.kinds
     parent_phi_raw = _raw_phi(phi[ℓ - 1][1])::Vector{T}
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
-    one_third = T(1//3); two_thirds = T(2//3)
 
     @inbounds for I in CartesianIndices(N)
         c = c2c[I]
         c == 0 && continue
         phi_c = phi_raw[c]
-        acc = zero(T)
-        for d in 1:D
-            for (side, face_idx) in ((1, 2 * (d - 1) + 2), (-1, 2 * (d - 1) + 1))
-                inew = I[d] + side
-                if 1 <= inew <= N[d]
-                    nb_c = c2c[I + side * _unit_offsets(Val(D))[d]]
-                    phi_n = phi_raw[nb_c]
-                else
-                    par_c = pcell[c, face_idx]
-                    if par_c != 0
-                        phi_p = parent_phi_raw[par_c]
-                        phi_n = one_third * phi_c + two_thirds * phi_p
-                    else
-                        phi_n = kinds[d] === :dirichlet ? -phi_c : phi_c
-                    end
-                end
-                acc += (phi_n - phi_c) * invh2[d]
-            end
-        end
-        Lphi_raw[c] = acc
+        nbr_acc, diag_eff = _fine_stencil_sums(I, c, c2c, phi_raw,
+                                                 parent_phi_raw, pcell,
+                                                 kinds, invh2, N, phi_c)
+        Lphi_raw[c] = nbr_acc - diag_eff * phi_c
     end
     return Lphi
 end
@@ -1148,18 +1178,11 @@ function gs_sweep_fine_fast!(phi::Vector{Vector{NamedTuple}},
     dx = ws.patch_dx[ℓ][pi]
     c2c = ws.cart_to_cell[ℓ][pi]
     pcell = ws.parent_cell[ℓ][pi]
-    phi_raw = _raw_phi(phi[ℓ][pi])
+    phi_raw = _raw_phi(phi[ℓ][pi])::Vector{T}
     rho_flat = ws.rho_flat[ℓ][pi]
     kinds = ws.axis_kinds.kinds
     parent_phi_raw = _raw_phi(phi[ℓ - 1][1])::Vector{T}
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
-    one_third = T(1//3); two_thirds = T(2//3)
-
-    # Per-cell diagonal of the Laplacian acting on φ_c. With the MC ghost
-    # `φ_ghost = (1/3) φ_c + (2/3) φ_parent`, an off-patch face contributes
-    # (1/3 − 1) φ_c / h_d² = −(2/3) φ_c / h_d², so the EFFECTIVE diagonal at
-    # a boundary cell DROPS by (2/3)/h_d² for each boundary face. We
-    # compute it on the fly per cell — cheap.
 
     for _ in 1:n_sweeps
         for colour in 0:1
@@ -1169,41 +1192,18 @@ function gs_sweep_fine_fast!(phi::Vector{Vector{NamedTuple}},
                 (s & 1) == colour || continue
                 c = c2c[I]
                 c == 0 && continue
-
-                # Sum the non-φ_c part of the stencil and compute the
-                # effective diagonal.
-                diag = zero(T)
-                nbr_acc = zero(T)
-                bc_diag_adj = zero(T)   # subtracts (1/3)/h² per MC face
-                for d in 1:D
-                    for (side, face_idx) in ((1, 2 * (d - 1) + 2), (-1, 2 * (d - 1) + 1))
-                        inew = I[d] + side
-                        if 1 <= inew <= N[d]
-                            nb_c = c2c[I + side * _unit_offsets(Val(D))[d]]
-                            nbr_acc += phi_raw[nb_c] * invh2[d]
-                            diag    += invh2[d]
-                        else
-                            par_c = pcell[c, face_idx]
-                            if par_c != 0
-                                nbr_acc += two_thirds * parent_phi_raw[par_c] * invh2[d]
-                                diag    += invh2[d]
-                                bc_diag_adj += one_third * invh2[d]
-                            else
-                                if kinds[d] === :dirichlet
-                                    diag += 2 * invh2[d]
-                                end
-                            end
-                        end
-                    end
-                end
+                phi_c = phi_raw[c]
+                nbr_acc, diag_eff = _fine_stencil_sums(I, c, c2c, phi_raw,
+                                                         parent_phi_raw, pcell,
+                                                         kinds, invh2, N, phi_c)
                 rho_c = rho_flat[c]
-                diag_eff = diag - bc_diag_adj
                 phi_raw[c] = (nbr_acc - rho_c) / diag_eff
             end
         end
     end
     return phi
 end
+
 
 # Fast direct-array RB-GS for the ROOT level (no parent halos).
 # Reads stencil neighbors via `cart_to_cell` with explicit periodic /
