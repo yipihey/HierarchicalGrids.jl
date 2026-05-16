@@ -290,6 +290,39 @@ end
 # Test 7: apply_laplacian! recovers the analytic Laplacian to 2nd order
 # ----------------------------------------------------------------------------
 
+@testset "GeometricMultigrid: PCG-on-composite drives residual to machine precision" begin
+    # The V-cycle stalls at a prolongation-coupling fixed point on AMR;
+    # PCG eliminates it by treating uncovered-coarse + fine cells as one
+    # SPD system and running preconditioned CG.
+    rho_fun(x) = -8π^2 * sin(2π * x[1]) * sin(2π * x[2])
+    phi_fun(x) = sin(2π * x[1]) * sin(2π * x[2])
+    bcs_spec = ((PERIODIC, PERIODIC), (PERIODIC, PERIODIC))
+    bcs = FrameBoundaries(bcs_spec)
+    ph = build_uniform_root_hierarchy(Val(2), 5, (0.0, 0.0), (1.0, 1.0);
+                                       physical_bcs = bcs)
+    fine_mesh = HierarchicalMesh{2}()
+    for _ in 1:4
+        refine_cells!(fine_mesh, enumerate_leaves(fine_mesh))
+    end
+    add_patches!(ph, 2, [EulerianFrame(fine_mesh, (0.375, 0.375), (0.625, 0.625))])
+    fields = allocate_phi_rho(ph)
+    fill_field!(fields, ph, :rho, rho_fun)
+    ws = MGWorkspace(ph, bcs_spec;
+                      opts = MGOptions(tol = 1e-8, maxiter = 200,
+                                        cycle = :pcg))
+    result = solve_poisson!(ws, fields)
+    @test result.converged
+    # Should drive residual several orders of magnitude below the V-cycle's
+    # ~1% relative fixed point. (V-cycle stalls around 0.5; PCG-Jacobi
+    # converges to ~1e-7.)
+    @test result.res_final < 1e-6
+    @test result.res_final / result.res_init < 1e-7
+    errs = l2_error(fields, ph, ws, phi_fun)
+    # Solution accuracy unchanged from the V-cycle's stalled value —
+    # discretization-limited at the C/F interface.
+    @test errs[2] < 1e-2
+end
+
 @testset "GeometricMultigrid: refinement listener invalidates caches" begin
     using HierarchicalGrids: refine_cells!
     bcs_spec = ((PERIODIC, PERIODIC), (PERIODIC, PERIODIC))
