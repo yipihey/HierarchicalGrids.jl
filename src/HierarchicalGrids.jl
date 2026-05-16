@@ -296,15 +296,17 @@ export step_patch_pipeline!
 # Overlap, and Threading all through the same `using ..*` mechanism. The
 # `..Solver` reference inside the file binds to the sibling submodule.
 include("Solver/GeometricMultigrid.jl")
-using .GeometricMultigrid: MGWorkspace, MGOptions, MGResult,
+using .GeometricMultigrid: MGWorkspace, MGOptions, MGResult, PhiRhoFields,
                            solve_poisson!, vcycle!,
                            apply_laplacian!, compute_residual!, residual_l2,
                            allocate_phi_rho, build_uniform_root_hierarchy,
-                           manufactured_rhs!, fill_field!
-export MGWorkspace, MGOptions, MGResult
+                           manufactured_rhs!, fill_field!,
+                           release!
+export MGWorkspace, MGOptions, MGResult, PhiRhoFields
 export solve_poisson!, vcycle!
 export apply_laplacian!, compute_residual!, residual_l2
 export allocate_phi_rho, build_uniform_root_hierarchy
 export manufactured_rhs!, fill_field!
+export release!
 
 end # module HierarchicalGrids

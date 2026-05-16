@@ -290,6 +290,45 @@ end
 # Test 7: apply_laplacian! recovers the analytic Laplacian to 2nd order
 # ----------------------------------------------------------------------------
 
+@testset "GeometricMultigrid: refinement listener invalidates caches" begin
+    using HierarchicalGrids: refine_cells!
+    bcs_spec = ((PERIODIC, PERIODIC), (PERIODIC, PERIODIC))
+    bcs = FrameBoundaries(bcs_spec)
+    ph = build_uniform_root_hierarchy(Val(2), 4, (0.0, 0.0), (1.0, 1.0);
+                                       physical_bcs = bcs)
+    ws = MGWorkspace(ph, bcs_spec)
+    @test ws.fft_ok          # configured at construction
+    # Trigger a refinement event on the root mesh by refining one leaf.
+    mesh = ph.levels[1][1].mesh
+    refine_cells!(mesh, [enumerate_leaves(mesh)[1]])
+    @test !ws.fft_ok         # listener cleared FFT
+    @test isempty(ws.schur_factors)
+    release!(ws)
+end
+
+@testset "GeometricMultigrid: allocation regression (warm solve)" begin
+    bcs_spec = ((PERIODIC, PERIODIC), (PERIODIC, PERIODIC))
+    bcs = FrameBoundaries(bcs_spec)
+    ph = build_uniform_root_hierarchy(Val(2), 5, (0.0, 0.0), (1.0, 1.0);
+                                       physical_bcs = bcs)
+    fields = allocate_phi_rho(ph)
+    fill_field!(fields, ph, :rho, x -> -8π^2 * sin(2π * x[1]) * sin(2π * x[2]))
+    ws = MGWorkspace(ph, bcs_spec; opts = MGOptions(tol = 1e-10, maxiter = 5))
+    # Warm up the JIT.
+    solve_poisson!(ws, fields)
+    # Reset phi to zero for a fair re-solve.
+    for ℓ in 1:length(fields), pi in 1:length(fields[ℓ])
+        f = fields[ℓ][pi].phi
+        for c in 1:length(f); f[c] = (0.0,); end
+    end
+    # Allocation budget: one warm V-cycle on a 32² periodic problem should
+    # allocate well under 64 KB. The exact number changes with Julia and
+    # FFTW versions; the bar guards against per-cell allocations creeping
+    # back into the hot path.
+    bytes = @allocated solve_poisson!(ws, fields)
+    @test bytes < 64_000
+end
+
 @testset "GeometricMultigrid: apply_laplacian! consistency" begin
     bcs_spec = ((PERIODIC, PERIODIC), (PERIODIC, PERIODIC))
     bcs = FrameBoundaries(bcs_spec)

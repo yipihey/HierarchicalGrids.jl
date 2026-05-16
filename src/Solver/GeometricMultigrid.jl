@@ -1,24 +1,97 @@
 # ============================================================================
 # GeometricMultigrid — Poisson solver on a PatchHierarchy
-#
-# Composite cell-centered 2nd-order finite-volume Laplacian + geometric V-cycle.
-#
-# v1 scope:
-#   * One patch per level (FFT bottom requires it; AMR tests use it).
-#   * Degree-0 polynomial fields (MonomialBasis{D, 0}).
-#   * Red-black Gauss-Seidel smoother (level-restricted).
-#   * Volume-weighted residual restriction (via existing
-#     `restrict_to_parents!` degree-0 path).
-#   * Multilinear correction prolongation (NEW; the existing degree-0
-#     prolong would degrade MG to first order).
-#   * FFT bottom solver on the level_range[1] root patch: periodic /
-#     Dirichlet / Neumann via rfft and FFTW.r2r (DST-II / DCT-II).
-#   * Partial-hierarchy support: `solve_poisson!(...; level_range = ℓ_lo:ℓ_hi)`
-#     updates only those levels; levels outside the range stay frozen and
-#     feed in via the existing `PatchBoundaryBC` parent-lookup path.
-#   * `interior_solver = :schur` is reserved for v2 (see plan §G).
 # ============================================================================
 
+"""
+    GeometricMultigrid
+
+A composite cell-centered finite-volume Poisson solver built on top of
+`HierarchicalGrids.Solver.PatchHierarchy`. Supports periodic, Dirichlet,
+and Neumann boundary conditions on a tile-uniform root level, with
+2:1-refined fine patches on top.
+
+# Quick start
+
+```julia
+using HierarchicalGrids
+using HierarchicalGrids: PERIODIC
+using HierarchicalGrids.Overlap: FrameBoundaries
+
+# Build a 64² periodic root grid.
+bcs_spec = ((PERIODIC, PERIODIC), (PERIODIC, PERIODIC))
+bcs = FrameBoundaries(bcs_spec)
+ph = build_uniform_root_hierarchy(Val(2), 6, (0.0, 0.0), (1.0, 1.0);
+                                   physical_bcs = bcs)
+
+# Allocate (phi, rho) and project a manufactured source.
+fields = allocate_phi_rho(ph)
+fill_field!(fields, ph, :rho, x -> -8π^2 * sin(2π*x[1]) * sin(2π*x[2]))
+
+# Build a workspace and solve.
+ws = MGWorkspace(ph, bcs_spec; opts = MGOptions(tol = 1e-10))
+result = solve_poisson!(ws, fields)        # convenience form
+# or: result = solve_poisson!(fields, fields, ws)
+
+@info "solved: \$result"                    # MGResult(converged in N V-cycles, ...)
+```
+
+# Solver paths
+
+The bottom solver inside the V-cycle dispatches based on which paths are
+applicable:
+
+  * **FFT direct solve** is used at `level_range[1]` when that level is a
+    single tile-uniform patch covering the domain. Supports periodic
+    (`rfft`), Dirichlet (DST-II), and Neumann (DCT-II). 1 V-cycle to
+    machine precision.
+  * **Schur-complement direct solve** is used for single-level fine-patch
+    solves when `bottom_solver = :schur`. Builds sparse A_II / A_IΓ /
+    A_ΓΓ blocks once, factors A_II by Cholesky, forms a dense Schur
+    complement S, factors S by LU. Reuses the factor across solves with
+    the same operator. Best for subcycling.
+  * **Jacobi-PCG** (`bottom_solver = :cg`, default) for non-FFT,
+    non-Schur bottoms — matrix-free, O(N) iterations.
+  * **Raw Gauss-Seidel** (`bottom_solver = :gs`) as a debugging fallback.
+
+The level-2+ smoother in the V-cycle goes through a fast direct-array
+path that uses pre-cached `cart_to_cell` and `parent_cell` tables to
+avoid the O(n_parent) scan in `PatchHaloView`. Martin–Colella linear
+ghost at C/F interfaces gives 2nd-order accuracy at the fine boundary;
+the coarse-side FAC flux fix gives a consistent composite operator.
+
+# Known limitations
+
+  * **AMR V-cycle stalls at ~3-7% relative residual.** This is the
+    discrepancy between the FAC composite operator (used for the residual)
+    and the regular periodic FFT operator (used for the bottom-level
+    correction). The V-cycle converges to a fixed point of the residual
+    reduction — NOT machine precision — but the solution accuracy at
+    the C/F interface is 2nd-order (best possible for the FAC
+    discretisation). To converge further you'd need a coarse-grid
+    correction that ALSO uses the FAC operator (open problem).
+  * **One patch per level.** Multi-patch root or multi-patch fine levels
+    are rejected. FFT bottom requires a single domain-covering patch.
+  * **Degree-0 polynomial fields only.** The cell-centered FV operator
+    treats the stored coefficient as a cell average.
+  * **No threading** of the fast Cartesian paths yet — only the
+    orchestrator path (level 2+ smoother / Laplacian) parallelises via
+    OhMyThreads.
+
+# Public API
+
+  * `build_uniform_root_hierarchy(::Val{D}, refines, lo, hi; physical_bcs)`
+  * `allocate_phi_rho(ph)` / `fill_field!(fields, ph, name, f)`
+  * `MGOptions(; kwargs...)`
+  * `MGWorkspace(ph, bcs_spec; level_range, opts)`
+  * `solve_poisson!(ws, fields)` or `solve_poisson!(phi, rho, ws)`
+  * `vcycle!(phi, rho, ws; level_range)`
+  * `apply_laplacian!(Lphi, phi, ws; level_range)`
+  * `compute_residual!(r, phi, rho, ws; level_range)`
+  * `residual_l2(r, ws; level_range)`
+  * `release!(ws)` — explicit teardown of the refinement listener.
+
+See also: `HierarchicalGrids.Solver.PatchHierarchy`, `for_each_patch!`.
+"""
 module GeometricMultigrid
 
 using ..Mesh: HierarchicalMesh, n_cells, is_leaf, level_of,
@@ -43,11 +116,18 @@ using FFTW
 using LinearAlgebra: norm, mul!, lu!, ldiv!, lu, cholesky
 using SparseArrays: SparseMatrixCSC, sparse, spzeros, nnz
 
-export MGWorkspace, MGOptions, MGResult,
+export MGWorkspace, MGOptions, MGResult, PhiRhoFields,
        solve_poisson!, vcycle!,
        apply_laplacian!, compute_residual!, residual_l2,
        allocate_phi_rho, build_uniform_root_hierarchy,
-       manufactured_rhs!, fill_field!
+       manufactured_rhs!, fill_field!, release!
+
+# Type alias for the (phi, rho) field container returned by
+# `allocate_phi_rho`. The outer Vector is per-level; the inner per-patch.
+# Loose on the concrete `PolynomialFieldView` parameters to avoid coupling
+# to the Storage submodule's internal types — any NamedTuple with the
+# right symbol-shape suffices for the solver's read/write paths.
+const PhiRhoFields = Vector{Vector{NamedTuple}}
 
 # ----------------------------------------------------------------------------
 # Field allocation helpers
@@ -110,6 +190,13 @@ end
 
 @inline _get_val(f, i) = @inbounds f[i][1]
 @inline _set_val!(f, i, v) = (@inbounds f[i] = (v,); nothing)
+
+# Raw-storage accessors for the degree-0 SoA layout. `phi_view.phi` is a
+# `PolynomialFieldView`; the underlying contiguous Vector{T} lives at
+# `view.phi.pfs.storage.phi`. Accessing it directly bypasses the
+# PolynomialView struct that `phi_view.phi[i]` would build per cell.
+@inline _raw_phi(v::NamedTuple) = v.phi.pfs.storage.phi
+@inline _raw_rho(v::NamedTuple) = v.rho.pfs.storage.rho
 
 # Local copy of `Solver._find_parent_patch` (not exported). Returns the
 # 1-based index of the parent patch containing `child`, or 0 if none.
@@ -209,6 +296,15 @@ struct MGResult
     history::Vector{Float64}
 end
 
+function Base.show(io::IO, r::MGResult)
+    red = r.res_init == 0 ? 0.0 : r.res_final / r.res_init
+    status = r.converged ? "converged" : "STOPPED (maxiter)"
+    print(io, "MGResult($status in $(r.iters) V-cycles, ",
+          "|r|: $(round(r.res_init, sigdigits=3)) → ",
+          "$(round(r.res_final, sigdigits=3)), ",
+          "reduction $(round(red, sigdigits=3)))")
+end
+
 # ----------------------------------------------------------------------------
 # MGWorkspace
 # ----------------------------------------------------------------------------
@@ -284,6 +380,8 @@ mutable struct MGWorkspace{D, T}
     fft_buf_complex::Array{Complex{T}, D}
     fft_plan_fwd::Any
     fft_plan_inv::Any
+    # Scratch buffer for the r2r path (in-place transforms).
+    fft_r2r_buf::Array{T, D}
 
     # Schur factor cache, per level (lazy-built on first :schur bottom call).
     # Only the levels with a corresponding parent benefit. Invalidated by
@@ -457,6 +555,7 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
     fft_kind   = Symbol[]
     fft_buf    = Array{T, D}(undef, ntuple(_ -> 1, Val(D)))
     fft_buf_complex = Array{Complex{T}, D}(undef, ntuple(_ -> 1, Val(D)))
+    fft_r2r_buf = Array{T, D}(undef, ntuple(_ -> 1, Val(D)))
     fft_plan_fwd = nothing
     fft_plan_inv = nothing
 
@@ -490,6 +589,7 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
             if ok
                 fft_ok = true; fft_N = N; fft_dx = dx; fft_kind = kinds
                 fft_buf = Array{T, D}(undef, N)
+                fft_r2r_buf = Array{T, D}(undef, N)
                 fft_inv_eig = _build_inv_eigenvalues(N, dx, kinds, T)
                 fft_plan_fwd, fft_plan_inv, fft_buf_complex =
                     _build_fft_plans(fft_buf, kinds)
@@ -505,7 +605,7 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
                             residual, correction, rhs_coarse,
                             fft_ok, fft_level, fft_N, fft_dx, fft_inv_eig,
                             fft_kind, fft_buf, fft_buf_complex,
-                            fft_plan_fwd, fft_plan_inv,
+                            fft_plan_fwd, fft_plan_inv, fft_r2r_buf,
                             Dict{Int, Any}(),
                             nothing)
 
@@ -578,6 +678,16 @@ function release!(ws::MGWorkspace)
         ws.listener = nothing
     end
     return ws
+end
+
+function Base.show(io::IO, ws::MGWorkspace{D, T}) where {D, T}
+    nL = length(ws.ph.levels)
+    bottom = ws.fft_ok ? "FFT($(join(ws.fft_kind, "/")))" :
+              ws.opts.bottom_solver === :schur ? "Schur(direct)" :
+              ws.opts.bottom_solver === :cg    ? "Jacobi-PCG"    : "GS"
+    print(io, "MGWorkspace{$D,$T}(",
+          "$(nL) levels, range $(ws.level_range), ",
+          "bottom = $bottom)")
 end
 
 # ----------------------------------------------------------------------------
@@ -709,51 +819,56 @@ function apply_laplacian_fine_fast!(Lphi::Vector{Vector{NamedTuple}},
     dx = ws.patch_dx[ℓ][pi]
     c2c = ws.cart_to_cell[ℓ][pi]
     pcell = ws.parent_cell[ℓ][pi]
-    phi_f = phi[ℓ][pi].phi
-    Lphi_f = Lphi[ℓ][pi].phi
+    phi_raw = _raw_phi(phi[ℓ][pi])::Vector{T}
+    Lphi_raw = _raw_phi(Lphi[ℓ][pi])::Vector{T}
     kinds = ws.axis_kinds.kinds
-    parent_phi = phi[ℓ - 1][1].phi
+    parent_phi_raw = _raw_phi(phi[ℓ - 1][1])::Vector{T}
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
     one_third = T(1//3); two_thirds = T(2//3)
 
     @inbounds for I in CartesianIndices(N)
         c = c2c[I]
         c == 0 && continue
-        phi_c = T(phi_f[c][1])
+        phi_c = phi_raw[c]
         acc = zero(T)
         for d in 1:D
             for (side, face_idx) in ((1, 2 * (d - 1) + 2), (-1, 2 * (d - 1) + 1))
-                # In-patch?
                 inew = I[d] + side
                 if 1 <= inew <= N[d]
-                    nb_tuple = Base.setindex(Tuple(I), inew, d)
-                    nb_c = c2c[CartesianIndex{D}(nb_tuple)]
-                    phi_n = T(phi_f[nb_c][1])
+                    nb_c = c2c[I + side * _unit_offsets(Val(D))[d]]
+                    phi_n = phi_raw[nb_c]
                 else
-                    # Off-patch: parent lookup.
                     par_c = pcell[c, face_idx]
                     if par_c != 0
-                        phi_p = T(parent_phi[par_c][1])
-                        # Martin-Colella linear ghost
+                        phi_p = parent_phi_raw[par_c]
                         phi_n = one_third * phi_c + two_thirds * phi_p
                     else
-                        # Outer wall (no parent). Apply BC.
                         phi_n = kinds[d] === :dirichlet ? -phi_c : phi_c
                     end
                 end
                 acc += (phi_n - phi_c) * invh2[d]
             end
         end
-        Lphi_f[c] = (acc,)
+        Lphi_raw[c] = acc
     end
     return Lphi
 end
 
+# Unit offsets along each axis: `_unit_offsets(Val(D))[d]` returns
+# `CartesianIndex{D}((j == d ? 1 : 0) for j in 1:D)`. Cached per D via
+# Val-dispatch so the kernel can do `I + unit_offsets[d]` (allocation-free
+# CartesianIndex arithmetic) instead of `Base.setindex(Tuple(I), …)`.
+@generated function _unit_offsets(::Val{D}) where {D}
+    offsets = ntuple(d -> CartesianIndex{D}(ntuple(j -> j == d ? 1 : 0, D)), D)
+    return :($offsets)
+end
+
 # Read phi at a wrapped/clamped axis-d neighbor of cell `c` at grid index I.
 # Returns the neighbor value, or the appropriate BC fall-back (`-phi_c` for
-# Dirichlet, `phi_c` for Neumann). Specialised per D via @generated for
-# allocation-free CartesianIndex arithmetic.
-@inline function _neighbor_phi(phi_f, c2c::Array{Int, D},
+# Dirichlet, `phi_c` for Neumann). `phi_raw` is the underlying
+# `Vector{T}` (extracted by `_raw_phi(...)` once per call), allowing
+# allocation-free direct indexing.
+@inline function _neighbor_phi(phi_raw::AbstractVector{T}, c2c::Array{Int, D},
                                 I::CartesianIndex{D}, d::Int, sign::Int,
                                 N::NTuple{D, Int}, kinds::NTuple{D, Symbol},
                                 phi_c::T) where {D, T}
@@ -768,12 +883,8 @@ end
         kinds[d] === :neumann && (i_new = Nd)
         kinds[d] === :dirichlet && return -phi_c
     end
-    # Build new CartesianIndex by replacing axis d. Using `Base.setindex` on
-    # an NTuple{D, Int} is allocation-free for a small D.
-    new_tuple = Base.setindex(Tuple(I), i_new, d)
-    nb_I = CartesianIndex{D}(new_tuple)
-    nb_c = c2c[nb_I]
-    return T(phi_f[nb_c][1])
+    @inbounds nb_c = c2c[I + (i_new - I[d]) * _unit_offsets(Val(D))[d]]
+    return @inbounds phi_raw[nb_c]
 end
 
 # FAC flux fix on the COARSE side at C/F faces. Replaces the (invalid)
@@ -801,9 +912,9 @@ function apply_fac_flux_fix!(Lphi::Vector{Vector{NamedTuple}},
     pi_f = 1
     dxc = ws.patch_dx[coarse_level][pi_c]
     dxf = ws.patch_dx[fine_level][pi_f]
-    phi_coarse = phi[coarse_level][pi_c].phi
-    phi_fine   = phi[fine_level][pi_f].phi
-    Lphi_coarse = Lphi[coarse_level][pi_c].phi
+    phi_coarse = _raw_phi(phi[coarse_level][pi_c])::Vector{T}
+    phi_fine   = _raw_phi(phi[fine_level][pi_f])::Vector{T}
+    Lphi_coarse = _raw_phi(Lphi[coarse_level][pi_c])::Vector{T}
     inv_table = ws.fac_fine_at_coarse_face[coarse_level][pi_c]
 
     two_thirds = T(2//3)
@@ -831,12 +942,12 @@ function apply_fac_flux_fix!(Lphi::Vector{Vector{NamedTuple}},
             #            = (2/3) / (h_c[d] * h_f[d] * n_sub) * Σ_j (φ_cf_j − φ_c)
             n_sub = length(fine_list)
             inv_factor = two_thirds / (dxc[d] * dxf[d] * n_sub)
-            phi_c = T(phi_coarse[c][1])
+            phi_c = phi_coarse[c]
             fac_acc = zero(T)
             for fcell in fine_list
-                fac_acc += (T(phi_fine[fcell][1]) - phi_c)
+                fac_acc += (phi_fine[fcell] - phi_c)
             end
-            Lphi_coarse[c] = (Lphi_coarse[c][1] + fac_acc * inv_factor,)
+            Lphi_coarse[c] += fac_acc * inv_factor
         end
     end
     return Lphi
@@ -857,8 +968,8 @@ function apply_laplacian_root_fast!(Lphi::Vector{Vector{NamedTuple}},
     N = ws.patch_N[ℓ][pi]
     dx = ws.patch_dx[ℓ][pi]
     c2c = ws.cart_to_cell[ℓ][pi]
-    phi_f = phi[ℓ][pi].phi
-    Lphi_f = Lphi[ℓ][pi].phi
+    phi_raw = _raw_phi(phi[ℓ][pi])::Vector{T}
+    Lphi_raw = _raw_phi(Lphi[ℓ][pi])::Vector{T}
     kinds = ws.axis_kinds.kinds
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
     covered = ws.covered_by_finer[ℓ][pi]
@@ -869,21 +980,21 @@ function apply_laplacian_root_fast!(Lphi::Vector{Vector{NamedTuple}},
         c = c2c[I]
         c == 0 && continue
         skip_covered && covered[c] && continue
-        phi_c = T(phi_f[c][1])
+        phi_c = phi_raw[c]
         acc = zero(T)
         for d in 1:D
             face_p = 2 * (d - 1) + 2
             if !(has_fac && !isempty(fac_table[c, face_p]))
-                phi_p = _neighbor_phi(phi_f, c2c, I, d, +1, N, kinds, phi_c)
+                phi_p = _neighbor_phi(phi_raw, c2c, I, d, +1, N, kinds, phi_c)
                 acc += (phi_p - phi_c) * invh2[d]
             end
             face_m = 2 * (d - 1) + 1
             if !(has_fac && !isempty(fac_table[c, face_m]))
-                phi_m = _neighbor_phi(phi_f, c2c, I, d, -1, N, kinds, phi_c)
+                phi_m = _neighbor_phi(phi_raw, c2c, I, d, -1, N, kinds, phi_c)
                 acc += (phi_m - phi_c) * invh2[d]
             end
         end
-        Lphi_f[c] = (acc,)
+        Lphi_raw[c] = acc
     end
     return Lphi
 end
@@ -902,10 +1013,10 @@ function compute_residual!(r::Vector{Vector{NamedTuple}},
     apply_laplacian!(r, phi, ws; level_range = level_range, backend = backend)
     @inbounds for ℓ in level_range
         for pi in 1:length(r[ℓ])
-            rf = r[ℓ][pi].phi
-            rh = rho[ℓ][pi].rho
+            rf = _raw_phi(r[ℓ][pi])::Vector{T}
+            rh = _raw_rho(rho[ℓ][pi])::Vector{T}
             for c in ws.patch_leaves[ℓ][pi]
-                _set_val!(rf, c, _get_val(rh, c) - _get_val(rf, c))
+                rf[c] = rh[c] - rf[c]
             end
         end
     end
@@ -917,10 +1028,10 @@ function residual_l2(r::Vector{Vector{NamedTuple}}, ws::MGWorkspace{D, T};
     s = 0.0
     @inbounds for ℓ in level_range
         for pi in 1:length(r[ℓ])
-            f = r[ℓ][pi].phi
+            f = _raw_phi(r[ℓ][pi])::Vector{T}
             v = prod(ws.patch_dx[ℓ][pi])
             for c in ws.patch_leaves[ℓ][pi]
-                rc = Float64(_get_val(f, c))
+                rc = Float64(f[c])
                 s += rc * rc * v
             end
         end
@@ -972,10 +1083,10 @@ end
                                      rho::Vector{Vector{NamedTuple}},
                                      ℓ::Int) where {D, T}
     @inbounds for pi in 1:length(rho[ℓ])
-        rf = rho[ℓ][pi].rho
+        rf = _raw_rho(rho[ℓ][pi])::Vector{T}
         out = ws.rho_flat[ℓ][pi]
         for i in 1:length(rf)
-            out[i] = T(rf[i][1])
+            out[i] = rf[i]
         end
     end
     return nothing
@@ -1009,10 +1120,10 @@ function gs_sweep_fine_fast!(phi::Vector{Vector{NamedTuple}},
     dx = ws.patch_dx[ℓ][pi]
     c2c = ws.cart_to_cell[ℓ][pi]
     pcell = ws.parent_cell[ℓ][pi]
-    phi_f = phi[ℓ][pi].phi
+    phi_raw = _raw_phi(phi[ℓ][pi])
     rho_flat = ws.rho_flat[ℓ][pi]
     kinds = ws.axis_kinds.kinds
-    parent_phi = phi[ℓ - 1][1].phi
+    parent_phi_raw = _raw_phi(phi[ℓ - 1][1])::Vector{T}
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
     one_third = T(1//3); two_thirds = T(2//3)
 
@@ -1040,37 +1151,26 @@ function gs_sweep_fine_fast!(phi::Vector{Vector{NamedTuple}},
                     for (side, face_idx) in ((1, 2 * (d - 1) + 2), (-1, 2 * (d - 1) + 1))
                         inew = I[d] + side
                         if 1 <= inew <= N[d]
-                            nb_tuple = Base.setindex(Tuple(I), inew, d)
-                            nb_c = c2c[CartesianIndex{D}(nb_tuple)]
-                            nbr_acc += T(phi_f[nb_c][1]) * invh2[d]
+                            nb_c = c2c[I + side * _unit_offsets(Val(D))[d]]
+                            nbr_acc += phi_raw[nb_c] * invh2[d]
                             diag    += invh2[d]
                         else
                             par_c = pcell[c, face_idx]
                             if par_c != 0
-                                # MC face: contributes (1/3) φ_c + (2/3) φ_p.
-                                # Move (1/3) φ_c to the diagonal side.
-                                nbr_acc += two_thirds * T(parent_phi[par_c][1]) * invh2[d]
+                                nbr_acc += two_thirds * parent_phi_raw[par_c] * invh2[d]
                                 diag    += invh2[d]
                                 bc_diag_adj += one_third * invh2[d]
                             else
-                                # BC ghost: Dirichlet = −φ_c → effectively the
-                                # neighbor is `-φ_c`, so the diagonal gains
-                                # an extra +invh2 (from -(-φ_c)).
                                 if kinds[d] === :dirichlet
-                                    diag += 2 * invh2[d]   # absorbs both
-                                else
-                                    # Neumann / Periodic-with-no-parent:
-                                    # ghost = +φ_c → contributes nothing.
+                                    diag += 2 * invh2[d]
                                 end
                             end
                         end
                     end
                 end
                 rho_c = rho_flat[c]
-                # GS update: solve diag_eff * φ_c = nbr_acc - ρ
-                # where diag_eff = diag - bc_diag_adj.
                 diag_eff = diag - bc_diag_adj
-                phi_f[c] = ((nbr_acc - rho_c) / diag_eff,)
+                phi_raw[c] = (nbr_acc - rho_c) / diag_eff
             end
         end
     end
@@ -1090,7 +1190,7 @@ function gs_sweep_root_fast!(phi::Vector{Vector{NamedTuple}},
     N = ws.patch_N[ℓ][pi]
     dx = ws.patch_dx[ℓ][pi]
     c2c = ws.cart_to_cell[ℓ][pi]
-    phi_f = phi[ℓ][pi].phi
+    phi_raw = _raw_phi(phi[ℓ][pi])
     rho_flat = ws.rho_flat[ℓ][pi]
     kinds = ws.axis_kinds.kinds
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
@@ -1100,22 +1200,21 @@ function gs_sweep_root_fast!(phi::Vector{Vector{NamedTuple}},
     for _ in 1:n_sweeps
         for colour in 0:1
             @inbounds for I in CartesianIndices(N)
-                # parity test
                 s = 0
                 for d in 1:D; s += I[d]; end
                 (s & 1) == colour || continue
                 c = c2c[I]
                 c == 0 && continue
                 skip_covered && covered[c] && continue
-                phi_c = T(phi_f[c][1])
+                phi_c = phi_raw[c]
                 nbr_acc = zero(T)
                 for d in 1:D
-                    phi_p = _neighbor_phi(phi_f, c2c, I, d, +1, N, kinds, phi_c)
-                    phi_m = _neighbor_phi(phi_f, c2c, I, d, -1, N, kinds, phi_c)
+                    phi_p = _neighbor_phi(phi_raw, c2c, I, d, +1, N, kinds, phi_c)
+                    phi_m = _neighbor_phi(phi_raw, c2c, I, d, -1, N, kinds, phi_c)
                     nbr_acc += (phi_p + phi_m) * invh2[d]
                 end
                 rho_c = rho_flat[c]
-                phi_f[c] = ((nbr_acc - rho_c) / diag,)
+                phi_raw[c] = (nbr_acc - rho_c) / diag
             end
         end
     end
@@ -1246,23 +1345,30 @@ function fft_bottom_solve!(ws::MGWorkspace{D, T},
     end
 
     if all(==(:periodic), ws.fft_kind)
-        kbuf = ws.fft_plan_fwd * buf
+        # In-place rfft to avoid allocating a fresh k-space buffer.
+        mul!(ws.fft_buf_complex, ws.fft_plan_fwd, buf)
+        kbuf = ws.fft_buf_complex
         @inbounds for I in CartesianIndices(kbuf)
             kbuf[I] = kbuf[I] * ws.fft_inv_eig[I]
         end
         mul!(buf, ws.fft_plan_inv, kbuf)
     else
-        rbuf = ws.fft_plan_fwd * buf
+        # r2r path: forward into the cached scratch buffer, multiply by
+        # 1/eigenvalues, inverse back into the main buffer, then normalise.
+        # Avoids the per-call allocation that `plan_fwd * buf` would do.
+        rbuf = ws.fft_r2r_buf
+        mul!(rbuf, ws.fft_plan_fwd, buf)
         @inbounds for I in eachindex(rbuf)
             rbuf[I] *= ws.fft_inv_eig[I]
         end
-        rbuf2 = ws.fft_plan_inv * rbuf
+        mul!(buf, ws.fft_plan_inv, rbuf)
         normfac = one(T)
         for d in 1:D
             normfac *= ws.fft_kind[d] === :periodic ? N[d] : 2 * N[d]
         end
-        @inbounds for I in eachindex(rbuf2)
-            buf[I] = rbuf2[I] / normfac
+        inv_norm = one(T) / normfac
+        @inbounds for I in eachindex(buf)
+            buf[I] *= inv_norm
         end
     end
 
@@ -1428,18 +1534,18 @@ end
 # back to φ_cf, which would modify A_ΓΓ's diagonal. Deferred to v2.
 # ----------------------------------------------------------------------------
 
-mutable struct SchurFactor{T}
+struct SchurFactor{T, Chol, Lu}
     # Cell partitioning
     I_cells::Vector{Int}            # fine-patch cell index of each I row
     Γ_cells::Vector{Int}            # fine-patch cell index of each Γ row
     I_pos::Vector{Int}              # I_pos[c] = row in A_II if c ∈ I, else 0
     Γ_pos::Vector{Int}              # Γ_pos[c] = row in A_ΓΓ if c ∈ Γ, else 0
-    # Operator blocks
-    A_II_chol::Any                  # cholesky of A_II
+    # Operator blocks (typed so back-substitution is fully specialized).
+    A_II_chol::Chol                 # cholesky of A_II
     A_IΓ::SparseMatrixCSC{T, Int}
     A_ΓI::SparseMatrixCSC{T, Int}
     A_ΓΓ::SparseMatrixCSC{T, Int}
-    S_lu::Any                       # LU factor of dense Schur complement
+    S_lu::Lu                        # LU factor of dense Schur complement
     # Parent-side contributions to the RHS at each Γ cell (Dirichlet flux).
     # Built fresh each solve from phi_parent — but the pattern (which Γ
     # cell touches which parent cell on which face, with what coefficient)
@@ -1448,14 +1554,6 @@ mutable struct SchurFactor{T}
     invh2::NTuple{1, T}             # 1/h² along each axis (we cache only
                                     # one entry for D=2/3 — see usage)
 end
-
-# Default constructor placeholder so MGWorkspace can hold one slot per
-# fine patch. The actual factor is built on-demand by `_build_schur_factor`.
-SchurFactor{T}() where {T} =
-    SchurFactor{T}(Int[], Int[], Int[], Int[],
-                    nothing, spzeros(T, 0, 0), spzeros(T, 0, 0),
-                    spzeros(T, 0, 0), nothing,
-                    NTuple{3, Int}[], (zero(T),))
 
 # Build the Schur factorisation for a single fine patch (single-patch-per-
 # level assumption). Reuses workspace `cart_to_cell`, `parent_cell`, and
@@ -1524,8 +1622,7 @@ function _build_schur_factor(ws::MGWorkspace{D, T}, ℓ::Int) where {D, T}
             inew = Ic[d] + side
             if 1 <= inew <= N[d]
                 # Same-patch neighbor: standard M-matrix off-diagonal.
-                nb_tuple = Base.setindex(Tuple(CartesianIndex(Ic)), inew, d)
-                nb_c = c2c[CartesianIndex{D}(nb_tuple)]
+                nb_c = c2c[CartesianIndex(Ic) + side * _unit_offsets(Val(D))[d]]
                 pos_nb_I = I_pos[nb_c]
                 pos_nb_Γ = Γ_pos[nb_c]
                 coeff = -invh2[d]
@@ -1592,9 +1689,10 @@ function _build_schur_factor(ws::MGWorkspace{D, T}, ℓ::Int) where {D, T}
 
     S_lu = lu!(S_dense)
 
-    return SchurFactor{T}(I_cells, Γ_cells, I_pos, Γ_pos,
-                           A_II_chol, A_IΓ, A_ΓI, A_ΓΓ, S_lu,
-                           ghost_links, (invh2[1],))
+    return SchurFactor{T, typeof(A_II_chol), typeof(S_lu)}(
+        I_cells, Γ_cells, I_pos, Γ_pos,
+        A_II_chol, A_IΓ, A_ΓI, A_ΓΓ, S_lu,
+        ghost_links, (invh2[1],))
 end
 
 # Solve `M φ = −ρ` on the fine patch using the precomputed Schur factor.
@@ -1603,11 +1701,11 @@ function schur_bottom_solve!(phi::Vector{Vector{NamedTuple}},
                               rho::Vector{Vector{NamedTuple}},
                               ws::MGWorkspace{D, T},
                               ℓ::Int,
-                              factor::SchurFactor{T}) where {D, T}
+                              factor::SchurFactor) where {D, T}
     pi = 1
-    phi_arr = phi[ℓ][pi].phi
-    rho_arr = rho[ℓ][pi].rho
-    parent_phi = phi[ℓ - 1][1].phi
+    phi_arr = _raw_phi(phi[ℓ][pi])::Vector{T}
+    rho_arr = _raw_rho(rho[ℓ][pi])::Vector{T}
+    parent_phi = _raw_phi(phi[ℓ - 1][1])::Vector{T}
     dx = ws.patch_dx[ℓ][pi]
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
 
@@ -1618,17 +1716,14 @@ function schur_bottom_solve!(phi::Vector{Vector{NamedTuple}},
     b_I = Vector{T}(undef, nI)
     b_Γ = Vector{T}(undef, nΓ)
     @inbounds for (i, c) in enumerate(factor.I_cells)
-        b_I[i] = -T(rho_arr[c][1])
+        b_I[i] = -rho_arr[c]
     end
     @inbounds for (i, c) in enumerate(factor.Γ_cells)
-        b_Γ[i] = -T(rho_arr[c][1])
+        b_Γ[i] = -rho_arr[c]
     end
-    # Add ghost contributions to b_Γ. With MC ghost = (1/3) φ_cf + (2/3) φ_p,
-    # the parent term moves to the rhs as +(2/3) invh2 · φ_p (sign-flipped
-    # from L → M, with the (1/3) part absorbed into the matrix diagonal).
     two_thirds = T(2//3)
     @inbounds for (row, par_c, d) in factor.ghost_links
-        b_Γ[row] += two_thirds * invh2[d] * T(parent_phi[par_c][1])
+        b_Γ[row] += two_thirds * invh2[d] * parent_phi[par_c]
     end
 
     # z_I = A_II⁻¹ b_I
@@ -1644,10 +1739,10 @@ function schur_bottom_solve!(phi::Vector{Vector{NamedTuple}},
 
     # Write back into phi.
     @inbounds for (i, c) in enumerate(factor.I_cells)
-        phi_arr[c] = (φ_I[i],)
+        phi_arr[c] = φ_I[i]
     end
     @inbounds for (i, c) in enumerate(factor.Γ_cells)
-        phi_arr[c] = (φ_Γ[i],)
+        phi_arr[c] = φ_Γ[i]
     end
     return phi
 end
@@ -1839,20 +1934,46 @@ function solve_poisson!(phi::Vector{Vector{NamedTuple}},
     r = r0
     iter = 0
     converged = false
+    stalled = 0
     while iter < opts.maxiter
         vcycle!(phi, rho, ws; level_range = level_range, backend = backend)
         iter += 1
         compute_residual!(ws.residual, phi, rho, ws;
                            level_range = level_range, backend = backend)
-        r = residual_l2(ws.residual, ws; level_range = level_range)
-        push!(history, r)
-        opts.verbose && @info "MG cycle $iter: residual = $r  (reduction = $(r/r0))"
-        if r <= opts.tol * r0 || r <= opts.tol
-            converged = true; break
+        r_new = residual_l2(ws.residual, ws; level_range = level_range)
+        push!(history, r_new)
+        opts.verbose && @info "MG cycle $iter: residual = $r_new  (reduction = $(r_new/r0))"
+        if r_new <= opts.tol * r0 || r_new <= opts.tol
+            r = r_new; converged = true; break
+        end
+        # Stagnation detection: if the residual changed by < 0.5% for 3
+        # consecutive cycles, the FAC composite operator is at its fixed
+        # point and further V-cycles won't help. Stop and report (the
+        # solution is still 2nd-order accurate at the C/F interface).
+        if iter >= 2 && abs(r_new - r) < 5e-3 * r
+            stalled += 1
+        else
+            stalled = 0
+        end
+        r = r_new
+        if stalled >= 3
+            break
         end
     end
     return MGResult(iter, r0, r, converged, history)
 end
+
+"""
+    solve_poisson!(ws::MGWorkspace, fields; level_range, backend)
+
+Convenience wrapper around the 3-argument form when φ and ρ share the
+same per-patch container (as returned by `allocate_phi_rho`). Reads ρ
+from `fields[…][…].rho` and writes φ to `fields[…][…].phi`.
+"""
+solve_poisson!(ws::MGWorkspace, fields::Vector;
+                level_range = ws.level_range, backend = Sequential()) =
+    solve_poisson!(fields, fields, ws;
+                    level_range = level_range, backend = backend)
 
 # ----------------------------------------------------------------------------
 # Hierarchy construction helpers
