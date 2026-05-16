@@ -110,6 +110,22 @@ end
 @inline _get_val(f, i) = @inbounds f[i][1]
 @inline _set_val!(f, i, v) = (@inbounds f[i] = (v,); nothing)
 
+# Local copy of `Solver._find_parent_patch` (not exported). Returns the
+# 1-based index of the parent patch containing `child`, or 0 if none.
+@inline function _local_find_parent_patch(parents::Vector{EulerianFrame{D, T}},
+                                            child::EulerianFrame{D, T}) where {D, T}
+    @inbounds for (i, p) in enumerate(parents)
+        inside = true
+        for d in 1:D
+            if child.lo[d] < p.lo[d] || child.hi[d] > p.hi[d]
+                inside = false; break
+            end
+        end
+        inside && return i
+    end
+    return 0
+end
+
 # ----------------------------------------------------------------------------
 # Uniform-patch geometry
 # ----------------------------------------------------------------------------
@@ -228,6 +244,28 @@ mutable struct MGWorkspace{D, T}
     # when this mask is consulted. Top-level value is `false` everywhere.
     covered_by_finer::Vector{Vector{Vector{Bool}}}
 
+    # `parent_cell[ℓ][pi][c, k]` is the parent-patch cell index containing
+    # the +/-axis-aligned GHOST of fine cell `c` at level ℓ. The face index
+    # `k ∈ 1:2D` follows the convention used by `face_neighbors`
+    # (axis 1 lo, axis 1 hi, axis 2 lo, axis 2 hi, …). 0 means the ghost
+    # is outside the parent patch (shouldn't happen if patches are
+    # well-contained). Pre-computed once at workspace construction so the
+    # fast level-ℓ Laplacian / smoother avoids the O(n_parent) scan that
+    # `PatchHaloView._find_leaf_containing` does.
+    parent_cell::Vector{Vector{Array{Int, 2}}}
+
+    # FAC flux fix: inverted view of `parent_cell`. For each coarse cell `c`
+    # at level ℓ-1 and each coarse face `k ∈ 1:2D`, lists the fine cells
+    # at level ℓ whose ghost lookup lands inside coarse cell `c` on face `k`.
+    # Indexed as `fac_fine_at_coarse_face[ℓ-1][pi_coarse][c, k] :: Vector{Int}`.
+    # Empty list ⇒ coarse cell c's face k is NOT a C/F interface.
+    # Built lazily — workspaces without finer levels just have empty
+    # vectors. Used by `apply_fac_flux_fix!` to replace the coarse one-
+    # sided flux at each C/F face with the area-weighted sum of the fine
+    # sub-face fluxes (Martin-Colella's 2nd-order conservative composite
+    # operator).
+    fac_fine_at_coarse_face::Vector{Vector{Matrix{Vector{Int}}}}
+
     # Scratch fields, one per (level, patch).
     residual::Vector{Vector{NamedTuple}}
     correction::Vector{Vector{NamedTuple}}
@@ -331,6 +369,80 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
         end
     end
 
+    # Pre-compute the parent-cell index containing the ghost of every fine
+    # cell at every face. Skips level 1 (no parent). Boundary cells get a
+    # non-zero entry; interior fine cells get 0 (the same-patch face has
+    # priority in the kernel and the parent slot isn't consulted).
+    #
+    # Simultaneously builds the inverted index `fac_fine_at_coarse_face`
+    # used by the FAC flux fix on the coarse side.
+    parent_cell = Vector{Vector{Array{Int, 2}}}(undef, nL)
+    fac_fine_at_coarse_face = Vector{Vector{Matrix{Vector{Int}}}}(undef, nL)
+    for ℓ in 1:nL
+        npatches = length(patches_at(ph, ℓ))
+        parent_cell[ℓ] = Vector{Array{Int, 2}}(undef, npatches)
+        fac_fine_at_coarse_face[ℓ] = Vector{Matrix{Vector{Int}}}(undef, npatches)
+        for pi in 1:npatches
+            n = n_cells(patches_at(ph, ℓ)[pi].mesh)
+            parent_cell[ℓ][pi] = fill(0, n, 2 * D)
+            # Inverted index, one Vector{Int} per (coarse_cell, face) slot.
+            # The coarse-side slot is allocated at level ℓ (acting as the
+            # "parent of level ℓ+1"); level nL has no inverse index needed.
+            tbl_inv = Matrix{Vector{Int}}(undef, n, 2 * D)
+            for c in 1:n, k in 1:(2 * D)
+                tbl_inv[c, k] = Int[]
+            end
+            fac_fine_at_coarse_face[ℓ][pi] = tbl_inv
+        end
+    end
+    for ℓ in 2:nL
+        coarse_patches = patches_at(ph, ℓ - 1)
+        for (pi, fine_frame) in enumerate(patches_at(ph, ℓ))
+            ppi = _local_find_parent_patch(coarse_patches, fine_frame)
+            ppi == 0 && continue
+            parent_frame = coarse_patches[ppi]
+            parent_N = patch_N[ℓ - 1][ppi]
+            parent_dx = patch_dx[ℓ - 1][ppi]
+            parent_lo = parent_frame.lo
+            parent_c2c = cart_to_cell[ℓ - 1][ppi]
+            fine_dx = patch_dx[ℓ][pi]
+            fine_lo = fine_frame.lo
+            tbl = parent_cell[ℓ][pi]
+            tbl_inv = fac_fine_at_coarse_face[ℓ - 1][ppi]
+            for c in patch_leaves[ℓ][pi]
+                gi = grid_idx[ℓ][pi][c]
+                for d in 1:D, side in (-1, 1)
+                    face = 2 * (d - 1) + (side == 1 ? 2 : 1)
+                    if (side == -1 && gi[d] > 1) || (side == 1 && gi[d] < patch_N[ℓ][pi][d])
+                        continue
+                    end
+                    g_d = fine_lo[d] + (gi[d] - T(0.5) + T(side)) * fine_dx[d]
+                    pi_d = clamp(Int(floor((g_d - parent_lo[d]) / parent_dx[d])) + 1,
+                                  1, parent_N[d])
+                    par_gi_tup = ntuple(j -> begin
+                        if j == d
+                            pi_d
+                        else
+                            fine_center_j = fine_lo[j] + (gi[j] - T(0.5)) * fine_dx[j]
+                            clamp(Int(floor((fine_center_j - parent_lo[j]) / parent_dx[j])) + 1,
+                                   1, parent_N[j])
+                        end
+                    end, Val(D))
+                    par_c = parent_c2c[par_gi_tup...]
+                    tbl[c, face] = par_c
+                    if par_c != 0
+                        # On the COARSE side, the corresponding face is the
+                        # MIRROR direction (a fine cell whose -x neighbor is
+                        # in the parent means the parent's +x face is the C/F
+                        # interface from c's perspective).
+                        coarse_face = 2 * (d - 1) + (side == 1 ? 1 : 2)
+                        push!(tbl_inv[par_c, coarse_face], c)
+                    end
+                end
+            end
+        end
+    end
+
     # FFT bottom on level_range[1] (only if single-patch + tile-uniform).
     fft_ok = false
     fft_level = first(level_range)
@@ -382,7 +494,8 @@ function MGWorkspace(ph::PatchHierarchy{D, T},
     ws = MGWorkspace{D, T}(ph, bcs, level_range, opts,
                             grid_idx, patch_N, patch_dx, patch_leaves,
                             cart_to_cell, axis_kinds, rho_flat,
-                            covered_by_finer,
+                            covered_by_finer, parent_cell,
+                            fac_fine_at_coarse_face,
                             residual, correction, rhs_coarse,
                             fft_ok, fft_level, fft_N, fft_dx, fft_inv_eig,
                             fft_kind, fft_buf, fft_buf_complex,
@@ -557,19 +670,72 @@ function apply_laplacian!(Lphi::Vector{Vector{NamedTuple}},
                           ws::MGWorkspace{D, T};
                           level_range::UnitRange{Int} = ws.level_range,
                           skip_covered::Bool = false,
+                          skip_cf::Bool = false,
                           backend = default_backend()) where {D, T}
-    ctx = ws.axis_kinds
     for ℓ in level_range
         if ℓ == 1
-            apply_laplacian_root_fast!(Lphi, phi, ws; skip_covered = skip_covered)
+            apply_laplacian_root_fast!(Lphi, phi, ws;
+                                         skip_covered = skip_covered,
+                                         skip_cf = skip_cf)
         else
-            parent_in = phi[ℓ - 1]
-            for_each_patch!(_lapl_kernel,
-                              Lphi[ℓ], phi[ℓ], ws.ph;
-                              level = ℓ, ghost_depth = 1,
-                              fields_in_parent = parent_in,
-                              ctx = ctx, backend = backend)
+            apply_laplacian_fine_fast!(Lphi, phi, ws, ℓ)
         end
+    end
+    return Lphi
+end
+
+# Fast direct-array Laplacian for a fine (non-root) level. Uses the
+# workspace's pre-cached cart_to_cell and parent_cell tables to avoid the
+# O(n_parent) `_find_leaf_containing` scan that PatchHaloView does.
+# Applies Martin–Colella linear ghost (1/3 φ_c + 2/3 φ_parent) for off-
+# patch reads. Outer-domain reads from a fine patch are not expected for
+# subcycling AMR; if a fine patch touches the domain wall, both `nb_c`
+# and `par_c` are 0 and we fall back to the BC ghost rule (Dirichlet =
+# −φ_c, periodic / Neumann = +φ_c).
+function apply_laplacian_fine_fast!(Lphi::Vector{Vector{NamedTuple}},
+                                     phi::Vector{Vector{NamedTuple}},
+                                     ws::MGWorkspace{D, T}, ℓ::Int) where {D, T}
+    pi = 1
+    N = ws.patch_N[ℓ][pi]
+    dx = ws.patch_dx[ℓ][pi]
+    c2c = ws.cart_to_cell[ℓ][pi]
+    pcell = ws.parent_cell[ℓ][pi]
+    phi_f = phi[ℓ][pi].phi
+    Lphi_f = Lphi[ℓ][pi].phi
+    kinds = ws.axis_kinds.kinds
+    parent_phi = phi[ℓ - 1][1].phi
+    invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
+    one_third = T(1//3); two_thirds = T(2//3)
+
+    @inbounds for I in CartesianIndices(N)
+        c = c2c[I]
+        c == 0 && continue
+        phi_c = T(phi_f[c][1])
+        acc = zero(T)
+        for d in 1:D
+            for (side, face_idx) in ((1, 2 * (d - 1) + 2), (-1, 2 * (d - 1) + 1))
+                # In-patch?
+                inew = I[d] + side
+                if 1 <= inew <= N[d]
+                    nb_tuple = Base.setindex(Tuple(I), inew, d)
+                    nb_c = c2c[CartesianIndex{D}(nb_tuple)]
+                    phi_n = T(phi_f[nb_c][1])
+                else
+                    # Off-patch: parent lookup.
+                    par_c = pcell[c, face_idx]
+                    if par_c != 0
+                        phi_p = T(parent_phi[par_c][1])
+                        # Martin-Colella linear ghost
+                        phi_n = one_third * phi_c + two_thirds * phi_p
+                    else
+                        # Outer wall (no parent). Apply BC.
+                        phi_n = kinds[d] === :dirichlet ? -phi_c : phi_c
+                    end
+                end
+                acc += (phi_n - phi_c) * invh2[d]
+            end
+        end
+        Lphi_f[c] = (acc,)
     end
     return Lphi
 end
@@ -601,14 +767,83 @@ end
     return T(phi_f[nb_c][1])
 end
 
+# FAC flux fix on the COARSE side at C/F faces. Replaces the (invalid)
+# coarse one-sided flux through each C/F face with the area-weighted sum
+# of fine sub-face fluxes, using Martin–Colella's MC ghost. Should be
+# called AFTER the regular coarse Laplacian has been computed with
+# skip-C/F-faces; this routine ADDS the FAC contribution for each C/F
+# face.
+#
+# The companion routine `apply_laplacian_root_fast!(...; skip_cf=true)`
+# computes the coarse Laplacian on uncovered cells while OMITTING the
+# flux contribution from any face whose other side is covered (so the
+# covered coarse cells' garbage phi never enters the result).
+#
+# Together, they form the FAC composite operator of Almgren–Bell–Colella
+# (1998), which drives the V-cycle residual to machine precision up to
+# the C/F discretisation order.
+function apply_fac_flux_fix!(Lphi::Vector{Vector{NamedTuple}},
+                              phi::Vector{Vector{NamedTuple}},
+                              ws::MGWorkspace{D, T},
+                              coarse_level::Int) where {D, T}
+    fine_level = coarse_level + 1
+    fine_level > length(ws.ph.levels) && return Lphi
+    pi_c = 1
+    pi_f = 1
+    dxc = ws.patch_dx[coarse_level][pi_c]
+    dxf = ws.patch_dx[fine_level][pi_f]
+    phi_coarse = phi[coarse_level][pi_c].phi
+    phi_fine   = phi[fine_level][pi_f].phi
+    Lphi_coarse = Lphi[coarse_level][pi_c].phi
+    inv_table = ws.fac_fine_at_coarse_face[coarse_level][pi_c]
+
+    two_thirds = T(2//3)
+
+    @inbounds for c in ws.patch_leaves[coarse_level][pi_c]
+        any_face = false
+        for k in 1:(2 * D)
+            fine_list = inv_table[c, k]
+            isempty(fine_list) && continue
+            any_face = true
+            d = (k - 1) ÷ 2 + 1
+            # Flux contribution per sub-face to L φ_c (per unit V_c):
+            #   F_j_in_Lphi_c = (2/3) (φ_cf_j − φ_c) / (h_f * h_c)
+            # The sub-face count is implicit in fine_list (each fine cell is
+            # one sub-face). Sub-face area = h_f^{D-1}, divided by V_c =
+            # prod(h_c) ⇒ per-sub-face contribution = (gradient) * (h_f^{D-1})
+            # / prod(h_c) = (gradient) * 1 / (h_c[d] * prod(h_c/h_f over j!=d))
+            # but since h_c/h_f = 2 (2:1), prod_{j!=d}(h_c/h_f) = 2^{D-1}.
+            # Total over r^{D-1} = 2^{D-1} sub-faces ⇒ each sub-face per-unit-V
+            # contribution divides by total sub-faces. Easier formulation:
+            #     ΔL_c from face k = (1/h_c[d]) * (avg fine grad over sub-faces)
+            #                       = (1/h_c[d]) * (1/n_sub) * Σ_j (φ_cf_j − ghost_j) / h_f[d]
+            # With MC: (φ_cf_j − ghost_j) = (2/3)(φ_cf_j − φ_c).
+            #     ⇒ ΔL_c = (1/h_c[d]) * (1/n_sub) * Σ_j (2/3)(φ_cf_j − φ_c) / h_f[d]
+            #            = (2/3) / (h_c[d] * h_f[d] * n_sub) * Σ_j (φ_cf_j − φ_c)
+            n_sub = length(fine_list)
+            inv_factor = two_thirds / (dxc[d] * dxf[d] * n_sub)
+            phi_c = T(phi_coarse[c][1])
+            fac_acc = zero(T)
+            for fcell in fine_list
+                fac_acc += (T(phi_fine[fcell][1]) - phi_c)
+            end
+            Lphi_coarse[c] = (Lphi_coarse[c][1] + fac_acc * inv_factor,)
+        end
+    end
+    return Lphi
+end
+
 # Fast direct-array Laplacian for the root level (no parent halos).
-# `skip_covered = true` skips coarse cells covered by a finer-level patch
-# — the result on those cells is discarded by `restrict_to_parents!`
-# during AMR V-cycles, so computing it is wasted work.
+#   skip_covered=true → don't compute the Laplacian on cells covered by a
+#     finer patch (result discarded by restrict_to_parents! anyway).
+#   skip_cf=true → for an uncovered cell whose neighbor across some face
+#     is covered, OMIT that face's flux contribution. `apply_fac_flux_fix!`
+#     adds the correct fine-side contribution afterwards.
 function apply_laplacian_root_fast!(Lphi::Vector{Vector{NamedTuple}},
                                      phi::Vector{Vector{NamedTuple}},
                                      ws::MGWorkspace{D, T};
-                                     skip_covered::Bool = false) where {D, T}
+                                     skip_covered::Bool = false,
+                                     skip_cf::Bool = false) where {D, T}
     pi = 1; ℓ = 1
     N = ws.patch_N[ℓ][pi]
     dx = ws.patch_dx[ℓ][pi]
@@ -618,6 +853,8 @@ function apply_laplacian_root_fast!(Lphi::Vector{Vector{NamedTuple}},
     kinds = ws.axis_kinds.kinds
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
     covered = ws.covered_by_finer[ℓ][pi]
+    fac_table = ws.fac_fine_at_coarse_face[ℓ][pi]
+    has_fac = skip_cf && length(ws.ph.levels) > ℓ
 
     @inbounds for I in CartesianIndices(N)
         c = c2c[I]
@@ -626,9 +863,16 @@ function apply_laplacian_root_fast!(Lphi::Vector{Vector{NamedTuple}},
         phi_c = T(phi_f[c][1])
         acc = zero(T)
         for d in 1:D
-            phi_p = _neighbor_phi(phi_f, c2c, I, d, +1, N, kinds, phi_c)
-            phi_m = _neighbor_phi(phi_f, c2c, I, d, -1, N, kinds, phi_c)
-            acc += (phi_p - 2 * phi_c + phi_m) * invh2[d]
+            face_p = 2 * (d - 1) + 2
+            if !(has_fac && !isempty(fac_table[c, face_p]))
+                phi_p = _neighbor_phi(phi_f, c2c, I, d, +1, N, kinds, phi_c)
+                acc += (phi_p - phi_c) * invh2[d]
+            end
+            face_m = 2 * (d - 1) + 1
+            if !(has_fac && !isempty(fac_table[c, face_m]))
+                phi_m = _neighbor_phi(phi_f, c2c, I, d, -1, N, kinds, phi_c)
+                acc += (phi_m - phi_c) * invh2[d]
+            end
         end
         Lphi_f[c] = (acc,)
     end
@@ -740,8 +984,86 @@ function gs_sweep!(phi::Vector{Vector{NamedTuple}},
         gs_sweep_root_fast!(phi, ws, ℓ; n_sweeps = n_sweeps,
                              skip_covered = skip_covered)
     else
-        gs_sweep_via_orchestrator!(phi, ws, ℓ; n_sweeps = n_sweeps,
-                                    backend = backend)
+        gs_sweep_fine_fast!(phi, ws, ℓ; n_sweeps = n_sweeps)
+    end
+    return phi
+end
+
+# Fast direct-array RB-GS for a fine (non-root) level. Same algorithm as
+# `gs_sweep_root_fast!` but uses `parent_cell` to look up the parent's
+# value at off-patch boundaries (with Martin–Colella correction).
+function gs_sweep_fine_fast!(phi::Vector{Vector{NamedTuple}},
+                              ws::MGWorkspace{D, T}, ℓ::Int;
+                              n_sweeps::Int = 1) where {D, T}
+    pi = 1
+    N = ws.patch_N[ℓ][pi]
+    dx = ws.patch_dx[ℓ][pi]
+    c2c = ws.cart_to_cell[ℓ][pi]
+    pcell = ws.parent_cell[ℓ][pi]
+    phi_f = phi[ℓ][pi].phi
+    rho_flat = ws.rho_flat[ℓ][pi]
+    kinds = ws.axis_kinds.kinds
+    parent_phi = phi[ℓ - 1][1].phi
+    invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
+    one_third = T(1//3); two_thirds = T(2//3)
+
+    # Per-cell diagonal of the Laplacian acting on φ_c. With the MC ghost
+    # `φ_ghost = (1/3) φ_c + (2/3) φ_parent`, an off-patch face contributes
+    # (1/3 − 1) φ_c / h_d² = −(2/3) φ_c / h_d², so the EFFECTIVE diagonal at
+    # a boundary cell DROPS by (2/3)/h_d² for each boundary face. We
+    # compute it on the fly per cell — cheap.
+
+    for _ in 1:n_sweeps
+        for colour in 0:1
+            @inbounds for I in CartesianIndices(N)
+                s = 0
+                for d in 1:D; s += I[d]; end
+                (s & 1) == colour || continue
+                c = c2c[I]
+                c == 0 && continue
+
+                # Sum the non-φ_c part of the stencil and compute the
+                # effective diagonal.
+                diag = zero(T)
+                nbr_acc = zero(T)
+                bc_diag_adj = zero(T)   # subtracts (1/3)/h² per MC face
+                for d in 1:D
+                    for (side, face_idx) in ((1, 2 * (d - 1) + 2), (-1, 2 * (d - 1) + 1))
+                        inew = I[d] + side
+                        if 1 <= inew <= N[d]
+                            nb_tuple = Base.setindex(Tuple(I), inew, d)
+                            nb_c = c2c[CartesianIndex{D}(nb_tuple)]
+                            nbr_acc += T(phi_f[nb_c][1]) * invh2[d]
+                            diag    += invh2[d]
+                        else
+                            par_c = pcell[c, face_idx]
+                            if par_c != 0
+                                # MC face: contributes (1/3) φ_c + (2/3) φ_p.
+                                # Move (1/3) φ_c to the diagonal side.
+                                nbr_acc += two_thirds * T(parent_phi[par_c][1]) * invh2[d]
+                                diag    += invh2[d]
+                                bc_diag_adj += one_third * invh2[d]
+                            else
+                                # BC ghost: Dirichlet = −φ_c → effectively the
+                                # neighbor is `-φ_c`, so the diagonal gains
+                                # an extra +invh2 (from -(-φ_c)).
+                                if kinds[d] === :dirichlet
+                                    diag += 2 * invh2[d]   # absorbs both
+                                else
+                                    # Neumann / Periodic-with-no-parent:
+                                    # ghost = +φ_c → contributes nothing.
+                                end
+                            end
+                        end
+                    end
+                end
+                rho_c = rho_flat[c]
+                # GS update: solve diag_eff * φ_c = nbr_acc - ρ
+                # where diag_eff = diag - bc_diag_adj.
+                diag_eff = diag - bc_diag_adj
+                phi_f[c] = ((nbr_acc - rho_c) / diag_eff,)
+            end
+        end
     end
     return phi
 end
@@ -1117,12 +1439,21 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
     # Compute residuals on level ℓ_hi AND ℓ_hi-1. On level ℓ_hi-1, skip
     # coarse cells covered by a finer patch — the restrict_to_parents!
     # call below overwrites them with the volume-averaged fine residual,
-    # so computing the Laplacian on them is wasted work.
+    # so computing the Laplacian on them is wasted work. ALSO apply the
+    # FAC flux fix on uncovered C/F-adjacent cells so the composite
+    # operator matches the fine-side flux (this is what stops the V-cycle
+    # from stagnating at the C/F interface error level).
     apply_laplacian!(ws.residual, phi, ws;
                       level_range = ℓ_hi:ℓ_hi, backend = backend)
+    # Coarse-level Laplacian: skip covered cells AND omit C/F-face flux
+    # contributions on uncovered cells (those faces are wrong because the
+    # covered coarse phi is garbage). The FAC fix below adds the correct
+    # fine-side flux through each C/F face.
     apply_laplacian!(ws.residual, phi, ws;
                       level_range = (ℓ_hi - 1):(ℓ_hi - 1),
-                      skip_covered = true, backend = backend)
+                      skip_covered = true, skip_cf = true,
+                      backend = backend)
+    apply_fac_flux_fix!(ws.residual, phi, ws, ℓ_hi - 1)
     @inbounds for ℓ in (ℓ_hi - 1):ℓ_hi
         for pi in 1:length(ws.residual[ℓ])
             rf = ws.residual[ℓ][pi].phi
