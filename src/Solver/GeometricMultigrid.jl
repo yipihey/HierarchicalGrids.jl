@@ -838,7 +838,9 @@ function apply_laplacian!(Lphi::Vector{Vector{NamedTuple}},
                                          skip_covered = skip_covered,
                                          skip_cf = skip_cf)
         else
-            apply_laplacian_fine_fast!(Lphi, phi, ws, ℓ)
+            apply_laplacian_fine_fast!(Lphi, phi, ws, ℓ;
+                                         skip_covered = skip_covered,
+                                         skip_cf = skip_cf)
         end
     end
     return Lphi
@@ -901,7 +903,9 @@ end
 
 function apply_laplacian_fine_fast!(Lphi::Vector{Vector{NamedTuple}},
                                      phi::Vector{Vector{NamedTuple}},
-                                     ws::MGWorkspace{D, T}, ℓ::Int) where {D, T}
+                                     ws::MGWorkspace{D, T}, ℓ::Int;
+                                     skip_covered::Bool = false,
+                                     skip_cf::Bool = false) where {D, T}
     pi = 1
     N = ws.patch_N[ℓ][pi]
     dx = ws.patch_dx[ℓ][pi]
@@ -912,17 +916,84 @@ function apply_laplacian_fine_fast!(Lphi::Vector{Vector{NamedTuple}},
     kinds = ws.axis_kinds.kinds
     parent_phi_raw = _raw_phi(phi[ℓ - 1][1])::Vector{T}
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
+    # Intermediate-level C/F handling: this level may have a FINER level
+    # above it (level ℓ+1) — cells in this level adjacent to that level's
+    # patch are "C/F-adjacent" and need the FAC flux-fix treatment when
+    # `skip_cf = true`. `covered_by_finer[ℓ]` flags those cells.
+    covered = ws.covered_by_finer[ℓ][pi]
+    fac_table = ws.fac_fine_at_coarse_face[ℓ][pi]
+    has_finer = length(ws.ph.levels) > ℓ
 
     @inbounds for I in CartesianIndices(N)
         c = c2c[I]
         c == 0 && continue
+        skip_covered && has_finer && covered[c] && continue
         phi_c = phi_raw[c]
-        nbr_acc, diag_eff = _fine_stencil_sums(I, c, c2c, phi_raw,
-                                                 parent_phi_raw, pcell,
-                                                 kinds, invh2, N, phi_c)
+        # If we're skipping C/F faces and this cell has any, we drop those
+        # face contributions here; the FAC flux fix added by the caller
+        # supplies the correct value.
+        if skip_cf && has_finer
+            nbr_acc, diag_eff = _fine_stencil_sums_skip_cf(I, c, c2c, phi_raw,
+                                                             parent_phi_raw, pcell,
+                                                             fac_table, kinds,
+                                                             invh2, N, phi_c)
+        else
+            nbr_acc, diag_eff = _fine_stencil_sums(I, c, c2c, phi_raw,
+                                                     parent_phi_raw, pcell,
+                                                     kinds, invh2, N, phi_c)
+        end
         Lphi_raw[c] = nbr_acc - diag_eff * phi_c
     end
     return Lphi
+end
+
+# Variant of `_fine_stencil_sums` that OMITS in-patch faces whose
+# cross-face neighbor IS the parent of some FINER-level cell (i.e., the
+# coarse cell on this level sits at the C/F boundary of level ℓ+1 from
+# THIS cell's perspective). For non-boundary cells it's identical to
+# `_fine_stencil_sums`.
+@inline function _fine_stencil_sums_skip_cf(I::CartesianIndex{D},
+                                              c::Int, c2c::Array{Int, D},
+                                              phi_raw::Vector{T},
+                                              parent_phi_raw::Vector{T},
+                                              pcell::Matrix{Int},
+                                              fac_table::Matrix{Vector{Int}},
+                                              kinds::NTuple{D, Symbol},
+                                              invh2::NTuple{D, T},
+                                              N::NTuple{D, Int},
+                                              phi_c::T) where {D, T}
+    nbr_acc = zero(T)
+    diag_eff = zero(T)
+    two_thirds = T(2//3)
+    @inbounds for d in 1:D
+        for (side, face_idx) in ((1, 2 * (d - 1) + 2), (-1, 2 * (d - 1) + 1))
+            # If this face is a C/F interface with a finer level (this
+            # cell has fine cells listed in fac_table for this face), the
+            # contribution is supplied by `apply_fac_flux_fix!` later;
+            # omit it here.
+            if !isempty(fac_table[c, face_idx])
+                continue
+            end
+            inew = I[d] + side
+            if 1 <= inew <= N[d]
+                nb_c = c2c[I + side * _unit_offsets(Val(D))[d]]
+                nbr_acc += phi_raw[nb_c] * invh2[d]
+                diag_eff += invh2[d]
+            else
+                # Off-patch toward parent (level ℓ-1): MC ghost.
+                par_c = pcell[c, face_idx]
+                if par_c != 0
+                    nbr_acc += two_thirds * parent_phi_raw[par_c] * invh2[d]
+                    diag_eff += two_thirds * invh2[d]
+                else
+                    if kinds[d] === :dirichlet
+                        diag_eff += 2 * invh2[d]
+                    end
+                end
+            end
+        end
+    end
+    return nbr_acc, diag_eff
 end
 
 # Unit offsets along each axis: `_unit_offsets(Val(D))[d]` returns
