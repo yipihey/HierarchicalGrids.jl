@@ -2118,15 +2118,10 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
     end
 
     # Pre-smooth fine level (level ℓ_hi).
-    fine_has_finer = length(ws.ph.levels) > ℓ_hi
     gs_sweep!(phi, rho, ws, ℓ_hi; n_sweeps = ws.opts.n_pre, backend = backend)
 
-    # Compute residual on level ℓ_hi (full operator — for the finest
-    # active level the FAC at C/F faces with even-finer levels would
-    # require a proper composite-grid FAC formulation across multiple
-    # levels, which our current V-cycle doesn't implement. The 2-level
-    # case is handled exactly; for 3+ levels the V-cycle diverges and
-    # the `cycle = :pcg` path should be used instead).
+    # Compute residual on level ℓ_hi (regular operator — see V-cycle
+    # limitation note in module docstring for 3+ level hierarchies).
     apply_laplacian!(ws.residual, phi, ws;
                       level_range = ℓ_hi:ℓ_hi, backend = backend)
     # Coarse-level Laplacian: skip covered cells AND omit C/F-face flux
@@ -2202,11 +2197,24 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
              level_range = ℓ_lo:(ℓ_hi - 1), backend = backend)
 
     # Apply correction: φ[ℓ_hi-1] += correction[ℓ_hi-1]; φ[ℓ_hi] += P(correction).
-    @inbounds for pi in 1:length(phi[ℓ_hi - 1])
-        pf = phi[ℓ_hi - 1][pi].phi
-        cf = ws.correction[ℓ_hi - 1][pi].phi
-        for c in ws.patch_leaves[ℓ_hi - 1][pi]
-            _set_val!(pf, c, _get_val(pf, c) + _get_val(cf, c))
+    #
+    # CRITICAL: In the OUTER V-cycle call, `phi` and `ws.correction` are
+    # distinct fields, so `phi[ℓ-1] += correction[ℓ-1]` correctly adds the
+    # coarse-grid correction to the actual solution. In the RECURSIVE
+    # call, however, `phi === ws.correction` (we passed correction as the
+    # phi argument), and naive addition would double the field value:
+    # phi[ℓ-1] += phi[ℓ-1]. The skip below is the standard
+    # "in-place V-cycle" pattern — when phi already IS the correction
+    # field, the sub-recursion has already written the result directly
+    # into phi[ℓ-1]; no further accumulation is needed at this level.
+    # The prolongation to phi[ℓ_hi] is still needed in both cases.
+    if phi !== ws.correction
+        @inbounds for pi in 1:length(phi[ℓ_hi - 1])
+            pf = phi[ℓ_hi - 1][pi].phi
+            cf = ws.correction[ℓ_hi - 1][pi].phi
+            for c in ws.patch_leaves[ℓ_hi - 1][pi]
+                _set_val!(pf, c, _get_val(pf, c) + _get_val(cf, c))
+            end
         end
     end
     @inbounds for pi in 1:length(phi[ℓ_hi])
