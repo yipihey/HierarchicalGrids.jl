@@ -2120,8 +2120,17 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
     # Pre-smooth fine level (level ℓ_hi).
     gs_sweep!(phi, rho, ws, ℓ_hi; n_sweeps = ws.opts.n_pre, backend = backend)
 
-    # Compute residual on level ℓ_hi (regular operator — see V-cycle
-    # limitation note in module docstring for 3+ level hierarchies).
+    # FAC SYNC: average phi[ℓ_hi] into phi[ℓ_hi-1][covered] cells.
+    # This is the standard FAC composite-grid sync (ABC98 §2.4): the
+    # covered coarse cells are "shadow" cells whose value must equal the
+    # volume-average of the fine cells underneath for the composite
+    # operator to be conservative. Without this step the coarse-grid
+    # correction equation works in an inconsistent state, and the V-cycle
+    # diverges on hierarchies of 3+ levels.
+    restrict_to_parents!(phi[ℓ_hi - 1], phi[ℓ_hi], ws.ph;
+                          level = ℓ_hi, fieldname = :phi)
+
+    # Compute residual on level ℓ_hi (regular operator).
     apply_laplacian!(ws.residual, phi, ws;
                       level_range = ℓ_hi:ℓ_hi, backend = backend)
     # Coarse-level Laplacian: skip covered cells AND omit C/F-face flux

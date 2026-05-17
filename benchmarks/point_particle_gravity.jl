@@ -98,10 +98,17 @@ positions = [ntuple(d -> x_start[d] + (x_end[d] - x_start[d]) * (i / n_steps), D
 
 # Run trajectory: cold OR warm starts.
 function run_trajectory(label, ph, bcs_spec, positions, σ_source, M;
-                        warm::Bool, tol::Float64, maxiter::Int)
+                        warm::Bool, tol::Float64, maxiter::Int,
+                        cycle::Symbol = :pcg, n_pre::Int = 2, n_post::Int = 2)
     fields = allocate_phi_rho(ph)
-    opts = MGOptions(tol = tol, maxiter = maxiter, cycle = :pcg,
-                      pcg_precond = :jacobi)
+    opts = if cycle == :pcg
+        MGOptions(tol = tol, maxiter = maxiter, cycle = :pcg,
+                   pcg_precond = :jacobi,
+                   n_pre = n_pre, n_post = n_post)
+    else
+        MGOptions(tol = tol, maxiter = maxiter, cycle = :vcycle,
+                   n_pre = n_pre, n_post = n_post)
+    end
     ws = MGWorkspace(ph, bcs_spec; opts = opts)
     # Warm up the JIT once.
     set_particle_source!(fields, ph, positions[1], σ_source, M)
@@ -143,19 +150,36 @@ end
 const TOL = 1e-9      # tight target so iteration counts reflect real convergence
 const MAXITER = 2000
 
-println(">>> PCG-Jacobi COLD start (each step φ = 0 initially):")
-r_cold = run_trajectory("PCG COLD", ph, bcs_spec, positions, σ_source, M;
-                         warm = false, tol = TOL, maxiter = MAXITER)
-print_table("PCG COLD", r_cold)
+println(">>> PCG-Jacobi COLD start:")
+r_pcg_cold = run_trajectory("PCG COLD", ph, bcs_spec, positions, σ_source, M;
+                              warm = false, tol = TOL, maxiter = MAXITER,
+                              cycle = :pcg)
+print_table("PCG COLD", r_pcg_cold)
 
-println(">>> PCG-Jacobi WARM start (each step reuses previous φ):")
-r_warm = run_trajectory("PCG WARM", ph, bcs_spec, positions, σ_source, M;
-                         warm = true, tol = TOL, maxiter = MAXITER)
-print_table("PCG WARM", r_warm)
+println(">>> PCG-Jacobi WARM start:")
+r_pcg_warm = run_trajectory("PCG WARM", ph, bcs_spec, positions, σ_source, M;
+                              warm = true, tol = TOL, maxiter = MAXITER,
+                              cycle = :pcg)
+print_table("PCG WARM", r_pcg_warm)
 
-cold_total = sum(r -> r.ms, r_cold)
-warm_total = sum(r -> r.ms, r_warm)
-cold_iters = sum(r -> r.iters, r_cold)
-warm_iters = sum(r -> r.iters, r_warm)
-@printf("Warm-start speedup: %.2fx wall-clock,  %.2fx iterations\n",
-        cold_total / warm_total, cold_iters / warm_iters)
+println(">>> V-cycle (n_pre=n_post=50) COLD start:")
+r_vc_cold = run_trajectory("V-cycle COLD", ph, bcs_spec, positions, σ_source, M;
+                              warm = false, tol = TOL, maxiter = MAXITER,
+                              cycle = :vcycle, n_pre = 50, n_post = 50)
+print_table("V-cycle COLD", r_vc_cold)
+
+println(">>> V-cycle (n_pre=n_post=50) WARM start:")
+r_vc_warm = run_trajectory("V-cycle WARM", ph, bcs_spec, positions, σ_source, M;
+                              warm = true, tol = TOL, maxiter = MAXITER,
+                              cycle = :vcycle, n_pre = 50, n_post = 50)
+print_table("V-cycle WARM", r_vc_warm)
+
+println("="^118)
+println("  Cold vs warm comparison:")
+for (label, cold, warm) in [("PCG", r_pcg_cold, r_pcg_warm),
+                              ("V-cycle", r_vc_cold, r_vc_warm)]
+    ct = sum(r -> r.ms, cold); wt = sum(r -> r.ms, warm)
+    ci = sum(r -> r.iters, cold); wi = sum(r -> r.iters, warm)
+    @printf("  %s: cold=%.0f ms (%d iters), warm=%.0f ms (%d iters), speedup=%.2fx wall, %.2fx iter\n",
+            label, ct, ci, wt, wi, ct/wt, ci/wi)
+end
