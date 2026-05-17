@@ -1289,7 +1289,9 @@ function gs_sweep!(phi::Vector{Vector{NamedTuple}},
                              skip_covered = skip_covered,
                              use_fac = use_fac)
     else
-        gs_sweep_fine_fast!(phi, ws, ℓ; n_sweeps = n_sweeps)
+        gs_sweep_fine_fast!(phi, ws, ℓ; n_sweeps = n_sweeps,
+                             skip_covered = skip_covered,
+                             use_fac = use_fac)
     end
     return phi
 end
@@ -1299,7 +1301,9 @@ end
 # value at off-patch boundaries (with Martin–Colella correction).
 function gs_sweep_fine_fast!(phi::Vector{Vector{NamedTuple}},
                               ws::MGWorkspace{D, T}, ℓ::Int;
-                              n_sweeps::Int = 1) where {D, T}
+                              n_sweeps::Int = 1,
+                              skip_covered::Bool = false,
+                              use_fac::Bool = false) where {D, T}
     pi = 1
     N = ws.patch_N[ℓ][pi]
     dx = ws.patch_dx[ℓ][pi]
@@ -1310,6 +1314,11 @@ function gs_sweep_fine_fast!(phi::Vector{Vector{NamedTuple}},
     kinds = ws.axis_kinds.kinds
     parent_phi_raw = _raw_phi(phi[ℓ - 1][1])::Vector{T}
     invh2 = ntuple(d -> one(T) / (dx[d] * dx[d]), Val(D))
+    covered = ws.covered_by_finer[ℓ][pi]
+    fac_table = ws.fac_fine_at_coarse_face[ℓ][pi]
+    has_finer = use_fac && length(ws.ph.levels) > ℓ
+    fine_phi_raw = has_finer ? (_raw_phi(phi[ℓ + 1][1])::Vector{T}) : phi_raw
+    dxf_finer = has_finer ? ws.patch_dx[ℓ + 1][1] : dx
 
     for _ in 1:n_sweeps
         for colour in 0:1
@@ -1319,16 +1328,84 @@ function gs_sweep_fine_fast!(phi::Vector{Vector{NamedTuple}},
                 (s & 1) == colour || continue
                 c = c2c[I]
                 c == 0 && continue
+                skip_covered && has_finer && covered[c] && continue
                 phi_c = phi_raw[c]
-                nbr_acc, diag_eff = _fine_stencil_sums(I, c, c2c, phi_raw,
-                                                         parent_phi_raw, pcell,
-                                                         kinds, invh2, N, phi_c)
+                if has_finer
+                    nbr_acc, diag_eff = _fine_stencil_sums_fac(
+                        I, c, c2c, phi_raw, parent_phi_raw, pcell,
+                        fine_phi_raw, fac_table, kinds, invh2, dx, dxf_finer,
+                        N, phi_c)
+                else
+                    nbr_acc, diag_eff = _fine_stencil_sums(I, c, c2c, phi_raw,
+                                                             parent_phi_raw, pcell,
+                                                             kinds, invh2, N, phi_c)
+                end
                 rho_c = rho_flat[c]
                 phi_raw[c] = (nbr_acc - rho_c) / diag_eff
             end
         end
     end
     return phi
+end
+
+# Fine-level stencil sums with FAC contribution from an even FINER level
+# (level ℓ+1). Used by `gs_sweep_fine_fast!` at intermediate levels.
+# Per face:
+#   * If face has a C/F sibling at level ℓ+1 (fac_table[c, k] non-empty):
+#       nbr_acc += (2/3)/(h_c h_f n_sub) · Σ_j φ_fine_j
+#       diag_eff += (2/3)/(h_c h_f)
+#   * Else if face is in-patch: regular.
+#   * Else (off-patch toward parent ℓ-1): MC ghost from parent.
+@inline function _fine_stencil_sums_fac(I::CartesianIndex{D},
+                                          c::Int, c2c::Array{Int, D},
+                                          phi_raw::Vector{T},
+                                          parent_phi_raw::Vector{T},
+                                          pcell::Matrix{Int},
+                                          fine_phi_raw::Vector{T},
+                                          fac_table::Matrix{Vector{Int}},
+                                          kinds::NTuple{D, Symbol},
+                                          invh2::NTuple{D, T},
+                                          dxc::NTuple{D, T},
+                                          dxf::NTuple{D, T},
+                                          N::NTuple{D, Int},
+                                          phi_c::T) where {D, T}
+    nbr_acc = zero(T)
+    diag_eff = zero(T)
+    two_thirds = T(2//3)
+    @inbounds for d in 1:D
+        for (side, face_idx) in ((1, 2 * (d - 1) + 2), (-1, 2 * (d - 1) + 1))
+            fine_list = fac_table[c, face_idx]
+            if !isempty(fine_list)
+                # C/F face with level ℓ+1.
+                n_sub = length(fine_list)
+                coeff_nbr = two_thirds / (dxc[d] * dxf[d] * n_sub)
+                for fcell in fine_list
+                    nbr_acc += coeff_nbr * fine_phi_raw[fcell]
+                end
+                diag_eff += two_thirds / (dxc[d] * dxf[d])
+                continue
+            end
+            inew = I[d] + side
+            if 1 <= inew <= N[d]
+                # In-patch (same-level) neighbor.
+                nb_c = c2c[I + side * _unit_offsets(Val(D))[d]]
+                nbr_acc += phi_raw[nb_c] * invh2[d]
+                diag_eff += invh2[d]
+            else
+                # Off-patch toward parent ℓ-1: MC ghost.
+                par_c = pcell[c, face_idx]
+                if par_c != 0
+                    nbr_acc += two_thirds * parent_phi_raw[par_c] * invh2[d]
+                    diag_eff += two_thirds * invh2[d]
+                else
+                    if kinds[d] === :dirichlet
+                        diag_eff += 2 * invh2[d]
+                    end
+                end
+            end
+        end
+    end
+    return nbr_acc, diag_eff
 end
 
 
@@ -2041,15 +2118,15 @@ function vcycle!(phi::Vector{Vector{NamedTuple}},
     end
 
     # Pre-smooth fine level (level ℓ_hi).
+    fine_has_finer = length(ws.ph.levels) > ℓ_hi
     gs_sweep!(phi, rho, ws, ℓ_hi; n_sweeps = ws.opts.n_pre, backend = backend)
 
-    # Compute residuals on level ℓ_hi AND ℓ_hi-1. On level ℓ_hi-1, skip
-    # coarse cells covered by a finer patch — the restrict_to_parents!
-    # call below overwrites them with the volume-averaged fine residual,
-    # so computing the Laplacian on them is wasted work. ALSO apply the
-    # FAC flux fix on uncovered C/F-adjacent cells so the composite
-    # operator matches the fine-side flux (this is what stops the V-cycle
-    # from stagnating at the C/F interface error level).
+    # Compute residual on level ℓ_hi (full operator — for the finest
+    # active level the FAC at C/F faces with even-finer levels would
+    # require a proper composite-grid FAC formulation across multiple
+    # levels, which our current V-cycle doesn't implement. The 2-level
+    # case is handled exactly; for 3+ levels the V-cycle diverges and
+    # the `cycle = :pcg` path should be used instead).
     apply_laplacian!(ws.residual, phi, ws;
                       level_range = ℓ_hi:ℓ_hi, backend = backend)
     # Coarse-level Laplacian: skip covered cells AND omit C/F-face flux
@@ -2184,6 +2261,14 @@ function apply_composite_laplacian!(Lphi::Vector{Vector{NamedTuple}},
     ℓ_lo = first(level_range)
     ℓ_hi = last(level_range)
     has_finer = length(ws.ph.levels) > ℓ_lo
+    # Apply L_FAC at the COARSEST level of the range (skip C/F faces, add
+    # FAC contribution from the next-finer level). At other levels, apply
+    # the regular Laplacian. (A fully correct multi-level FAC operator
+    # would apply skip_cf + FAC fix at EVERY level with a finer level
+    # above — but empirically that produces a non-SPD operator in the
+    # V-weighted norm despite the per-pair coupling being symmetric. The
+    # cause is under investigation; this conservative form is symmetric
+    # AND positive-definite, so PCG converges.)
     for ℓ in level_range
         if ℓ == ℓ_lo && has_finer
             apply_laplacian!(Lphi, phi, ws; level_range = ℓ:ℓ,
