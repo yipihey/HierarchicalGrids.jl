@@ -10,9 +10,13 @@
 # 4.5·dx_finest over 5 steps. We compare PCG-Jacobi cold vs warm start
 # convergence and per-step wall time.
 #
-# (V-cycle alone diverges on 3+ level nested hierarchies — its smoother
-# doesn't apply the FAC operator at intermediate-level C/F faces.
-# PCG-Jacobi uses the correct composite operator everywhere and converges.)
+# (V-cycle alone is unreliable on deep nested hierarchies: the recursive
+# coarse-correction operator is regular-Laplacian, but the composite FAC
+# residual involves the C/F flux mismatch — empirically the V-cycle
+# diverges past ~4 levels. PCG-Jacobi-on-composite uses the correct FAC
+# composite operator everywhere via apply_composite_laplacian! and
+# converges in depth-independent ~62 iterations to machine precision.
+# That's the recommended path for deep hierarchies.)
 
 using HierarchicalGrids
 using HierarchicalGrids: build_uniform_root_hierarchy, allocate_phi_rho,
@@ -162,24 +166,11 @@ r_pcg_warm = run_trajectory("PCG WARM", ph, bcs_spec, positions, σ_source, M;
                               cycle = :pcg)
 print_table("PCG WARM", r_pcg_warm)
 
-println(">>> V-cycle (n_pre=n_post=50) COLD start:")
-r_vc_cold = run_trajectory("V-cycle COLD", ph, bcs_spec, positions, σ_source, M;
-                              warm = false, tol = TOL, maxiter = MAXITER,
-                              cycle = :vcycle, n_pre = 50, n_post = 50)
-print_table("V-cycle COLD", r_vc_cold)
-
-println(">>> V-cycle (n_pre=n_post=50) WARM start:")
-r_vc_warm = run_trajectory("V-cycle WARM", ph, bcs_spec, positions, σ_source, M;
-                              warm = true, tol = TOL, maxiter = MAXITER,
-                              cycle = :vcycle, n_pre = 50, n_post = 50)
-print_table("V-cycle WARM", r_vc_warm)
-
 println("="^118)
 println("  Cold vs warm comparison:")
-for (label, cold, warm) in [("PCG", r_pcg_cold, r_pcg_warm),
-                              ("V-cycle", r_vc_cold, r_vc_warm)]
-    ct = sum(r -> r.ms, cold); wt = sum(r -> r.ms, warm)
-    ci = sum(r -> r.iters, cold); wi = sum(r -> r.iters, warm)
-    @printf("  %s: cold=%.0f ms (%d iters), warm=%.0f ms (%d iters), speedup=%.2fx wall, %.2fx iter\n",
-            label, ct, ci, wt, wi, ct/wt, ci/wi)
+let
+    ct = sum(r -> r.ms, r_pcg_cold); wt = sum(r -> r.ms, r_pcg_warm)
+    ci = sum(r -> r.iters, r_pcg_cold); wi = sum(r -> r.iters, r_pcg_warm)
+    @printf("  PCG-Jacobi: cold=%.0f ms (%d iters), warm=%.0f ms (%d iters), speedup=%.2fx wall, %.2fx iter\n",
+            ct, ci, wt, wi, ct/wt, ci/wi)
 end
