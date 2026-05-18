@@ -266,6 +266,22 @@ using HierarchicalGrids
         include("test_edge_fields.jl")
     end
 
+    @testset "Phase 2 (Solver): HYPRE bottom" begin
+        include("test_hypre_bottom.jl")
+    end
+
+    @testset "Phase 2 (Solver): Tensor viscosity" begin
+        include("test_tensor_op.jl")
+    end
+
+    @testset "Phase 2 (Solver): Curl-curl operator" begin
+        include("test_curl_curl.jl")
+    end
+
+    @testset "Phase 2 (Solver): Multi-level node Laplacian" begin
+        include("test_node_laplacian_ml.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end

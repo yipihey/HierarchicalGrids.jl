@@ -327,7 +327,18 @@ using .GeometricMultigrid: MGWorkspace, MGOptions, MGResult, PhiRhoFields,
                            VectorABecProblem, allocate_vector_abec,
                            solve_vector_abec!,
                            EdgeField, allocate_edge_field, fill_edge_field!,
-                           apply_edge_laplacian!, solve_edge_laplacian!
+                           apply_edge_laplacian!, solve_edge_laplacian!,
+                           HYPREPreconditioner, hypre_preconditioner,
+                           hypre_precond_callback, solve_abec_hypre!,
+                           init_hypre,
+                           TensorCoefs, allocate_tensor_coefs,
+                           TensorVelocity, allocate_tensor_velocity,
+                           fill_tensor_velocity!,
+                           apply_tensor!, gs_sweep_tensor!, solve_tensor!,
+                           CurlCurlCoefs, allocate_curlcurl_coefs,
+                           apply_curl_curl!, solve_curl_curl!,
+                           restrict_node!, prolong_node!, vcycle_node!,
+                           solve_node_laplacian_ml!
 export MGWorkspace, MGOptions, MGResult, PhiRhoFields
 export solve_poisson!, vcycle!
 export apply_laplacian!, compute_residual!, residual_l2
@@ -353,5 +364,12 @@ export apply_node_laplacian!, gs_sweep_node!, solve_node_laplacian!
 export VectorABecProblem, allocate_vector_abec, solve_vector_abec!
 export EdgeField, allocate_edge_field, fill_edge_field!
 export apply_edge_laplacian!, solve_edge_laplacian!
+export HYPREPreconditioner, hypre_preconditioner, hypre_precond_callback
+export solve_abec_hypre!, init_hypre
+export TensorCoefs, allocate_tensor_coefs
+export TensorVelocity, allocate_tensor_velocity, fill_tensor_velocity!
+export apply_tensor!, gs_sweep_tensor!, solve_tensor!
+export CurlCurlCoefs, allocate_curlcurl_coefs, apply_curl_curl!, solve_curl_curl!
+export restrict_node!, prolong_node!, vcycle_node!, solve_node_laplacian_ml!
 
 end # module HierarchicalGrids

@@ -160,7 +160,19 @@ export MGWorkspace, MGOptions, MGResult, PhiRhoFields,
        VectorABecProblem, allocate_vector_abec, solve_vector_abec!,
        # Edge-centered vector fields
        EdgeField, allocate_edge_field, fill_edge_field!,
-       apply_edge_laplacian!, solve_edge_laplacian!
+       apply_edge_laplacian!, solve_edge_laplacian!,
+       # HYPRE BoomerAMG bottom solver (MPI-capable)
+       HYPREPreconditioner, hypre_preconditioner, hypre_precond_callback,
+       solve_abec_hypre!, init_hypre,
+       # Full tensor viscosity (cross-component coupling)
+       TensorCoefs, allocate_tensor_coefs, TensorVelocity,
+       allocate_tensor_velocity, fill_tensor_velocity!,
+       apply_tensor!, gs_sweep_tensor!, solve_tensor!,
+       # 2D curl-curl operator (magnetostatic / MHD)
+       CurlCurlCoefs, allocate_curlcurl_coefs,
+       apply_curl_curl!, solve_curl_curl!,
+       # Multi-level node Laplacian (nested grids)
+       restrict_node!, prolong_node!, vcycle_node!, solve_node_laplacian_ml!
 
 # Type alias for the (phi, rho) field container returned by
 # `allocate_phi_rho`. The outer Vector is per-level; the inner per-patch.
@@ -2799,5 +2811,21 @@ include("VectorABec.jl")
 # component-wise scalar Laplacian on edges. Full MLCurlCurl with cross-
 # component coupling builds on this.
 include("EdgeFields.jl")
+
+# HYPRE BoomerAMG / Krylov bottom solvers (Tier 2 #6+) — MPI-capable
+# wrapper via HYPRE.jl. Companion to the pure-Julia AMGBottom.
+include("HYPREBottom.jl")
+
+# Full tensor viscosity operator (Tier 2 #5 full) — cell-centered
+# velocity with cross-component coupling μ(∇u + ∇uᵀ) + λ ∇·u·I.
+include("TensorOp.jl")
+
+# 2D curl-curl operator (Tier 3 #10) — edge-centered ∇×(μ⁻¹∇×) + σ for
+# magnetostatic / resistive MHD.
+include("CurlCurl.jl")
+
+# Multi-level node Laplacian (Tier 2 #4 multi-level) — nested-grid
+# restriction / prolongation and multi-level V-cycle.
+include("NodeLaplacianML.jl")
 
 end # module GeometricMultigrid

@@ -4,7 +4,7 @@ This roadmap tracks the AMReX-compatible elliptic-solver capabilities
 being ported to HierarchicalGrids.jl. Strategic survey behind it is in
 the development-session log.
 
-## Shipped (Tier 1 + most of Tier 2 + Tier 3 #7 #8 + Tier 3 #10 foundation)
+## Shipped
 
 | # | Item | AMReX equivalent | File |
 |---|------|------------------|------|
@@ -12,11 +12,15 @@ the development-session log.
 | 2 | MAC (face) velocity projection | `MacProjector` (single level) | `src/Solver/MACProjection.jl` |
 | 3 | Krylov.jl flat-vector bridge | CG/GMRES/BiCGStab/FGMRES/MINRES | `src/Solver/KrylovBridge.jl` |
 | 4 (single-level) | Node-centered variable-σ Poisson | `MLNodeLaplacian` (single-level) | `src/Solver/NodeLaplacian.jl` |
-| 5 (subset) | Multi-component decoupled diffusion | `MLTensorOp` (scalar-per-component, isotropic) | `src/Solver/VectorABec.jl` |
+| 4 (nested-MG) | Multi-level V-cycle on nested grids | `MLNodeLaplacian` (nested coarsening) | `src/Solver/NodeLaplacianML.jl` |
+| 5 (subset) | Multi-component decoupled diffusion | `MLTensorOp` scalar-per-component | `src/Solver/VectorABec.jl` |
+| 5 (full) | Tensor viscosity with cross-component coupling | `MLTensorOp` full | `src/Solver/TensorOp.jl` |
 | 6 (CPU) | AlgebraicMultigrid bottom solver | HYPRE BoomerAMG (CPU, non-MPI) | `src/Solver/AMGBottom.jl` |
+| 6 (MPI) | HYPRE BoomerAMG bottom solver | HYPRE BoomerAMG (MPI, via HYPRE.jl) | `src/Solver/HYPREBottom.jl` |
 | 7 | Gray + multigroup radiation diffusion (linear) | Castro MGFLD inner ABec | `src/Solver/RadiationDiffusion.jl` |
 | 8 | Stiff chemistry per-cell integrator | PelePhysics CVODE reactor (pure-Julia BDF1) | `src/Solver/StiffChemistry.jl` |
 | 10 (foundation) | Edge-centered vector fields + component-wise Laplacian | `MLCurlCurl` storage primitives | `src/Solver/EdgeFields.jl` |
+| 10 (2D op) | 2D curl-curl operator with σ identity | `MLCurlCurl` (2D, single-level) | `src/Solver/CurlCurl.jl` |
 
 End-to-end capability now:
 
@@ -39,9 +43,8 @@ End-to-end capability now:
 
 | # | Item | Effort | Notes |
 |---|------|--------|-------|
-| 4 (multi-level) | `MLNodeLaplacian` with FAC at AMR C/F boundaries (Martin-Colella-Almgren) | 800–1200 LoC | Needed for AMR nodal pressure projection (IAMR / incflo / MAESTROeX). Storage primitives are in place; main work is the C/F nodal restrictor/prolongator and a proper composite operator. |
-| 5 (full) | `MLTensorOp` with cross-component coupling μ(∇u + ∇uᵀ) + λ ∇·u · I | 600–900 LoC | Builds on `VectorABecProblem`; adds a joint smoother that updates all D components with cross terms. |
-| 6+ | HYPRE.jl (MPI BoomerAMG) and AMGX.jl (CUDA BoomerAMG) | 300 LoC each | External deps. Use the in-tree `AMGBottom` for the pure-Julia / single-node CPU case (already shipped). |
+| 4 (full FAC) | `MLNodeLaplacian` with FAC at true AMR C/F boundaries (Martin-Colella-Almgren) | 600–1000 LoC | Nested-grid multi-level V-cycle is shipped; the remaining work is the proper C/F coupling when fine patches cover only a *sub-region* of coarse. |
+| 6+ | AMGX.jl (CUDA BoomerAMG) | 300 LoC | NVIDIA-only. HYPRE.jl is already shipped (CPU + MPI). |
 | -- | Multi-level FAC matrix assembly (for AMG-on-composite) | 200–400 LoC | Adds C/F coupling rows to `assemble_abec_matrix`. Enables AMG to be used as a composite bottom solver. |
 
 ### Tier 3 continuation
@@ -50,7 +53,7 @@ End-to-end capability now:
 |---|------|--------|-------|
 | 7 (nonlinear) | Newton-Krylov coupling of κ(T), B(T) for fully nonlinear radiation | 200 LoC + NonlinearSolve.jl | Linear inner solve already shipped; outer Newton is mechanical. |
 | 9 | EB / cut-cell support across all operators | 5000+ LoC, multi-month | Geometry generation, EB stencils, EB-aware C/F, EB-aware boundary conditions. Multi-month — should be its own design phase. |
-| 10 (cross-component) | `MLCurlCurl` edge-centered ∇×(μ⁻¹∇×) + σ identity, full operator | 1200–1600 LoC | Storage primitive shipped (`EdgeField`); next is the curl-curl operator with cross-component coupling and a tailored smoother (Hiptmair / nodal-AMG). |
+| 10 (3D + smoother) | 3D MLCurlCurl + Hiptmair smoother | 800–1200 LoC | 2D shipped (`CurlCurl.jl`); 3D adds full edge-edge cross-coupling and a tailored smoother. |
 
 ### Architecture / infrastructure
 
