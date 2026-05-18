@@ -4,7 +4,7 @@ This roadmap tracks the AMReX-compatible elliptic-solver capabilities
 being ported to HierarchicalGrids.jl. Strategic survey behind it is in
 the development-session log.
 
-## Shipped (Tier 1 + most of Tier 2 + Tier 3 #7 #8)
+## Shipped (Tier 1 + most of Tier 2 + Tier 3 #7 #8 + Tier 3 #10 foundation)
 
 | # | Item | AMReX equivalent | File |
 |---|------|------------------|------|
@@ -16,6 +16,7 @@ the development-session log.
 | 6 (CPU) | AlgebraicMultigrid bottom solver | HYPRE BoomerAMG (CPU, non-MPI) | `src/Solver/AMGBottom.jl` |
 | 7 | Gray + multigroup radiation diffusion (linear) | Castro MGFLD inner ABec | `src/Solver/RadiationDiffusion.jl` |
 | 8 | Stiff chemistry per-cell integrator | PelePhysics CVODE reactor (pure-Julia BDF1) | `src/Solver/StiffChemistry.jl` |
+| 10 (foundation) | Edge-centered vector fields + component-wise Laplacian | `MLCurlCurl` storage primitives | `src/Solver/EdgeFields.jl` |
 
 End-to-end capability now:
 
@@ -49,14 +50,14 @@ End-to-end capability now:
 |---|------|--------|-------|
 | 7 (nonlinear) | Newton-Krylov coupling of κ(T), B(T) for fully nonlinear radiation | 200 LoC + NonlinearSolve.jl | Linear inner solve already shipped; outer Newton is mechanical. |
 | 9 | EB / cut-cell support across all operators | 5000+ LoC, multi-month | Geometry generation, EB stencils, EB-aware C/F, EB-aware boundary conditions. Multi-month — should be its own design phase. |
-| 10 | `MLCurlCurl` edge-centered ∇×(μ⁻¹∇×) + σ identity | 2000 LoC | Requires edge-centered field storage. WarpX magnetostatic, resistive MHD. |
+| 10 (cross-component) | `MLCurlCurl` edge-centered ∇×(μ⁻¹∇×) + σ identity, full operator | 1200–1600 LoC | Storage primitive shipped (`EdgeField`); next is the curl-curl operator with cross-component coupling and a tailored smoother (Hiptmair / nodal-AMG). |
 
 ### Architecture / infrastructure
 
 | Item | Effort | Notes |
 |------|--------|-------|
 | Composite (multi-level) node Laplacian via FAC | 600 LoC | Mirrors the existing multi-level FAC for cell-centered ABec. |
-| Edge-centered field type (`EdgeField{D,T}`) | 300 LoC | Foundation for `MLCurlCurl` and tensor-coupling. |
+| Edge-centered field type (`EdgeField{D,T}`) | -- (shipped) | Foundation for `MLCurlCurl` and tensor-coupling. |
 | GPU dispatch via KernelAbstractions | 1000+ LoC | Lift kernels to KA; the Krylov bridge already supports CUDA/AMD via Krylov.jl + KA. |
 
 ## Architectural notes for future sessions

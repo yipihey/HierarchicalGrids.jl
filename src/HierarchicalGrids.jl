@@ -325,7 +325,9 @@ using .GeometricMultigrid: MGWorkspace, MGOptions, MGResult, PhiRhoFields,
                            apply_node_laplacian!, gs_sweep_node!,
                            solve_node_laplacian!,
                            VectorABecProblem, allocate_vector_abec,
-                           solve_vector_abec!
+                           solve_vector_abec!,
+                           EdgeField, allocate_edge_field, fill_edge_field!,
+                           apply_edge_laplacian!, solve_edge_laplacian!
 export MGWorkspace, MGOptions, MGResult, PhiRhoFields
 export solve_poisson!, vcycle!
 export apply_laplacian!, compute_residual!, residual_l2
@@ -349,5 +351,7 @@ export NodeField, allocate_node_field, fill_node_field!
 export NodeCoefs, allocate_node_coefs, fill_node_coefs_sigma!
 export apply_node_laplacian!, gs_sweep_node!, solve_node_laplacian!
 export VectorABecProblem, allocate_vector_abec, solve_vector_abec!
+export EdgeField, allocate_edge_field, fill_edge_field!
+export apply_edge_laplacian!, solve_edge_laplacian!
 
 end # module HierarchicalGrids

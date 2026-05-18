@@ -157,7 +157,10 @@ export MGWorkspace, MGOptions, MGResult, PhiRhoFields,
        NodeCoefs, allocate_node_coefs, fill_node_coefs_sigma!,
        apply_node_laplacian!, gs_sweep_node!, solve_node_laplacian!,
        # Vector ABec (multi-component decoupled diffusion)
-       VectorABecProblem, allocate_vector_abec, solve_vector_abec!
+       VectorABecProblem, allocate_vector_abec, solve_vector_abec!,
+       # Edge-centered vector fields
+       EdgeField, allocate_edge_field, fill_edge_field!,
+       apply_edge_laplacian!, solve_edge_laplacian!
 
 # Type alias for the (phi, rho) field container returned by
 # `allocate_phi_rho`. The outer Vector is per-level; the inner per-patch.
@@ -2791,5 +2794,10 @@ include("NodeLaplacian.jl")
 # Multi-component decoupled ABec (Tier 2 #5 subset) — K independent
 # scalar solves for vector physics (per-component velocity diffusion).
 include("VectorABec.jl")
+
+# Edge-centered vector fields (Tier 3 #10 foundation) — storage + the
+# component-wise scalar Laplacian on edges. Full MLCurlCurl with cross-
+# component coupling builds on this.
+include("EdgeFields.jl")
 
 end # module GeometricMultigrid

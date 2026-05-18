@@ -262,6 +262,10 @@ using HierarchicalGrids
         include("test_vector_abec.jl")
     end
 
+    @testset "Phase 2 (Solver): Edge fields" begin
+        include("test_edge_fields.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end
