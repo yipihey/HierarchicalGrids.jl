@@ -301,12 +301,29 @@ using .GeometricMultigrid: MGWorkspace, MGOptions, MGResult, PhiRhoFields,
                            apply_laplacian!, compute_residual!, residual_l2,
                            allocate_phi_rho, build_uniform_root_hierarchy,
                            manufactured_rhs!, fill_field!,
-                           release!
+                           release!,
+                           ABecCoefs, allocate_abec_coefs,
+                           fill_abec_alpha!, fill_abec_beta!,
+                           apply_abec!, gs_sweep_abec!, compute_abec_residual!,
+                           vcycle_abec!, pcg_composite_abec_solve!, solve_abec!,
+                           FaceVelocity, allocate_face_velocity,
+                           fill_face_velocity!, face_divergence!,
+                           face_divergence_l2, mac_project!,
+                           FlatLayout, flat_layout, pack!, unpack!,
+                           FACCompositeOp, ABecOp, solve_with_krylov!,
+                           abec_jacobi_precond
 export MGWorkspace, MGOptions, MGResult, PhiRhoFields
 export solve_poisson!, vcycle!
 export apply_laplacian!, compute_residual!, residual_l2
 export allocate_phi_rho, build_uniform_root_hierarchy
 export manufactured_rhs!, fill_field!
 export release!
+export ABecCoefs, allocate_abec_coefs, fill_abec_alpha!, fill_abec_beta!
+export apply_abec!, gs_sweep_abec!, compute_abec_residual!
+export vcycle_abec!, pcg_composite_abec_solve!, solve_abec!
+export FaceVelocity, allocate_face_velocity, fill_face_velocity!
+export face_divergence!, face_divergence_l2, mac_project!
+export FlatLayout, flat_layout, pack!, unpack!
+export FACCompositeOp, ABecOp, solve_with_krylov!, abec_jacobi_precond
 
 end # module HierarchicalGrids

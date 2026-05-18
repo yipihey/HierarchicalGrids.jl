@@ -132,7 +132,17 @@ export MGWorkspace, MGOptions, MGResult, PhiRhoFields,
        solve_poisson!, vcycle!,
        apply_laplacian!, compute_residual!, residual_l2,
        allocate_phi_rho, build_uniform_root_hierarchy,
-       manufactured_rhs!, fill_field!, release!
+       manufactured_rhs!, fill_field!, release!,
+       # ABec / variable-coefficient operator API
+       ABecCoefs, allocate_abec_coefs, fill_abec_alpha!, fill_abec_beta!,
+       apply_abec!, gs_sweep_abec!, compute_abec_residual!,
+       vcycle_abec!, pcg_composite_abec_solve!, solve_abec!,
+       # MAC projector
+       FaceVelocity, allocate_face_velocity, fill_face_velocity!,
+       face_divergence!, face_divergence_l2, mac_project!,
+       # Krylov.jl bridge
+       FlatLayout, flat_layout, pack!, unpack!,
+       FACCompositeOp, ABecOp, solve_with_krylov!, abec_jacobi_precond
 
 # Type alias for the (phi, rho) field container returned by
 # `allocate_phi_rho`. The outer Vector is per-level; the inner per-patch.
@@ -2735,5 +2745,16 @@ function manufactured_rhs!(fields_view::NamedTuple,
     end
     return fields_view
 end
+
+# Variable-coefficient ABec operator: L φ = A α φ - B ∇·(β ∇φ) = f.
+include("ABecLaplacian.jl")
+
+# MAC (face-centered) velocity projection: u^{n+1} = u - β ∇φ with
+# ∇·(β ∇φ) = ∇·u.  Builds on the ABec operator.
+include("MACProjection.jl")
+
+# Krylov.jl bridge — flat-vector wrapping of the FAC composite and ABec
+# operators so that GMRES / BiCGStab / FGMRES / MINRES can drive solves.
+include("KrylovBridge.jl")
 
 end # module GeometricMultigrid

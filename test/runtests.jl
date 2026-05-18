@@ -230,6 +230,18 @@ using HierarchicalGrids
         include("test_geometric_multigrid.jl")
     end
 
+    @testset "Phase 2 (Solver): ABec / variable-coefficient operator" begin
+        include("test_abec_laplacian.jl")
+    end
+
+    @testset "Phase 2 (Solver): MAC projection" begin
+        include("test_mac_projection.jl")
+    end
+
+    @testset "Phase 2 (Solver): Krylov.jl bridge" begin
+        include("test_krylov_bridge.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end
