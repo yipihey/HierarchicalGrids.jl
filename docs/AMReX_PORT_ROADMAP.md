@@ -1,73 +1,85 @@
 # AMReX → HierarchicalGrids.jl porting roadmap
 
-This roadmap tracks the AMReX-compatible elliptic-solver capabilities being
-ported to HierarchicalGrids.jl. The strategic survey behind it is in commit
-`acc110c` of the development log.
+This roadmap tracks the AMReX-compatible elliptic-solver capabilities
+being ported to HierarchicalGrids.jl. Strategic survey behind it is in
+the development-session log.
 
-## Shipped (Tier 1 + start of Tier 2)
+## Shipped (Tier 1 + most of Tier 2 + Tier 3 #7 #8)
 
-| # | Item | AMReX equivalent | Files |
-|---|------|------------------|-------|
+| # | Item | AMReX equivalent | File |
+|---|------|------------------|------|
 | 1 | Variable-coefficient ABec operator | `MLABecLaplacian` | `src/Solver/ABecLaplacian.jl` |
-| 2 | MAC (face-centered) velocity projection | `MacProjector` | `src/Solver/MACProjection.jl` |
-| 3 | Krylov.jl flat-vector bridge | (CG/GMRES/BiCGStab/FGMRES/MINRES) | `src/Solver/KrylovBridge.jl` |
-| 6 | AlgebraicMultigrid bottom solver | HYPRE BoomerAMG (CPU-only) | `src/Solver/AMGBottom.jl` |
+| 2 | MAC (face) velocity projection | `MacProjector` (single level) | `src/Solver/MACProjection.jl` |
+| 3 | Krylov.jl flat-vector bridge | CG/GMRES/BiCGStab/FGMRES/MINRES | `src/Solver/KrylovBridge.jl` |
+| 4 (single-level) | Node-centered variable-σ Poisson | `MLNodeLaplacian` (single-level) | `src/Solver/NodeLaplacian.jl` |
+| 5 (subset) | Multi-component decoupled diffusion | `MLTensorOp` (scalar-per-component, isotropic) | `src/Solver/VectorABec.jl` |
+| 6 (CPU) | AlgebraicMultigrid bottom solver | HYPRE BoomerAMG (CPU, non-MPI) | `src/Solver/AMGBottom.jl` |
+| 7 | Gray + multigroup radiation diffusion (linear) | Castro MGFLD inner ABec | `src/Solver/RadiationDiffusion.jl` |
+| 8 | Stiff chemistry per-cell integrator | PelePhysics CVODE reactor (pure-Julia BDF1) | `src/Solver/StiffChemistry.jl` |
 
-What you can now solve, end-to-end on the patch hierarchy:
+End-to-end capability now:
 
-* `∇²φ = ρ` and `(I - Δt·D ∇²)φ = rhs` (heat) via either `solve_poisson!`
-  or the variable-coefficient `solve_abec!`.
-* `∇·(β ∇φ) = ∇·u*` and the matching MAC correction `u^{n+1} = u* - β ∇φ`,
-  single level.
-* Any of the above through `solve_with_krylov!` with `method =
-  :cg|:gmres|:bicgstab|:fgmres|:minres` and an optional `precond`
-  callback (Jacobi, AMG, …).
-* Single-level AMG-preconditioned solves: build the sparse matrix once
-  with `assemble_abec_matrix`, hand it to `amg_preconditioner`, pass the
-  result to `solve_with_krylov!`. ~7 iters to converge on variable-β
-  Helmholtz vs ~50 with Jacobi.
+* **Scalar elliptic** — `∇²φ = ρ`, variable-coef Helmholtz, MAC and nodal
+  pressure projection (single level), implicit thermal / species
+  diffusion, gray + multigroup radiation backward-Euler step. All drive
+  via `solve_abec!`, `solve_node_laplacian!`, `mac_project!`, or the
+  Krylov bridge with `:cg | :gmres | :bicgstab | :fgmres | :minres` and
+  optional Jacobi or AMG preconditioning.
+* **Multi-component** — `solve_vector_abec!` for K decoupled scalar
+  systems; sufficient for incompressible-NS isotropic viscosity. Full
+  tensor coupling is still TODO (#5 full).
+* **Stiff source terms** — per-cell `step_reaction!` with damped Newton
+  / analytical-or-FD Jacobian, parallelised over leaves. Suitable for
+  O(10)-species networks; large mechanisms should wrap CVODE externally.
 
-## Remaining (Tier 2 + Tier 3)
+## Remaining
 
-Effort estimates are rough — each line is a focused future session.
+### Tier 2 continuation
 
-### Tier 2 (medium lift, opens application classes)
+| # | Item | Effort | Notes |
+|---|------|--------|-------|
+| 4 (multi-level) | `MLNodeLaplacian` with FAC at AMR C/F boundaries (Martin-Colella-Almgren) | 800–1200 LoC | Needed for AMR nodal pressure projection (IAMR / incflo / MAESTROeX). Storage primitives are in place; main work is the C/F nodal restrictor/prolongator and a proper composite operator. |
+| 5 (full) | `MLTensorOp` with cross-component coupling μ(∇u + ∇uᵀ) + λ ∇·u · I | 600–900 LoC | Builds on `VectorABecProblem`; adds a joint smoother that updates all D components with cross terms. |
+| 6+ | HYPRE.jl (MPI BoomerAMG) and AMGX.jl (CUDA BoomerAMG) | 300 LoC each | External deps. Use the in-tree `AMGBottom` for the pure-Julia / single-node CPU case (already shipped). |
+| -- | Multi-level FAC matrix assembly (for AMG-on-composite) | 200–400 LoC | Adds C/F coupling rows to `assemble_abec_matrix`. Enables AMG to be used as a composite bottom solver. |
 
-| # | Item | Effort | Unlocks |
-|---|------|--------|---------|
-| 4 | `MLNodeLaplacian` equivalent — node-centered variable-coefficient Poisson with C/F at AMR boundaries (Martin-Colella-Almgren) | 1500–2000 LoC | Nodal pressure projection (IAMR / incflo / MAESTROeX / PeleLMeX); a real incompressible driver. |
-| 5 | `MLTensorOp` equivalent — multi-component cell-centered tensor viscosity with face-averaged μ | 800–1200 LoC | Implicit-viscosity Navier-Stokes; rounds out the IAMR/PeleLMeX trio. |
-| 6+ | HYPRE.jl (MPI BoomerAMG) and AMGX.jl (CUDA BoomerAMG) bottom plug-ins | 300 LoC each | Scaling beyond geometric-coarsening floor and GPU. Use the AlgebraicMultigrid-bottom (already shipped) for the CPU-non-MPI case. |
+### Tier 3 continuation
 
-### Tier 3 (specialty, application-driven)
+| # | Item | Effort | Notes |
+|---|------|--------|-------|
+| 7 (nonlinear) | Newton-Krylov coupling of κ(T), B(T) for fully nonlinear radiation | 200 LoC + NonlinearSolve.jl | Linear inner solve already shipped; outer Newton is mechanical. |
+| 9 | EB / cut-cell support across all operators | 5000+ LoC, multi-month | Geometry generation, EB stencils, EB-aware C/F, EB-aware boundary conditions. Multi-month — should be its own design phase. |
+| 10 | `MLCurlCurl` edge-centered ∇×(μ⁻¹∇×) + σ identity | 2000 LoC | Requires edge-centered field storage. WarpX magnetostatic, resistive MHD. |
 
-| # | Item | Effort | Unlocks |
-|---|------|--------|---------|
-| 7 | Gray + multigroup radiation diffusion | 600 LoC on top of Tier 1 | Castro MGFLD, Quokka rad-hydro. Gray = ABec + Newton on κ(T); multigroup = block ABec per group. |
-| 8 | Stiff chemistry per-cell integrator | 400 LoC | PelePhysics-style reactor. Wrap CVODE via Sundials.jl with `OhMyThreads` cell-batching (Sundials is a soft dep). |
-| 9 | EB / cut-cell support across all operators | 5000+ LoC, multi-month | MFIX-Exa, incflo-EB, WarpX-EB. Geometry generation, EB stencils, EB-aware C/F. |
-| 10 | `MLCurlCurl` equivalent — edge-centered ∇×μ⁻¹∇× | 2000 LoC | WarpX magnetostatic; resistive MHD. |
+### Architecture / infrastructure
 
-## Architectural notes carried into Tier 2
+| Item | Effort | Notes |
+|------|--------|-------|
+| Composite (multi-level) node Laplacian via FAC | 600 LoC | Mirrors the existing multi-level FAC for cell-centered ABec. |
+| Edge-centered field type (`EdgeField{D,T}`) | 300 LoC | Foundation for `MLCurlCurl` and tensor-coupling. |
+| GPU dispatch via KernelAbstractions | 1000+ LoC | Lift kernels to KA; the Krylov bridge already supports CUDA/AMD via Krylov.jl + KA. |
 
-* The flat-vector layout (`FlatLayout`, `pack!`, `unpack!`) used by the
-  Krylov bridge generalizes to any operator that acts on uncovered cells
-  across `level_range`. Tier-2 #4/#5 should expose the same flat view
-  for their own multi-component / node-centered storage.
+## Architectural notes for future sessions
 
-* AlgebraicMultigrid.jl's `aspreconditioner` only takes a `SparseMatrixCSC`.
-  Multi-level FAC matrix assembly (covering C/F entries) is the natural
-  next step — needed for AMG to drive composite AMR solves rather than
-  just single-level bottoms.
+* The flat-vector layout (`FlatLayout`, `pack!`, `unpack!`) generalises
+  to any operator on uncovered cells. Tier-2 #4 multi-level / #5 full
+  should reuse it for AMG preconditioning.
 
-* `pcg_composite_abec_solve!` and `solve_with_krylov!` both consume the
-  same operator + scratch interface. New operators (TensorOp, NodeLaplacian)
-  should follow the same `apply!`, `gs_sweep!`, `compute_residual!`
-  three-function contract.
+* `apply_*`, `gs_sweep_*`, `compute_*_residual!` is the three-function
+  contract every new operator should follow — that's what
+  `pcg_composite_abec_solve!`, `solve_with_krylov!`, and the AMG
+  preconditioner all consume.
 
 * Sign convention: `L_ABec φ = A·α·φ - B·∇·(β ∇φ)` matches AMReX. For
-  SPD-positive operators (so PCG works directly), use `A ≥ 0` with `α ≥ 0`
-  and `B ≥ 0` with `β ≥ 0`. For pure Poisson `∇²φ = ρ`, set
-  `A=0, B=1, β=1` and supply `-ρ` as RHS (the negative of the standard
-  convention). The existing const-coef `solve_poisson!` keeps the
-  `∇²φ = ρ` sign convention for backward compatibility.
+  PCG to converge directly, use SPD-positive forms (`A ≥ 0`, `α ≥ 0`,
+  `B ≥ 0`, `β ≥ 0`). Pure Poisson `∇²φ = ρ` is `A=0, B=1, β=1, f=-ρ`
+  in this convention. The original `solve_poisson!` keeps the
+  `∇²φ = ρ` form for backward compatibility.
+
+* `NodeLaplacian` uses node-centered storage `(N+1, ..., N+1)`. The
+  natural convention identifies node `1` with node `N+1` along
+  periodic axes; the apply / GS kernels do this internally.
+
+* `RadiationDiffusion` and `MAC projection` are thin wrappers on the
+  ABec operator. Treat new "physics" modules the same way unless they
+  introduce a new field-storage type.
