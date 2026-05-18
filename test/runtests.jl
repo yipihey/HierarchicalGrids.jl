@@ -301,4 +301,8 @@ using HierarchicalGrids
     @testset "Phase 2 worked example: Sod-tube compressible (PR-3)" begin
         include("test_cfd_compressible_sod.jl")
     end
+
+    @testset "Phase 2 worked example: Implicit Navier-Stokes (JFNK)" begin
+        include("test_cfd_implicit_ns.jl")
+    end
 end
