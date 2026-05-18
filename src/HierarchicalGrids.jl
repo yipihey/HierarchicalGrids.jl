@@ -311,7 +311,9 @@ using .GeometricMultigrid: MGWorkspace, MGOptions, MGResult, PhiRhoFields,
                            face_divergence_l2, mac_project!,
                            FlatLayout, flat_layout, pack!, unpack!,
                            FACCompositeOp, ABecOp, solve_with_krylov!,
-                           abec_jacobi_precond
+                           abec_jacobi_precond,
+                           AMGPreconditioner, amg_preconditioner,
+                           amg_precond_callback, assemble_abec_matrix
 export MGWorkspace, MGOptions, MGResult, PhiRhoFields
 export solve_poisson!, vcycle!
 export apply_laplacian!, compute_residual!, residual_l2
@@ -325,5 +327,7 @@ export FaceVelocity, allocate_face_velocity, fill_face_velocity!
 export face_divergence!, face_divergence_l2, mac_project!
 export FlatLayout, flat_layout, pack!, unpack!
 export FACCompositeOp, ABecOp, solve_with_krylov!, abec_jacobi_precond
+export AMGPreconditioner, amg_preconditioner, amg_precond_callback
+export assemble_abec_matrix
 
 end # module HierarchicalGrids

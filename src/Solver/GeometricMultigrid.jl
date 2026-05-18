@@ -142,7 +142,10 @@ export MGWorkspace, MGOptions, MGResult, PhiRhoFields,
        face_divergence!, face_divergence_l2, mac_project!,
        # Krylov.jl bridge
        FlatLayout, flat_layout, pack!, unpack!,
-       FACCompositeOp, ABecOp, solve_with_krylov!, abec_jacobi_precond
+       FACCompositeOp, ABecOp, solve_with_krylov!, abec_jacobi_precond,
+       # AlgebraicMultigrid bottom solver
+       AMGPreconditioner, amg_preconditioner, amg_precond_callback,
+       assemble_abec_matrix
 
 # Type alias for the (phi, rho) field container returned by
 # `allocate_phi_rho`. The outer Vector is per-level; the inner per-patch.
@@ -2756,5 +2759,9 @@ include("MACProjection.jl")
 # Krylov.jl bridge — flat-vector wrapping of the FAC composite and ABec
 # operators so that GMRES / BiCGStab / FGMRES / MINRES can drive solves.
 include("KrylovBridge.jl")
+
+# AlgebraicMultigrid.jl bottom solver (Tier 2 #6) — sparse matrix assembly
+# of the single-level ABec operator and an AMG preconditioner over Krylov.
+include("AMGBottom.jl")
 
 end # module GeometricMultigrid

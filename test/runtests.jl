@@ -242,6 +242,10 @@ using HierarchicalGrids
         include("test_krylov_bridge.jl")
     end
 
+    @testset "Phase 2 (Solver): AMG bottom" begin
+        include("test_amg_bottom.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end
