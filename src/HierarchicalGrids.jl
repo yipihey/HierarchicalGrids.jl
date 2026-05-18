@@ -313,7 +313,19 @@ using .GeometricMultigrid: MGWorkspace, MGOptions, MGResult, PhiRhoFields,
                            FACCompositeOp, ABecOp, solve_with_krylov!,
                            abec_jacobi_precond,
                            AMGPreconditioner, amg_preconditioner,
-                           amg_precond_callback, assemble_abec_matrix
+                           amg_precond_callback, assemble_abec_matrix,
+                           setup_gray_radiation!, solve_gray_radiation_step!,
+                           MultigroupRadiation, allocate_multigroup,
+                           solve_multigroup_step!,
+                           ReactionSystem, SpeciesField, allocate_species,
+                           fill_species!, step_reaction!,
+                           NodeField, allocate_node_field, fill_node_field!,
+                           NodeCoefs, allocate_node_coefs,
+                           fill_node_coefs_sigma!,
+                           apply_node_laplacian!, gs_sweep_node!,
+                           solve_node_laplacian!,
+                           VectorABecProblem, allocate_vector_abec,
+                           solve_vector_abec!
 export MGWorkspace, MGOptions, MGResult, PhiRhoFields
 export solve_poisson!, vcycle!
 export apply_laplacian!, compute_residual!, residual_l2
@@ -329,5 +341,13 @@ export FlatLayout, flat_layout, pack!, unpack!
 export FACCompositeOp, ABecOp, solve_with_krylov!, abec_jacobi_precond
 export AMGPreconditioner, amg_preconditioner, amg_precond_callback
 export assemble_abec_matrix
+export setup_gray_radiation!, solve_gray_radiation_step!
+export MultigroupRadiation, allocate_multigroup, solve_multigroup_step!
+export ReactionSystem, SpeciesField, allocate_species, fill_species!
+export step_reaction!
+export NodeField, allocate_node_field, fill_node_field!
+export NodeCoefs, allocate_node_coefs, fill_node_coefs_sigma!
+export apply_node_laplacian!, gs_sweep_node!, solve_node_laplacian!
+export VectorABecProblem, allocate_vector_abec, solve_vector_abec!
 
 end # module HierarchicalGrids

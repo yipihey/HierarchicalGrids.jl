@@ -145,7 +145,19 @@ export MGWorkspace, MGOptions, MGResult, PhiRhoFields,
        FACCompositeOp, ABecOp, solve_with_krylov!, abec_jacobi_precond,
        # AlgebraicMultigrid bottom solver
        AMGPreconditioner, amg_preconditioner, amg_precond_callback,
-       assemble_abec_matrix
+       assemble_abec_matrix,
+       # Radiation diffusion
+       setup_gray_radiation!, solve_gray_radiation_step!,
+       MultigroupRadiation, allocate_multigroup, solve_multigroup_step!,
+       # Stiff chemistry
+       ReactionSystem, SpeciesField, allocate_species, fill_species!,
+       step_reaction!,
+       # Node Laplacian
+       NodeField, allocate_node_field, fill_node_field!,
+       NodeCoefs, allocate_node_coefs, fill_node_coefs_sigma!,
+       apply_node_laplacian!, gs_sweep_node!, solve_node_laplacian!,
+       # Vector ABec (multi-component decoupled diffusion)
+       VectorABecProblem, allocate_vector_abec, solve_vector_abec!
 
 # Type alias for the (phi, rho) field container returned by
 # `allocate_phi_rho`. The outer Vector is per-level; the inner per-patch.
@@ -2763,5 +2775,21 @@ include("KrylovBridge.jl")
 # AlgebraicMultigrid.jl bottom solver (Tier 2 #6) — sparse matrix assembly
 # of the single-level ABec operator and an AMG preconditioner over Krylov.
 include("AMGBottom.jl")
+
+# Radiation diffusion (Tier 3 #7) — gray / multigroup linear backward-Euler
+# steps built on the ABec operator.
+include("RadiationDiffusion.jl")
+
+# Stiff chemistry (Tier 3 #8) — per-cell backward-Euler / Newton stiff ODE
+# integrator with cell-batch parallelism.
+include("StiffChemistry.jl")
+
+# Node-centered variable-coefficient Poisson (Tier 2 #4) — single-level
+# nodal pressure projection operator. AMReX MLNodeLaplacian equivalent.
+include("NodeLaplacian.jl")
+
+# Multi-component decoupled ABec (Tier 2 #5 subset) — K independent
+# scalar solves for vector physics (per-component velocity diffusion).
+include("VectorABec.jl")
 
 end # module GeometricMultigrid

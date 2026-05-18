@@ -246,6 +246,22 @@ using HierarchicalGrids
         include("test_amg_bottom.jl")
     end
 
+    @testset "Phase 2 (Solver): Radiation diffusion" begin
+        include("test_radiation_diffusion.jl")
+    end
+
+    @testset "Phase 2 (Solver): Stiff chemistry" begin
+        include("test_stiff_chemistry.jl")
+    end
+
+    @testset "Phase 2 (Solver): Node Laplacian" begin
+        include("test_node_laplacian.jl")
+    end
+
+    @testset "Phase 2 (Solver): VectorABec" begin
+        include("test_vector_abec.jl")
+    end
+
     @testset "Integration tests" begin
         include("test_integration.jl")
     end
