@@ -37,6 +37,7 @@ using HierarchicalGrids: HierarchicalMesh, n_cells, refine_cells!,
                           PERIODIC, OUTFLOW,
                           AdaptiveField, dispose!,
                           for_each_cell!, for_each_face!,
+                          step_with_amr!, refine_by_indicator!,
                           Sequential
 
 using LinearAlgebra
@@ -258,6 +259,11 @@ Base.@kwdef struct ImplicitNSConfig
     gmres_maxiter::Int                = 100
     gmres_restart::Int                = 30
     precond::Symbol                   = :none
+    # AMR settings — `amr_every = 0` disables AMR entirely.
+    amr_every::Int                    = 0
+    refine_threshold::Float64         = 0.20
+    coarsen_threshold::Float64        = 0.05
+    max_level::Int                    = 3
 end
 
 # Mutable state — holds the mesh, scratch buffers for residual + JFNK,
@@ -284,6 +290,9 @@ mutable struct ImplicitNSState
     fdE::Vector{Float64}
     # Block-Jacobi preconditioner cache (per-cell inverse 4×4 frozen at U^n).
     bj_inv::Vector{NTuple{16, Float64}}  # row-major flattened 4×4 inverse
+    # Time-tracking (incremented by the run! driver).
+    t::Float64
+    n_steps::Int
 end
 
 function _build_uniform_mesh(n_levels::Int)
@@ -344,7 +353,7 @@ function build_state(config::ImplicitNSConfig;
 
     state = ImplicitNSState(config, mesh, frame, bcs, af, leaves, cell_to_idx,
                               n_leaves, U_n, U_iter, U_pert, F_iter, F_pert,
-                              fdr, fdru, fdrv, fdE, bj_inv)
+                              fdr, fdru, fdrv, fdE, bj_inv, 0.0, 0)
 
     if ic !== nothing
         field = parent(af)
@@ -816,14 +825,118 @@ function implicit_ns_step!(state::ImplicitNSState, dt::Float64;
 end
 
 # ============================================================================
+# AMR primitives
+#
+# AMR runs *between* implicit steps — the mesh is frozen during the Newton
+# / GMRES inner loop.  After `step_with_amr!` refines or coarsens, the
+# cached `leaves` / `cell_to_idx` / flat-vector scratch buffers in
+# `state` are stale and must be rebuilt before the next residual is
+# computed.  `refresh_state!` does that in place.
+#
+# Conservative remapping of (ρ, ρu, ρv, E) across refinement events is
+# handled by the `AdaptiveField` machinery — degree-0 BernsteinBasis is
+# remapped by mean-preserving (volume-weighted average for coarsening,
+# copy for refinement), which matches the FV conservation law.
+# ============================================================================
+
+"""
+    refresh_state!(state)
+
+Rebuild `state.leaves`, `state.cell_to_idx`, and resize the JFNK scratch
+buffers (`U_n`, `U_iter`, `U_pert`, `F_iter`, `F_pert`, `bj_inv`) and the
+per-cell flux divergence accumulators (`fdr`, `fdru`, `fdrv`, `fdE`) to
+match the current mesh.  Idempotent on an unchanged mesh.
+"""
+function refresh_state!(state::ImplicitNSState)
+    state.leaves = enumerate_leaves(state.mesh)
+    n_cells_total = n_cells(state.mesh)
+    state.n_leaves = length(state.leaves)
+    resize!(state.cell_to_idx, n_cells_total)
+    fill!(state.cell_to_idx, 0)
+    @inbounds for (k, c) in enumerate(state.leaves)
+        state.cell_to_idx[c] = k
+    end
+    n_flat = 4 * state.n_leaves
+    resize!(state.U_n,    n_flat)
+    resize!(state.U_iter, n_flat)
+    resize!(state.U_pert, n_flat)
+    resize!(state.F_iter, n_flat)
+    resize!(state.F_pert, n_flat)
+    resize!(state.fdr,   n_cells_total)
+    resize!(state.fdru,  n_cells_total)
+    resize!(state.fdrv,  n_cells_total)
+    resize!(state.fdE,   n_cells_total)
+    resize!(state.bj_inv, state.n_leaves)
+    return state
+end
+
+"""
+    gradient_indicator(field, mesh) -> Vector{Float64}
+
+Per-cell `|Δρ|/max(ρ, ρ_nbr)` as a finite-difference proxy on face
+neighbours.  Mirrors the indicator used by `cfd_compressible_sod` — same
+shock / contact detection, cheap to evaluate.
+"""
+function gradient_indicator(field, mesh::HierarchicalMesh{2})
+    n = n_cells(mesh)
+    out = zeros(Float64, n)
+    ensure_neighbor_graph!(mesh)
+    @inbounds for i in 1:n
+        is_leaf(mesh.cells[i]) || continue
+        nbs = face_neighbors(mesh, i)
+        ρ_i = field.rho[i][1]
+        ρ_i > 0.0 || continue
+        max_rel = 0.0
+        for f in 1:4
+            nb = nbs[f]
+            nb == 0 && continue
+            ρ_j = field.rho[Int(nb)][1]
+            d = abs(ρ_i - ρ_j) / max(ρ_i, ρ_j, eps(Float64))
+            if d > max_rel
+                max_rel = d
+            end
+        end
+        out[i] = max_rel
+    end
+    return out
+end
+
+"""
+    implicit_ns_step_with_amr!(state, dt; refine_now = false) -> (newton_iters, residual)
+
+One implicit step + optional AMR cycle.  Caller decides whether to fire
+AMR this step (typically `step % config.amr_every == 0`).  After AMR,
+`refresh_state!` is called to resize the scratch buffers.
+"""
+function implicit_ns_step_with_amr!(state::ImplicitNSState, dt::Float64;
+                                       refine_now::Bool = false,
+                                       verbose::Bool = false)
+    refresh_state!(state)
+    iters, res = implicit_ns_step!(state, dt; verbose = verbose)
+    if refine_now && state.config.amr_every > 0
+        indicator_fn = m -> gradient_indicator(parent(state.af), m)
+        refine_by_indicator!(state.mesh, indicator_fn(state.mesh);
+                               refine_threshold  = state.config.refine_threshold,
+                               coarsen_threshold = state.config.coarsen_threshold,
+                               max_level         = state.config.max_level,
+                               isotropic         = true)
+        refresh_state!(state)
+    end
+    return (iters, res)
+end
+
+# ============================================================================
 # Top-level driver
 # ============================================================================
 
 """
-    run!(config; ic = nothing, callback = nothing) -> ImplicitNSState
+    run!(config; ic = nothing, callback = nothing, verbose = false) -> ImplicitNSState
 
 Run an implicit-NS simulation from `t = 0` to `config.t_final` with fixed
-`config.dt`. Optional `ic(x) -> (ρ, u, v, p)` sets the initial condition;
+`config.dt`.  If `config.amr_every > 0`, AMR fires every Nth step using a
+density-gradient indicator; otherwise the mesh is static.
+
+Optional `ic(x) -> (ρ, u, v, p)` sets the initial condition;
 optional `callback(state, t, step)` runs after every accepted step.
 """
 function run!(config::ImplicitNSConfig;
@@ -831,17 +944,19 @@ function run!(config::ImplicitNSConfig;
                 callback = nothing,
                 verbose::Bool = false)
     state = build_state(config; ic = ic)
-    t = 0.0
-    step = 0
-    while t < config.t_final - 1e-14
-        dt = min(config.dt, config.t_final - t)
-        iters, res = implicit_ns_step!(state, dt; verbose = verbose)
-        t += dt
-        step += 1
+    while state.t < config.t_final - 1e-14
+        dt = min(config.dt, config.t_final - state.t)
+        refine_now = (config.amr_every > 0) &&
+                     ((state.n_steps + 1) % config.amr_every == 0)
+        iters, res = implicit_ns_step_with_amr!(state, dt;
+                                                    refine_now = refine_now,
+                                                    verbose = verbose)
+        state.t += dt
+        state.n_steps += 1
         if verbose
-            @info "step $step  t=$t  newton_iters=$iters  |F_final|=$res"
+            @info "step $(state.n_steps)  t=$(state.t)  newton_iters=$iters  |F|=$res  n_leaves=$(state.n_leaves)"
         end
-        callback === nothing || callback(state, t, step)
+        callback === nothing || callback(state, state.t, state.n_steps)
     end
     return state
 end

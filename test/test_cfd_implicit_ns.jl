@@ -124,6 +124,58 @@ end
     @test var(f_v) <= var(f_i) * 1.05    # within tolerance; viscous ≤ inviscid
 end
 
+@testset "Implicit NS: refresh_state! after manual refinement" begin
+    # Build a uniform 8×8 mesh, refine one cell, verify refresh_state!
+    # picks up the new leaves and resizes the JFNK scratch buffers.
+    cfg = _NS.ImplicitNSConfig(n_initial_refines = 3,
+                                  t_final = 0.0, dt = 1e-3)
+    state = _NS.build_state(cfg; ic = x -> (1.0, 0.0, 0.0, 1.0))
+    n_leaves_before = state.n_leaves   # 8×8 = 64
+    @test n_leaves_before == 64
+    @test length(state.U_n) == 4 * 64
+
+    # Refine the first leaf cell.  In 2D that adds 4 children, removes
+    # 1 leaf → net +3 leaves.
+    _NS.refine_cells!(state.mesh, [state.leaves[1]])
+    _NS.refresh_state!(state)
+    @test state.n_leaves == n_leaves_before + 3
+    @test length(state.U_n)    == 4 * state.n_leaves
+    @test length(state.U_iter) == 4 * state.n_leaves
+    @test length(state.F_iter) == 4 * state.n_leaves
+    @test length(state.fdr)    == _NS.n_cells(state.mesh)
+
+    # One implicit step on the heterogeneous mesh must still converge.
+    iters, res = _NS.implicit_ns_step!(state, 1e-3)
+    @test iters <= 8
+    @test res < 1e-6
+end
+
+@testset "Implicit NS: AMR-enabled run! produces refined mesh" begin
+    # Sod-like IC concentrates a steep ρ gradient at x = 0.5; AMR should
+    # refine cells crossing the interface within a few steps.
+    ic = function (x)
+        return x[1] < 0.5 ? (1.0, 0.0, 0.0, 1.0) :
+                            (0.125, 0.0, 0.0, 0.1)
+    end
+    cfg = _NS.ImplicitNSConfig(
+        n_initial_refines = 3, t_final = 0.01, dt = 5e-3,
+        periodic_x = false, periodic_y = true,
+        amr_every = 1, refine_threshold = 0.10, coarsen_threshold = 0.01,
+        max_level = 5,
+        newton_tol = 1e-6, gmres_tol = 1e-5, newton_maxiter = 15)
+    n_leaves_initial = let s = _NS.build_state(cfg; ic = ic)
+        s.n_leaves
+    end
+    state = _NS.run!(cfg; ic = ic)
+    # AMR fired on every step (`amr_every = 1`); should have added at
+    # least one level of refinement near the discontinuity.
+    @test state.n_leaves > n_leaves_initial
+    # Physical sanity.
+    field = parent(state.af)
+    ρ_min = minimum(field.rho[c][1] for c in state.leaves)
+    @test ρ_min > 0.0
+end
+
 @testset "Implicit NS: Sod tube runs to completion (CFL-unbounded dt)" begin
     # Sod IC: discontinuous initial state.  Implicit backward-Euler is
     # unconditionally stable so we can take a `dt` an order of magnitude

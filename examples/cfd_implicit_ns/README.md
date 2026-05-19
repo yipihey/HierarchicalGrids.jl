@@ -63,24 +63,55 @@ src/CFDImplicitNS.jl
 3. **Uniform translation**: backward-Euler step preserves (ρ, u, 0, p).
 4. **Viscous mode**: a Gaussian density pulse smears more under viscous +
    heat-conducting integration than under pure inviscid.
-5. **Sod tube**: discontinuous IC, dt ≈ 5× the explicit CFL bound, Newton
+5. **`refresh_state!` after manual refinement**: refine one cell, verify
+   the scratch buffers are resized, and the implicit step still converges
+   on the heterogeneous mesh.
+6. **AMR-enabled `run!`**: Sod-like initial discontinuity triggers AMR
+   every step; mesh ends with strictly more leaves than the initial
+   uniform setup, ρ stays positive.
+7. **Sod tube**: discontinuous IC, dt ≈ 5× the explicit CFL bound, Newton
    converges every step, positivity preserved in ρ and p.
+
+## AMR support
+
+`for_each_face!` already handles hanging-node (C/F) faces in the
+residual function — no JFNK-side changes needed once the mesh is
+heterogeneous.  What the implicit step needs around AMR events is:
+
+* `refresh_state!(state)` — rebuilds `state.leaves`, `state.cell_to_idx`,
+  and resizes the flat-vector scratch (`U_n`, `U_iter`, `U_pert`,
+  `F_iter`, `F_pert`) and the per-cell flux-divergence buffers after a
+  refinement event.
+* `implicit_ns_step_with_amr!(state, dt; refine_now = …)` — runs one
+  Newton-Krylov step on the current mesh, then (if requested) fires
+  `refine_by_indicator!` and refreshes the state.
+* AMR knobs on `ImplicitNSConfig`: `amr_every`, `refine_threshold`,
+  `coarsen_threshold`, `max_level`.  Setting `amr_every = 0` keeps the
+  mesh static (same as the v1 behaviour).
+* Conservative remapping of (ρ, ρu, ρv, E) at refinement / coarsening
+  events is handled by the existing `AdaptiveField` machinery —
+  degree-0 BernsteinBasis is mean-preserving, which matches the FV
+  conservation law.
+
+The default density-gradient indicator (`gradient_indicator(field,
+mesh)`) is the same one used by `cfd_compressible_sod`: per-cell
+`|Δρ|/max(ρ, ρ_nbr)` over leaf face-neighbours.
 
 ## Limitations / follow-ups
 
-* **Single level, single patch.** The residual routine consumes the
-  `AdaptiveField`'s `for_each_face!`, so adapting to AMR is mostly
-  plumbing — the JFNK loop doesn't care about hierarchy depth.
-* **First-order spatial accuracy.** Same Godunov + HLL as the Sod tube; no
-  slope reconstruction. Backward-Euler is first-order in time. BDF2 / DIRK
-  for higher accuracy is left as a follow-up.
-* **Block-Jacobi preconditioner only.** Good for moderate `dt`. For stiff
-  cases (large `dt`, low Mach, fine grids) a physics-based block precond
-  (Schur on the pressure block) is the standard next step.
+* **Single patch per level.** Mesh refinement adds leaves within the
+  single AdaptiveField; there's no second `PatchHierarchy`-style patch
+  yet.
+* **First-order spatial accuracy.** Same Godunov + HLL as the Sod tube;
+  no slope reconstruction.  Backward-Euler is first-order in time.
+  BDF2 / DIRK for higher accuracy is left as a follow-up.
+* **Block-Jacobi preconditioner only.** Good for moderate `dt`.  For
+  stiff cases (large `dt`, low Mach, fine grids) a physics-based block
+  precond (Schur on the pressure block) is the standard next step.
 * **Viscous handling at periodic boundaries is zero-gradient.** The
   interior viscous flux uses full tangential gradients via the
   `face_neighbors` graph; periodic boundary face viscous fluxes are
-  dropped. For low-Re flow this is fine; for Re ~ O(1) at the boundary
+  dropped.  For low-Re flow this is fine; for Re ~ O(1) at the boundary
   one would wire the periodic neighbor-graph through.
 
 ## Why this is "Path A"
