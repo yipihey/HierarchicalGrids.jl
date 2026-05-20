@@ -305,4 +305,8 @@ using HierarchicalGrids
     @testset "Phase 2 worked example: Implicit Navier-Stokes (JFNK)" begin
         include("test_cfd_implicit_ns.jl")
     end
+
+    @testset "Phase 2 worked example: Incompressible NS (CN + SDIRK2 JFNK)" begin
+        include("test_cfd_incompressible_ns.jl")
+    end
 end
