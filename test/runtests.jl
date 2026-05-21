@@ -309,4 +309,8 @@ using HierarchicalGrids
     @testset "Phase 2 worked example: Incompressible NS (CN + SDIRK2 JFNK)" begin
         include("test_cfd_incompressible_ns.jl")
     end
+
+    @testset "Phase 2 worked example: 2nd-order AMR scalar advection" begin
+        include("test_cfd_amr_advection_2o.jl")
+    end
 end
