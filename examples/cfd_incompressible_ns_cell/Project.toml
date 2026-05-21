@@ -1,0 +1,13 @@
+name = "CFDIncompressibleNSCell"
+uuid = "7d9e2a44-3c4f-4b5a-9e8b-1a6c5d7e8f9c"
+authors = ["HierarchicalGrids contributors"]
+version = "0.1.0"
+
+[deps]
+HierarchicalGrids = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
