@@ -41,9 +41,11 @@ using HierarchicalGrids: HierarchicalMesh, refine_cells!, n_cells, is_leaf,
                           BernsteinBasis, allocate_polynomial_fields, SoA,
                           AdaptiveField, dispose!,
                           for_each_face!, Sequential
+import LinearAlgebra: mul!
+using Krylov: cg
 
 export NSCellConfig, NSCellState
-export build_state, step!, run!
+export build_state, step!, run!, viscous_step!
 export taylor_green_ic, taylor_green_solution
 export l2_error, total_momentum, kinetic_energy
 
@@ -84,6 +86,11 @@ Base.@kwdef struct NSCellConfig
     t_final::Float64 = 0.05
     dt::Float64 = 1e-3
     time_scheme::Symbol = :rk2
+
+    # Step 2: implicit viscous step.
+    μ::Float64 = 1e-2                 # kinematic viscosity ν
+    helmholtz_tol::Float64 = 1e-10
+    helmholtz_maxiter::Int = 200
 end
 
 # ============================================================================
@@ -381,6 +388,146 @@ function _accumulate_flux_divergence!(fdu::Vector{Float64},
     end
 
     return (fdu, fdv)
+end
+
+# ============================================================================
+# Discrete Laplacian on the AMR mesh
+#
+# Conservative form: (L u)_c = (1/V_c) · ∑_faces β · (u_neighbour − u_c) ·
+#                                                   face_area / center_distance
+# with β ≡ 1 here (variable-coefficient extension is a one-liner).
+#
+# To avoid double-counting on the cell sweep, we only process each leaf's
+# *low* face along each axis (face_idx ∈ {1, 3}), and add the equal-and-
+# opposite contribution to the neighbour. Every face is then visited
+# exactly once: same-level faces by the cell on the high side, C/F faces
+# by each fine cell (each of which has the C/F as its low face — coarse
+# never iterates a C/F face from its high side).
+#
+# At hanging-node faces the gradient is approximated by the simple
+# centre-to-centre formula `(u_j − u_i) / dist_ij`. Discretely this is
+# 2nd-order along the centreline between cells but 1st-order at the
+# sub-face centre in 2D (the same transverse-offset issue the advection
+# fixes with Martin-Colella). Step 3 (cell-native multigrid Poisson)
+# upgrades this to a fully 2nd-order Martin-Colella Laplacian; for the
+# step-2 implicit viscous solve the 1st-order C/F treatment is
+# acceptable (and the AMR test below just checks the solve runs and
+# the field decays — the 2nd-order verification is on uniform meshes).
+# ============================================================================
+
+function _apply_laplacian!(Lv::Vector{T}, v::Vector{T},
+                            state::NSCellState) where {T}
+    mesh = state.mesh
+    frame = state.frame
+    bcs = state.bcs
+    @inbounds for c in state.leaves; Lv[c] = zero(T); end
+
+    ensure_neighbor_graph!(mesh)
+    @inbounds for i in 1:n_cells(mesh)
+        is_leaf(mesh.cells[i]) || continue
+        nbrs = face_neighbors_with_bcs(mesh, i, bcs)
+        lo_i, hi_i = cell_physical_box(frame, i)
+        V_i = (hi_i[1] - lo_i[1]) * (hi_i[2] - lo_i[2])
+        v_i = v[i]
+
+        # Low faces only: face_idx 1 (axis 1 lo) and 3 (axis 2 lo).
+        for axis in 1:2
+            face_idx = 2 * (axis - 1) + 1
+            j_raw = nbrs[face_idx]
+            j_raw == 0 && continue
+            j = Int(j_raw)
+
+            lo_j, hi_j = cell_physical_box(frame, j)
+            V_j = (hi_j[1] - lo_j[1]) * (hi_j[2] - lo_j[2])
+            transverse = axis == 1 ? 2 : 1
+            face_area = min(hi_i[transverse] - lo_i[transverse],
+                              hi_j[transverse] - lo_j[transverse])
+
+            # Centre-to-centre distance along the face normal, with
+            # periodic-wrap correction.
+            c_i_n = 0.5 * (lo_i[axis] + hi_i[axis])
+            c_j_n = 0.5 * (lo_j[axis] + hi_j[axis])
+            raw = c_i_n - c_j_n
+            domain_extent = frame.hi[axis] - frame.lo[axis]
+            if abs(raw) > domain_extent / 2
+                raw -= sign(raw) * domain_extent
+            end
+            dist = abs(raw)
+
+            F = (v[j] - v_i) * face_area / dist
+            Lv[i] += F / V_i
+            Lv[j] -= F / V_j
+        end
+    end
+    return Lv
+end
+
+# ============================================================================
+# Helmholtz operator (I − Δt · ν · L) as a Krylov matrix-free operator
+# ============================================================================
+
+mutable struct HelmholtzOp{T}
+    state::NSCellState
+    dt::T
+    ν::T
+    Lv_scratch::Vector{T}     # mesh-indexed scratch for L·v
+    v_scratch::Vector{T}      # mesh-indexed scratch for v
+end
+
+Base.size(op::HelmholtzOp) = (length(op.state.leaves), length(op.state.leaves))
+Base.size(op::HelmholtzOp, k::Int) = length(op.state.leaves)
+Base.eltype(::HelmholtzOp{T}) where {T} = T
+
+function mul!(y::AbstractVector{T}, op::HelmholtzOp{T},
+              v::AbstractVector{T}) where {T}
+    s = op.state
+    # Scatter v (leaf-indexed, length n_leaves) into mesh-indexed scratch.
+    @inbounds for i in eachindex(op.v_scratch); op.v_scratch[i] = zero(T); end
+    @inbounds for (k, c) in enumerate(s.leaves)
+        op.v_scratch[c] = v[k]
+    end
+    _apply_laplacian!(op.Lv_scratch, op.v_scratch, s)
+    @inbounds for (k, c) in enumerate(s.leaves)
+        y[k] = v[k] - op.dt * op.ν * op.Lv_scratch[c]
+    end
+    return y
+end
+
+"""
+    viscous_step!(state, dt) -> (cg_stats_u, cg_stats_v)
+
+Solve `(I − Δt · ν · L) u = u^n` per component using Krylov.cg with a
+matrix-free SPD operator. Writes the new (u, v) back into the field of
+record. Returns the per-component Krylov stats for diagnostics.
+"""
+function viscous_step!(state::NSCellState, dt::Float64)
+    cfg = state.config
+    field = parent(state.af)
+    raw_u = field.u.pfs.storage.u
+    raw_v = field.v.pfs.storage.v
+    n_leaves = length(state.leaves)
+    n_storage = length(raw_u)
+
+    Lv_scratch = Vector{Float64}(undef, n_storage)
+    v_scratch  = Vector{Float64}(undef, n_storage)
+    op = HelmholtzOp{Float64}(state, dt, cfg.μ, Lv_scratch, v_scratch)
+
+    # Component u: RHS = current u (leaf-indexed flat vector).
+    rhs = Vector{Float64}(undef, n_leaves)
+    @inbounds for (k, c) in enumerate(state.leaves); rhs[k] = raw_u[c]; end
+    u_new, stats_u = cg(op, rhs;
+                          rtol = cfg.helmholtz_tol, atol = 0.0,
+                          itmax = cfg.helmholtz_maxiter)
+    @inbounds for (k, c) in enumerate(state.leaves); raw_u[c] = u_new[k]; end
+
+    # Component v: RHS = current v.
+    @inbounds for (k, c) in enumerate(state.leaves); rhs[k] = raw_v[c]; end
+    v_new, stats_v = cg(op, rhs;
+                          rtol = cfg.helmholtz_tol, atol = 0.0,
+                          itmax = cfg.helmholtz_maxiter)
+    @inbounds for (k, c) in enumerate(state.leaves); raw_v[c] = v_new[k]; end
+
+    return (stats_u, stats_v)
 end
 
 # ============================================================================

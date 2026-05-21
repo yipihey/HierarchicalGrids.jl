@@ -92,3 +92,79 @@ end
     @test _order(errs[2], errs[3]) > 1.85
     @test _order(errs[3], errs[4]) > 1.9
 end
+
+# ============================================================================
+# Step 2: implicit viscous step
+# ============================================================================
+
+@testset "INSCell viscous: stationary Taylor-Green decay (uniform)" begin
+    # Backward-Euler one step of the heat equation on Taylor-Green:
+    #   u^{n+1} = u^n + Δt ν L u^{n+1}        (= explicit form: u^n / (1 - Δt ν λ))
+    # For TG, L u = -2 k² u (eigenfunction), so the backward-Euler answer is
+    #   u^{n+1} = u^n / (1 + 2 Δt ν k²).
+    # The kinetic energy then scales as (1/(1 + 2 Δt ν k²))² ≈ exp(-4 ν k² Δt) for
+    # small Δt — match within the 1st-order BE truncation.
+    cfg = _C.NSCellConfig(n_base_refines = 5, t_final = 0.0, dt = 0.0,
+                              μ = 5e-2,
+                              helmholtz_tol = 1e-12,
+                              helmholtz_maxiter = 500)
+    state = _C.build_state(cfg)
+    ke0 = _C.kinetic_energy(state)
+
+    dt = 1e-2
+    stats_u, stats_v = _C.viscous_step!(state, dt)
+    @test stats_u.solved
+    @test stats_v.solved
+
+    ke = _C.kinetic_energy(state)
+    # Backward-Euler analytic factor for the TG eigenmode:
+    factor = 1.0 / (1.0 + 2.0 * dt * cfg.μ * (2π)^2)^2
+    @test isapprox(ke, ke0 * factor; rtol = 1e-3)
+end
+
+@testset "INSCell viscous: multi-step Taylor-Green energy decay" begin
+    # Repeated backward-Euler steps — the kinetic energy should track the
+    # analytic exp(-4 (2π)² ν t) decay closely (BE has 1st-order time
+    # truncation but the eigenmode is exact, so the multi-step factor is
+    # 1/(1+2 dt ν k²)^(2N) which equals exp(-4 ν k² t) in the limit).
+    cfg = _C.NSCellConfig(n_base_refines = 5, t_final = 0.0, dt = 0.0,
+                              μ = 5e-2,
+                              helmholtz_tol = 1e-12,
+                              helmholtz_maxiter = 500)
+    state = _C.build_state(cfg)
+    ke0 = _C.kinetic_energy(state)
+    dt = 5e-3
+    t_final = 0.02
+    nsteps = Int(round(t_final / dt))
+    for _ in 1:nsteps
+        _C.viscous_step!(state, dt)
+    end
+    ke = _C.kinetic_energy(state)
+    factor_per_step = 1.0 / (1.0 + 2.0 * dt * cfg.μ * (2π)^2)^2
+    expected = ke0 * factor_per_step^nsteps
+    @test isapprox(ke, expected; rtol = 5e-3)
+    # And it should be reasonably close to the analytic decay too.
+    analytic = ke0 * exp(-4 * (2π)^2 * cfg.μ * (dt * nsteps))
+    @test isapprox(ke, analytic; rtol = 0.05)
+end
+
+@testset "INSCell viscous: AMR (one step runs, CG converges)" begin
+    # On an AMR mesh the Laplacian is 1st-order at C/F faces (documented
+    # limitation; step 3 upgrades to Martin-Colella). Verify the solve
+    # still runs and energy decreases.
+    cfg = _C.NSCellConfig(n_base_refines = 4, refine_center = true,
+                              t_final = 0.0, dt = 0.0,
+                              μ = 5e-2,
+                              helmholtz_tol = 1e-10,
+                              helmholtz_maxiter = 500)
+    state = _C.build_state(cfg)
+    ke0 = _C.kinetic_energy(state)
+    dt = 5e-3
+    stats_u, stats_v = _C.viscous_step!(state, dt)
+    @test stats_u.solved
+    @test stats_v.solved
+    ke = _C.kinetic_energy(state)
+    @test ke < ke0
+    # Bounded — not blowing up.
+    @test ke > 0.5 * ke0
+end
