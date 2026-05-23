@@ -1,6 +1,6 @@
 # Cell-mode incompressible Navier-Stokes (scaffold)
 
-**Steps 1–2 of the cell-mode incompressible-NS punch list.** Cell-mode
+**Steps 1–3 of the cell-mode incompressible-NS punch list.** Cell-mode
 AMR scaffolding (`HierarchicalMesh{2}` + `AdaptiveField` carrying
 `(:u, :v)`) with:
 
@@ -9,10 +9,14 @@ AMR scaffolding (`HierarchicalMesh{2}` + `AdaptiveField` carrying
 * **Step 2** — backward-Euler implicit viscous step `(I − Δt · ν · L)
   u^{n+1} = u^n`, per component, via `Krylov.cg` on a matrix-free SPD
   operator built from a discrete cell-volume Laplacian.
+* **Step 3** — Poisson solver `solve_cell_poisson!(phi, rhs, state)`
+  for the projection step. Same matrix-free Laplacian as the viscous
+  step, Krylov.cg, with mean-subtraction to handle the periodic
+  nullspace. 2nd-order on uniform meshes, 1st-order at C/F faces
+  (documented limitation; see "Limitations" below).
 
-Steps 3 (cell-native multigrid Poisson) and 4 (projection + full NS
-step + AMR re-refinement) are still pending; this README is updated
-as each step lands.
+Step 4 (projection + full NS step + AMR re-refinement) is the only
+piece pending; this README is updated as each step lands.
 
 ## What's here
 
@@ -57,6 +61,29 @@ dt = 1e-3, RK2:
 Momentum conserved to `< 1e-11` in both u and v components in both
 single-level and AMR setups.
 
+## Step-3 empirical convergence (Poisson)
+
+Manufactured solution `φ(x, y) = sin(2π x) cos(2π y)` ⇒
+`−∇²φ = 8π²·φ`. CG to `tol = 1e-12`:
+
+| N  | uniform  | CG iters | order | AMR err  | leaves |
+|----|----------|----------|-------|----------|--------|
+| 8  | 2.65e-2  | 1        | —     | 5.52e-2  | 112    |
+| 16 | 6.48e-3  | 1        | 2.03  | 2.59e-2  | 448    |
+| 32 | 1.61e-3  | 1        | 2.01  | 1.33e-2  | 1792   |
+| 64 | 4.02e-4  | 1        | 2.00  | —        | —      |
+
+Uniform: clean 2nd-order, CG converges in 1 iteration on Taylor-Green
+(eigenvector of the discrete Laplacian).
+
+AMR: solver converges (though many CG iterations — multigrid
+preconditioner is a v2 follow-on), error decreases with N at ~1st
+order. The Laplacian at C/F faces uses the standard MLABec-style
+centre-to-centre stencil which is V-symmetric (so CG converges) but
+only 1st-order at sub-face centres in 2D. A "stencil-symmetric"
+2nd-order AMR Laplacian (Almgren-Bell-Crutchfield 2000) is the
+natural v2 upgrade.
+
 ## Step-2 empirical decay (viscous)
 
 Backward-Euler on Taylor-Green eigenmode: `u^{n+1} = u^n / (1 + 2 Δt
@@ -85,9 +112,11 @@ src/CFDIncompressibleNSCell.jl
   ├── build_state                     — uniform mesh + optional center refine
   ├── _cf_face_value                  — Martin-Colella transverse correction
   ├── _accumulate_flux_divergence!    — for_each_face! + periodic-axis pass
-  ├── _apply_laplacian!               — discrete cell-volume Laplacian
+  ├── _apply_laplacian!               — discrete cell-volume Laplacian (V-symmetric)
   ├── HelmholtzOp / mul!              — Krylov matrix-free (I − Δt ν L)
   ├── viscous_step!                   — Krylov.cg per component
+  ├── NegLaplacianOp                  — Krylov matrix-free (−L)
+  ├── solve_cell_poisson!             — Poisson solve with nullspace handling
   ├── step!                           — Euler or RK2 (Heun) advection
   ├── run!                            — drive to t_final
   └── total_momentum / kinetic_energy / l2_error — diagnostics
@@ -115,20 +144,35 @@ Step 2 (viscous):
    per-step factor exactly (CG solves to tol) and the continuous
    `exp(−4 ν k² t)` to within `5%`.
 8. **AMR viscous step** — CG converges, energy decreases, energy
-   bounded above 50% of the initial (no blow-up). Operator is 1st-order
-   at C/F faces; step 3 upgrades to Martin-Colella for full 2nd-order.
+   bounded above 50% of the initial (no blow-up).
+
+Step 3 (Poisson):
+9. **MMS recovers analytic φ (uniform)** — `err < 5e-3` on a 32²
+   grid.
+10. **Spatial convergence ≥ 2 (uniform)** — three doubling pairs,
+    observed slopes 2.00–2.03.
+11. **AMR Poisson** — solver converges, error bounded (1st-order at
+    C/F as documented).
+
+## Limitations / v2 follow-ons
+
+* **Laplacian is 1st-order at C/F faces.** A Martin-Colella
+  reconstruction (transverse-corrected face value) recovers
+  2nd-order accuracy *at the sub-face centre* but breaks the SPD
+  property needed for CG: the coupling to the coarse cell's
+  transverse neighbour `L[i, T]` has no symmetric counterpart
+  (`L[T, i] = 0`). A genuine 2nd-order *and* SPD AMR Laplacian
+  needs the "stencil-symmetric" Martin-Colella variant
+  (Almgren-Bell-Crutchfield 2000) — non-trivial implementation,
+  deferred to v2.
+* **No multigrid preconditioner.** CG without preconditioning is
+  O(N²) work for an N² mesh. Adequate for verification at the
+  scales we test; a cell-native FAC V-cycle preconditioner is the
+  natural v2 acceleration. The AMR Poisson at N=32 took ~8000 CG
+  iters before hitting the tolerance — workable but slow.
 
 ## Next steps on this path
 
-* **Step 3** (next) — cell-native multigrid Poisson. Port the FAC
-  V-cycle from `GeometricMultigrid` to operate directly on
-  `HierarchicalMesh`, with tree-parent restriction / linear
-  prolongation, GS red/black smoother, AMG bottom, and the
-  Martin-Colella flux fix at C/F faces (upgrading both the Poisson
-  operator AND the step-2 viscous Laplacian to true 2nd-order at C/F).
-  ~800 LoC. Tests: 2D periodic MMS converges in ≤ 8 V-cycles to 1e-10
-  on AMR mesh; matches `solve_poisson!` on a uniform single-patch
-  reference.
 * **Step 4** — MAC-on-averaged-faces (or nodal) projection + full
   incompressible NS step + AMR re-refinement via `step_with_amr!`.
   ~250 LoC. Tests: Taylor-Green decay on 3-level AMR mesh, lid-driven

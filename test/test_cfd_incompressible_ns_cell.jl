@@ -2,6 +2,7 @@
 # advection across coarse-fine interfaces.
 
 using Test
+using HierarchicalGrids: cell_physical_box
 
 const _example_root = abspath(joinpath(@__DIR__, "..", "examples",
                                          "cfd_incompressible_ns_cell"))
@@ -167,4 +168,95 @@ end
     @test ke < ke0
     # Bounded — not blowing up.
     @test ke > 0.5 * ke0
+end
+
+# ============================================================================
+# Step 3: cell-mode Poisson solver
+# ============================================================================
+
+# Manufactured Taylor-Green-style solution:
+#     φ(x, y)        = sin(2π x) cos(2π y)
+#     −∇² φ          = 8 π² sin(2π x) cos(2π y) = 8 π² · φ
+# So the RHS is just `8 π² · φ_exact`.
+function _poisson_mms_data(state)
+    n_leaves = length(state.leaves)
+    rhs = Vector{Float64}(undef, n_leaves)
+    phi_exact = Vector{Float64}(undef, n_leaves)
+    @inbounds for (k, c) in enumerate(state.leaves)
+        lo, hi = cell_physical_box(state.frame, c)
+        x = (0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2]))
+        φ = sin(2π * x[1]) * cos(2π * x[2])
+        phi_exact[k] = φ
+        rhs[k] = 8 * π^2 * φ
+    end
+    # Anchor the exact solution to mean zero (matches what solve does).
+    num = 0.0; vol = 0.0
+    @inbounds for (k, c) in enumerate(state.leaves)
+        V = (cell_physical_box(state.frame, c)[2][1] -
+             cell_physical_box(state.frame, c)[1][1]) *
+            (cell_physical_box(state.frame, c)[2][2] -
+             cell_physical_box(state.frame, c)[1][2])
+        num += phi_exact[k] * V
+        vol += V
+    end
+    mean_phi = num / vol
+    @inbounds for k in 1:length(phi_exact); phi_exact[k] -= mean_phi; end
+    return (rhs, phi_exact)
+end
+
+# L² error between solver output and the analytic reference.
+function _poisson_l2_error(phi::Vector{Float64}, phi_exact::Vector{Float64},
+                            state)
+    num = 0.0; vol = 0.0
+    @inbounds for (k, c) in enumerate(state.leaves)
+        lo, hi = cell_physical_box(state.frame, c)
+        V = (hi[1] - lo[1]) * (hi[2] - lo[2])
+        d = phi[k] - phi_exact[k]
+        num += d * d * V
+        vol += V
+    end
+    return sqrt(num / vol)
+end
+
+@testset "INSCell Poisson: MMS recovers analytic φ (uniform)" begin
+    cfg = _C.NSCellConfig(n_base_refines = 5,
+                              poisson_tol = 1e-12, poisson_maxiter = 4000)
+    state = _C.build_state(cfg)
+    rhs, phi_exact = _poisson_mms_data(state)
+    phi = zeros(Float64, length(state.leaves))
+    stats = _C.solve_cell_poisson!(phi, rhs, state)
+    @test stats.solved
+    # Recovery error: O(h²) for the 5-point Laplacian on a 32² grid.
+    err = _poisson_l2_error(phi, phi_exact, state)
+    @test err < 5e-3
+end
+
+@testset "INSCell Poisson: spatial convergence ≥ 2 (uniform)" begin
+    errs = Float64[]
+    for n in 3:6
+        cfg = _C.NSCellConfig(n_base_refines = n,
+                                  poisson_tol = 1e-12, poisson_maxiter = 8000)
+        state = _C.build_state(cfg)
+        rhs, phi_exact = _poisson_mms_data(state)
+        phi = zeros(Float64, length(state.leaves))
+        _C.solve_cell_poisson!(phi, rhs, state)
+        push!(errs, _poisson_l2_error(phi, phi_exact, state))
+    end
+    @test _order(errs[1], errs[2]) > 1.7
+    @test _order(errs[2], errs[3]) > 1.85
+    @test _order(errs[3], errs[4]) > 1.9
+end
+
+@testset "INSCell Poisson: AMR (CG converges, error bounded)" begin
+    cfg = _C.NSCellConfig(n_base_refines = 4, refine_center = true,
+                              poisson_tol = 1e-10, poisson_maxiter = 5000)
+    state = _C.build_state(cfg)
+    rhs, phi_exact = _poisson_mms_data(state)
+    phi = zeros(Float64, length(state.leaves))
+    stats = _C.solve_cell_poisson!(phi, rhs, state)
+    @test stats.solved
+    err = _poisson_l2_error(phi, phi_exact, state)
+    # 1st-order at C/F → coarser asymptotic, but error should still be
+    # small at N=16-equivalent. Sanity-check it's not catastrophic.
+    @test err < 5e-2
 end
