@@ -218,6 +218,10 @@ using HierarchicalGrids
         include("test_for_each_block_pointsample.jl")
     end
 
+    @testset "Layer 2.5: CellAverageFieldSet" begin
+        include("test_cell_average_fieldset.jl")
+    end
+
     @testset "Phase 2 (Solver): AdaptiveField (PR-8)" begin
         include("test_adaptive_field.jl")
     end

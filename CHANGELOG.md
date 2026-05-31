@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`CellAverageFieldSet` + `allocate_cell_average_fields`**: a finite-volume
+  (cell-average) field model — one scalar per field per cell holding the
+  volume integral over the cell divided by the cell volume. Third sibling to
+  `PolynomialFieldSet` / `PointSampleFieldSet`, riding the same
+  `SoA` / `AoS` / `Blocked{B}` layout machinery (no fork). Refinement via
+  `AdaptiveField` is conservative in the finite-volume sense: prolongation is
+  piecewise-constant injection and restriction is the volume-weighted mean of
+  the children (the arithmetic mean for equal-volume splits), preserving
+  `Σ value × volume` to round-off. Consumable by `for_each_cell!` and the
+  halo / BC-resolved neighbor accessors via the shared `_coeffs_for_cell`
+  abstraction. Distinct from `PointSampleFieldSet{…, N=1}`: a volume average
+  with conservative-mean coarsening, not a point value with interpolation.
 - **1D parity for `compute_overlap`**: closed-form interval intersection
   in `src/Overlap/r3d_adapter.jl`; `HierarchicalMesh{1}` and
   `SimplicialMesh{1, T}` are now first-class across the overlap and

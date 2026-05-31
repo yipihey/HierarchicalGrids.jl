@@ -63,6 +63,8 @@ export PointSampleFieldView, PointSampleView
 export n_points_per_cell, n_points_per_axis
 export point_multi_to_flat, point_flat_to_multi
 export eval_point_samples
+export CellAverageFieldSet, allocate_cell_average_fields
+export CellAverageFieldView
 export HaloView, halo_view
 
 # ============================================================================
@@ -431,6 +433,13 @@ include("PolynomialFieldSet.jl")
 # the layout machinery from PolynomialFieldSet.jl.
 # ============================================================================
 include("PointSampleFieldSet.jl")
+
+# ============================================================================
+# Cell-average (finite-volume) field storage. Third sibling to the polynomial
+# and point-sample models; reuses the same layout machinery with one scalar
+# (nc = 1) per cell, and carries finite-volume conservation semantics.
+# ============================================================================
+include("CellAverageFieldSet.jl")
 
 # ============================================================================
 # Halo view over a PolynomialFieldView (depends on Mesh's NeighborGraph; PR-C)

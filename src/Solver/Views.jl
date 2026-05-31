@@ -57,6 +57,22 @@ end
     return value
 end
 
+# Finite-volume cell-average fields. A `CellAverageFieldView`
+# carries one scalar per cell — its cell average. Reads/writes through the
+# same `_coeffs_for_cell` / `_set_coeffs_for_cell!` abstraction the other two
+# models use, so `CellView` / `HaloView` and the orchestrators consume a
+# cell-average field unchanged. Unlike the polynomial / point-sample cases,
+# `cv[Val(:rho)]` returns the scalar average directly (there is no per-cell
+# coefficient sub-view).
+@inline function _coeffs_for_cell(field::CellAverageFieldView, i::Integer)
+    return field[Int(i)]
+end
+
+@inline function _set_coeffs_for_cell!(field::CellAverageFieldView, i::Integer, value)
+    field[Int(i)] = value
+    return value
+end
+
 # ----------------------------------------------------------------------------
 # CellView
 # ----------------------------------------------------------------------------

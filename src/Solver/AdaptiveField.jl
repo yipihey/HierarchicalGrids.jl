@@ -610,3 +610,163 @@ Storage.n_elements(af::AdaptiveField) = n_elements(af.field)
 Storage.field_names(af::AdaptiveField) = field_names(af.field)
 Storage.basis_of(af::AdaptiveField) = basis_of(af.field)
 Storage.n_coeffs_per_element(af::AdaptiveField) = n_coeffs_per_element(af.field)
+
+# ============================================================================
+# CellAverageFieldSet integration (finite-volume, conservative)
+# ============================================================================
+
+"""
+    AdaptiveField(field::CellAverageFieldSet, mesh::HierarchicalMesh)
+
+Wrap a finite-volume `CellAverageFieldSet` so its storage tracks `mesh`
+refinement events with **conservative** finite-volume operators:
+
+- **Prolongation (refine):** piecewise-constant injection — every child cell
+  inherits its parent's cell average verbatim. Conservative because children
+  of a split have equal volume, so `Σ child_avg · child_vol` equals
+  `parent_avg · parent_vol` exactly.
+- **Restriction (coarsen):** the parent's cell average is the
+  volume-weighted average of its children's averages. Children of a single
+  (an)isotropic split have equal volume by construction, so this reduces to
+  the arithmetic mean — exact and conservative (total `value × volume`
+  preserved to round-off).
+
+Mirrors the `PolynomialFieldSet` wrapper; the field-replacement and
+storage-resize mechanics are identical (see that constructor's docstring),
+specialized here to one scalar per cell. Like the polynomial wrapper, the
+`Blocked{B}` layout is not supported for adaptive resize — use `SoA` or
+`AoS`.
+"""
+function AdaptiveField(field::CellAverageFieldSet, mesh::HierarchicalMesh)
+    af = AdaptiveField{typeof(field), typeof(mesh)}(field, mesh, ListenerHandle(0), false)
+    handle = register_refinement_listener!(mesh, ev -> _handle_event!(af, ev))
+    af.listener_handle = handle
+    finalizer(_finalize_adaptive_field!, af)
+    return af
+end
+
+# Rebuild the immutable wrapper with a new n, sharing the (resized-in-place)
+# storage object — same idiom as `_rebuild_with_n` for PolynomialFieldSet.
+function _rebuild_ca_with_n(cafs::CellAverageFieldSet{D, L, Names, ST, S},
+                             new_n::Int) where {D, L, Names, ST, S}
+    return CellAverageFieldSet{D, L, Names, ST, S}(new_n, cafs.storage)
+end
+
+# Snapshot every OLD cell's average before the resize clobbers (SoA) or
+# shifts (AoS) the storage. One Vector per field, indexed by old cell.
+function _snapshot_cell_averages(cafs::CellAverageFieldSet{D, L, Names, ST, S},
+                                  n_old::Int) where {D, L, Names, ST, S}
+    snap = NamedTuple{Names}(ntuple(length(Names)) do k
+        T = fieldtype(ST, k)
+        v = Vector{T}(undef, n_old)
+        name = Names[k]
+        @inbounds for i in 1:n_old
+            v[i] = _get_cell_average(cafs, Val(name), i)
+        end
+        v
+    end)
+    return snap
+end
+
+# Injection (prolongation): write the snapshot value of `src_col` into the
+# (post-resize) cell `new_i`.
+@inline function _write_avg_from_column!(
+    cafs::CellAverageFieldSet{D, L, Names, ST, S},
+    snap, new_i::Int, src_col::Int) where {D, L, Names, ST, S}
+    @inbounds for name in Names
+        v = getfield(snap, name)
+        _set_cell_average!(cafs, Val(name), new_i, v[src_col])
+    end
+    return nothing
+end
+
+# Restriction: volume-weighted average of the children in `src_cols`.
+# Children of a single (an)isotropic split have EQUAL volume by construction
+# — each split axis halves the cell along that axis — so the volume-weighted
+# average reduces exactly to the arithmetic mean. This is the fast path that
+# assumes equal child volume; the mean is computed over whichever children
+# exist under the parent's split mask (`children_count`).
+@inline function _write_avg_mean!(
+    cafs::CellAverageFieldSet{D, L, Names, ST, S},
+    snap, new_i::Int, src_cols) where {D, L, Names, ST, S}
+    n_src = length(src_cols)
+    n_src > 0 || return nothing
+    @inbounds for name in Names
+        v = getfield(snap, name)
+        T = eltype(v)
+        s = zero(T)
+        for c in src_cols
+            s += v[c]
+        end
+        _set_cell_average!(cafs, Val(name), new_i, s / T(n_src))
+    end
+    return nothing
+end
+
+function _handle_event!(af::AdaptiveField{<:CellAverageFieldSet}, event::RefinementEvent)
+    af.disposed && return  # defensive; shouldn't fire if unregistered
+
+    cafs = af.field
+    n_old = cafs.n
+    new_n = Int(n_cells(af.mesh))  # mesh has already been rebuilt
+
+    if isempty(event.refined_parents) && isempty(event.coarsened_parents)
+        return
+    end
+
+    # Snapshot all OLD averages before we touch the storage.
+    snap = _snapshot_cell_averages(cafs, n_old)
+
+    # Resize storage in place (one scalar per cell → nc = 1) and rebuild the
+    # immutable wrapper with the new n. Reuses the polynomial resize helper.
+    L = _layout_type_ca(cafs)
+    _resize_poly_storage_inplace!(cafs.storage, L, 1, new_n)
+    cafs_new = _rebuild_ca_with_n(cafs, new_n)
+    af.field = cafs_new
+
+    written = falses(new_n)
+
+    # Phase 1: copy unchanged + refined-parent slots via the remap.
+    remap = event.index_remap
+    @inbounds for old_i in 1:n_old
+        ni = remap[old_i]
+        if ni != 0
+            _write_avg_from_column!(cafs_new, snap, Int(ni), Int(old_i))
+            written[Int(ni)] = true
+        end
+    end
+
+    # Phase 2: refinement — constant prolongation (injection). Each child
+    # inherits its parent's OLD cell average.
+    @inbounds for k in eachindex(event.refined_parents)
+        parent_old = Int(event.refined_parents[k])
+        for new_child in event.new_children[k]
+            _write_avg_from_column!(cafs_new, snap, Int(new_child), parent_old)
+            written[Int(new_child)] = true
+        end
+    end
+
+    # Phase 3: coarsening — conservative restriction (volume-weighted mean).
+    if !isempty(event.coarsened_parents)
+        inv = _build_inverse_remap(remap, new_n)
+        @inbounds for parent_new in event.coarsened_parents
+            pn = Int(parent_new)
+            parent_old = Int(inv[pn])
+            parent_cell = af.mesh.cells[pn]
+            n_children = children_count(parent_cell)
+            # OLD children are contiguous immediately after the OLD parent.
+            src_cols = (parent_old + 1):(parent_old + n_children)
+            _write_avg_mean!(cafs_new, snap, pn, src_cols)
+            written[pn] = true
+        end
+    end
+
+    if !all(written)
+        unwritten = findall(!, written)
+        error("AdaptiveField: $(length(unwritten)) new cell slot(s) left " *
+              "unwritten after handling event (e.g. slot $(first(unwritten))). " *
+              "This is a bug in AdaptiveField or RefinementEvent.")
+    end
+
+    return
+end

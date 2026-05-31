@@ -152,6 +152,8 @@ export PointSampleFieldView, PointSampleView
 export n_points_per_cell, n_points_per_axis
 export point_multi_to_flat, point_flat_to_multi
 export eval_point_samples
+export CellAverageFieldSet, allocate_cell_average_fields
+export CellAverageFieldView
 export HaloView, halo_view
 
 # Layer 3 (foundational pieces, full implementation later)
